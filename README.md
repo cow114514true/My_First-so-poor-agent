@@ -42,7 +42,7 @@ cd <project-directory>
 ### 2. 安装依赖
 
 ```bash
-pip install openai playwright
+pip install openai playwright (注意，所有的依赖要处于相同的python环境中，否则不同的python会识别不到已有的包导致无法运行)
 playwright install chromium
 ```
 
