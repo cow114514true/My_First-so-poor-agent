@@ -4,6 +4,8 @@
 
 一个基于 DeepSeek API 的多轮对话 Agent，集成了工具调用（Function Calling）能力，并通过 Playwright 桥接 DeepSeek 网页版，实现图片理解、联网搜索等扩展功能。新增 **Textual 终端图形界面（TUI）**，提供三面板实时交互体验。
 
+![TUI Screenshot](example.png)
+
 ## 项目结构
 
 ```

@@ -7,6 +7,7 @@ import queue
 import threading
 import json
 import os
+import signal
 from datetime import datetime
 
 from textual.app import App, ComposeResult
@@ -147,6 +148,11 @@ class AgentTUI(App):
         self._update_footer()
         self.set_interval(1 / 30, self._poll_queue)
         self.query_one("#input-area", Input).focus()
+        signal.signal(signal.SIGINT, self._on_sigint)
+
+    def _on_sigint(self, signum, frame):
+        """Intercept Ctrl+C → route through save-dialog flow."""
+        self.call_from_thread(self.action_request_quit)
 
     # -- key bindings --
 
@@ -210,6 +216,18 @@ class AgentTUI(App):
 
         input_widget = self.query_one("#input-area", Input)
         input_widget.value = ""
+
+        # /clear — reset corrupted conversation
+        if question == "/clear":
+            _agent_messages.clear()
+            _agent_messages.append({"role": "system", "content": loop_agent_v2.system_prompt})
+            for pid in ("#chat-panel", "#think-panel", "#tool-panel"):
+                self.query_one(pid, RichLog).clear()
+            self.query_one("#chat-panel", RichLog).write("[dim]--- Conversation cleared ---[/dim]")
+            self._token_total = 0
+            self._update_footer()
+            return
+
         input_widget.disabled = True
         self._agent_busy = True
 
