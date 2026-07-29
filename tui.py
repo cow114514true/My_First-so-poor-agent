@@ -207,6 +207,80 @@ class AgentTUI(App):
             json.dump(_agent_messages, f, ensure_ascii=False, indent=2)
         return filepath
 
+    @property
+    def _save_dir(self) -> str:
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversations")
+
+    def _cmd_load(self, question: str) -> None:
+        chat_panel = self.query_one("#chat-panel", RichLog)
+        arg = question[5:].strip()
+        os.makedirs(self._save_dir, exist_ok=True)
+
+        # List saved files
+        files = sorted(
+            [f for f in os.listdir(self._save_dir) if f.startswith("chat_") and f.endswith(".json")],
+            reverse=True,
+        )
+
+        if not files:
+            chat_panel.write("[dim]No saved conversations found.[/dim]")
+            return
+
+        if not arg:
+            # Show available saves
+            chat_panel.write("[bold]Saved conversations:[/bold]")
+            for f in files:
+                # Extract timestamp from filename
+                stem = f[len("chat_"):-len(".json")]
+                try:
+                    dt = datetime.strptime(stem, "%Y%m%d_%H%M%S")
+                    label = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    label = stem
+                chat_panel.write(f"  [dim]•[/dim] {f}")
+            chat_panel.write("[dim]Usage: /load <filename>[/dim]")
+            return
+
+        # Load specific file
+        target = arg if arg.endswith(".json") else arg + ".json"
+        if not os.path.exists(target):
+            # try in save_dir
+            target = os.path.join(self._save_dir, target)
+        if not os.path.exists(target):
+            chat_panel.write(f"[bold red]Not found:[/bold red] {arg}")
+            return
+
+        try:
+            with open(target, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        except Exception as e:
+            chat_panel.write(f"[bold red]Failed to load:[/bold red] {e}")
+            return
+
+        # Replace global messages
+        _agent_messages.clear()
+        _agent_messages.extend(loaded)
+
+        # Rebuild chat panel from loaded messages
+        chat_panel.clear()
+        chat_panel.write(f"[dim]--- Loaded {os.path.basename(target)} ---[/dim]")
+        for msg in loaded:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                chat_panel.write(f"[bold white]You:[/bold white] {content}")
+            elif role == "assistant":
+                if len(content) > 500:
+                    content = content[:500] + f"\n[dim]... ({len(content)} chars)[/dim]"
+                chat_panel.write(f"[bold]Assistant:[/bold]\n{content}")
+            elif role == "tool":
+                chat_panel.write(f"[dim]  tool result ({len(content)} chars)[/dim]")
+
+        self.query_one("#think-panel", RichLog).clear()
+        self.query_one("#tool-panel", RichLog).clear()
+        self._token_total = 0
+        self._update_footer()
+
     # -- input handling --
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -226,6 +300,11 @@ class AgentTUI(App):
             self.query_one("#chat-panel", RichLog).write("[dim]--- Conversation cleared ---[/dim]")
             self._token_total = 0
             self._update_footer()
+            return
+
+        # /load [name] — load a saved conversation
+        if question.startswith("/load"):
+            self._cmd_load(question)
             return
 
         input_widget.disabled = True
