@@ -10,11 +10,13 @@
 
 ```
 .
-├── Get_State.py          # 登录 DeepSeek 网页版，保存浏览器状态
-├── loop_agent_v2.py      # 主 Agent 程序，支持多轮对话和工具调用
-├── tui.py                # Textual TUI 界面（三面板图形交互）
-├── profile.json          # 浏览器登录状态（运行 Get_State.py 后生成）
-├── conversations/        # 自动保存的对话历史（JSON 格式）
+├── setup.bat              # 一键安装 & 启动脚本（推荐）
+├── requirements.txt       # Python 依赖清单
+├── Get_State.py           # 登录 DeepSeek 网页版，保存浏览器状态
+├── loop_agent_v2.py       # 主 Agent 程序，支持多轮对话和工具调用
+├── tui.py                 # Textual TUI 界面（三面板图形交互）
+├── profile.json           # 浏览器登录状态（运行 Get_State.py 后生成）
+├── conversations/         # 自动保存的对话历史（JSON 格式）
 └── README.md
 ```
 
@@ -52,28 +54,54 @@
 
 ## 安装
 
-### 1. 克隆项目
+> **新手推荐**：直接双击 `setup.bat`，脚本会自动处理虚拟环境、依赖安装、Playwright 浏览器下载、DS_KEY 配置，最后启动 TUI。无需手动执行以下步骤。
+
+### 一键安装（setup.bat）
+
+```bash
+cd <project-directory>
+setup.bat
+```
+
+脚本会依次完成：
+1. 检测全局 Python 环境，展示已安装的包
+2. 创建项目专属的 `.venv` 虚拟环境（不影响系统 Python）
+3. 在虚拟环境中安装依赖（已装过的自动跳过）
+4. 下载 Chromium 浏览器（Playwright）
+5. 检查 `DS_KEY`，未设置则交互输入
+6. 启动 TUI 界面
+
+> **注意**：请从命令行（cmd）运行 `setup.bat`，不建议从 PyCharm 或其他 IDE 内置终端启动。IDE 可能使用自己的 Python 环境，会导致包找不到。
+
+### 手动安装
+
+#### 1. 克隆项目
 
 ```bash
 git clone <repository-url>
 cd <project-directory>
 ```
 
-### 2. 安装依赖
+#### 2. 创建虚拟环境并安装依赖
 
 ```bash
-pip install openai playwright textual
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 3. 设置 API Key
+#### 3. 设置 API Key
 
 ```bash
-# Windows (CMD)
+# CMD
 set DS_KEY=your-deepseek-api-key
 
-# Windows (PowerShell)
+# PowerShell
 $env:DS_KEY="your-deepseek-api-key"
+
+# 永久设置（推荐）
+setx DS_KEY "your-deepseek-api-key"
 
 # Linux / macOS
 export DS_KEY="your-deepseek-api-key"
