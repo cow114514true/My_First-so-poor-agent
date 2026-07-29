@@ -369,6 +369,24 @@ def validate_tool_result(tool_name, result):
 
     return True, ""
 
+# -- ponytail: response quality guard, prevents DSML/garbage from polluting messages --
+def _is_garbage_content(text: str) -> bool:
+    """True if the response looks like DSML garbage / XML leakage."""
+    if not text or not text.strip():
+        return True
+    t = text.strip()
+    # DSML markers
+    if "<DSML" in t or "<dsml" in t or "|DSML|" in t:
+        return True
+    # Raw XML declaration
+    if t.startswith("<?xml"):
+        return True
+    # Excessive markup density (angle brackets >30% of chars, but skip legit code)
+    angle_count = t.count("<") + t.count(">")
+    if len(t) > 100 and angle_count / len(t) > 0.3:
+        return True
+    return False
+
 TOOL_CALL_MAP = {
     "get_date": get_date_mock,
     "get_weather": get_weather_mock,
@@ -480,8 +498,11 @@ def chat(question, on_event=None):
         
         # 如果没有工具调用，跳出循环
         if not use_tool_calls:
-            # 保存助手响应（非工具调用）
-            messages.append({"role": "assistant", "content": response_msg.content})
+            content = response_msg.content or ""
+            if _is_garbage_content(content):
+                messages.append({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"})
+            else:
+                messages.append({"role": "assistant", "content": content})
             break
         
         # 有工具调用
@@ -571,8 +592,11 @@ def chat(question, on_event=None):
         if chunk.usage is not None:
             _emit({"type": "stream_usage", "usage": chunk.usage})
 
-    # 保存流式生成的助手回复
-    messages.append({"role": "assistant", "content": full_response})
+    # 保存流式生成的助手回复（带垃圾检测）
+    if _is_garbage_content(full_response):
+        messages.append({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"})
+    else:
+        messages.append({"role": "assistant", "content": full_response})
         
 # 交互式连续对话
 if __name__ == "__main__":
