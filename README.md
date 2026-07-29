@@ -1,5 +1,3 @@
-好的，我来为你生成一份更新后的 `README.md`。根据你提供的 `loop_agent_v2.py` 和 `tui.py` 以及之前的记忆，我将把新的 TUI 界面、shell 实时输出、工具结果验证、安全文件读写等特性全部整合进去。
-
 ---
 
 # DeepSeek Agent with Web Bridge & TUI
