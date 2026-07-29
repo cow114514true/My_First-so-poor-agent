@@ -1,4 +1,3 @@
-# myAgent_memory.py
 import os
 from openai import OpenAI
 import sys
@@ -173,45 +172,42 @@ def enter_confirm(session):
 
 def get_response(session):
     page = session["page"]
-    timeout = 60000
+    timeout = 120  # 2分钟，DeepSeek 网页版搜索回复通常需要 30-60 秒
     start_time = time.time()
     last_content = ""
     stable_count = 0
-        
-        # 回复内容选择器
+    min_elapsed_before_return = 3  # 至少等 3 秒再判定完成，避免刚生成第一段就截断
+
     response_selectors = [
         "[class*='message-assistant'] [class*='markdown']",
         "[class*='assistant'] [class*='content']",
         ".ds-markdown",
         "[class*='chat-message']:last-child"
     ]
-        
+
     while time.time() - start_time < timeout:
-        # 检查是否还在生成中（打字指示器）
-        typing_indicator = page.query_selector("[class*='typing'], [class*='loading'], .cursor-blink")
-        is_typing = typing_indicator and typing_indicator.is_visible()
-            
-        # 获取最新回复内容
+        time.sleep(0.5)  # 避免忙循环，给页面渲染留时间
+
         current_content = ""
         for sel in response_selectors:
             els = page.query_selector_all(sel)
             if els:
-                # 取最后一条助手消息
                 current_content = els[-1].inner_text()
                 break
-            
+
         if current_content and current_content == last_content:
             stable_count += 1
         else:
             stable_count = 0
             last_content = current_content
-            
-            # 内容稳定2秒以上且没有打字指示器，认为回复完成
-        if not is_typing and stable_count >= 4 and current_content:
-            return current_content
-            break
 
-        time.sleep(0.5)
+        elapsed = time.time() - start_time
+        # 内容稳定 2 秒（4 次 × 0.5s）且至少过了 3 秒，认为回复完成
+        if elapsed > min_elapsed_before_return and stable_count >= 4 and current_content:
+            return current_content
+
+    # 超时返回已有内容（可能不完整），不返回 None
+    return last_content if last_content else "[get_response timeout] No response captured"
 
 def use_ds_from_web_mock(file_path,ask_prompt):
     global _ds_session
@@ -221,9 +217,21 @@ def use_ds_from_web_mock(file_path,ask_prompt):
         upload_files(_ds_session, file_path)
     input_prompt(_ds_session, ask_prompt)
     enter_confirm(_ds_session)
+    print("[DEBUG] enter_confirm 完成，即将调用 get_response\n")
     response = get_response(_ds_session)
+    print("[DEBUG] get_response")
+
     return response
-    
+
+def is_result_make_sense(tool_name,result):
+    if not result:
+        return False
+    if "error" in str(result).lower() or "fail" in str(result).lower():
+        return False
+    if len(str(result)) < 10:
+        return False
+    return True
+
 TOOL_CALL_MAP = {
     "get_date": get_date_mock,
     "get_weather": get_weather_mock,
@@ -237,8 +245,12 @@ client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
+system_prompt = """You are a helpful assistant. If you need to use tools, just use them! When you have all the information, provide a complete answer;
+                If the result is time-sensitive and not universally applicable, then you must call the web search tool(using use_ds_from_web) to verify!It is important!
+                Such as weather or other infomation like this"""
+
 messages = [
-    {"role": "system", "content": "You are a helpful assistant. If you need to use tools, just use them! When you have all the information, provide a complete answer."}
+    {"role": "system", "content": system_prompt}
 ]
 
 def chat(question):
@@ -247,8 +259,12 @@ def chat(question):
     # 添加用户问题
     messages.append({"role": "user", "content": question})
     
+    MAX_TOOL_ROUNDS = 6
+    tool_round = 0
+
     # 循环处理工具调用
-    while True:
+    while tool_round < MAX_TOOL_ROUNDS:
+        tool_round += 1
         # 调用 API（不使用流式）
         response = client.chat.completions.create(
             model="deepseek-v4-flash",
@@ -256,7 +272,7 @@ def chat(question):
             stream=False,
             tools=tools,
             reasoning_effort="high",
-            extra_body={"thinking": {"type": "disabled"}}
+            extra_body={"thinking": {"type": "enabled"}}
         )
         
         response_msg = response.choices[0].message
@@ -269,36 +285,76 @@ def chat(question):
             break
         
         # 有工具调用
-        print(f"Agent 决定调用工具: {response_msg.tool_calls}\n")
+        print(f"Agent调用工具: {response_msg.tool_calls}")
         
         # 添加助手的工具调用消息
         messages.append(response_msg)
         
+        all_tools_make_sense = True
+        tool_results = []
         # 执行所有工具
         for tool in use_tool_calls:
-            tool_function = TOOL_CALL_MAP[tool.function.name]
-            tool_result = tool_function(**json.loads(tool.function.arguments))
-            print(f"tool result for {tool.function.name}:\n {tool_result}\n")
+            tool_name = tool.function.name
+            try:
+                tool_args = json.loads(tool.function.arguments)
+            except json.JSONDecodeError as e:
+                tool_result = f"[Error] Invalid JSON arguments: {e}\nRaw: {tool.function.arguments}"
+                all_tools_make_sense = False
+            else:
+                try:
+                    tool_fn = TOOL_CALL_MAP.get(tool_name)
+                    if tool_fn is None:
+                        tool_result = f"[Error] Unknown tool: {tool_name}"
+                        all_tools_make_sense = False
+                    else:
+                        tool_result = tool_fn(**tool_args)
+                except Exception as e:
+                    tool_result = f"[Error] Tool execution failed: {e}"
+                    all_tools_make_sense = False
+
+            if tool_result is None:
+                tool_result = "[Error] Tool returned None (timeout or empty response)"
+
+            print(f"tool result for {tool_name}:\n {tool_result}\n")
             messages.append({
                 "role": "tool",
                 "tool_call_id": tool.id,
-                "content": tool_result,
+                "content": str(tool_result),
             })
-        
+
+            tool_results.append(
+                {
+                    "tool_name": tool_name,
+                    "tool_result": tool_result,
+                    "tool_call_id": tool.id
+                }
+            )
+
+            if not is_result_make_sense(tool_name, tool_result):
+                print("Need to recall tool\n")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": f"Tool {tool_name}' result have some problems, please retry and solve it"
+                    }
+                )
         # 继续循环，让助手处理工具结果
     
     # 所有工具调用完成后，流式输出最终答案
     # 注意：最后一条消息已经是助手的响应了，但我们想要流式输出，所以重新请求一次
     # 移除最后一条助手消息，用流式重新生成
-    last_msg = messages.pop()
-    
+    last_msg = messages[-1]
+    if last_msg.get("role") == "assistant" and last_msg.get("content"):
+        # 已有完整回答，直接输出
+        print(f": {last_msg['content']}")
+        return
     # 用流式输出最终答案
     response_stream = client.chat.completions.create(
-        model="deepseek-v4-pro",
+        model="deepseek-v4-flash",
         messages=messages,
         stream=True,
         reasoning_effort="high",
-        extra_body={"thinking": {"type": "disabled"}}
+        extra_body={"thinking": {"type": "enabled"}}
     )
     
     full_response = ""
