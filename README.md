@@ -1,3 +1,5 @@
+---
+
 # DeepSeek Agent with Web Bridge & TUI
 
 一个基于 DeepSeek API 的多轮对话 Agent，集成了工具调用（Function Calling）能力，并通过 Playwright 桥接 DeepSeek 网页版，实现图片理解、联网搜索等扩展功能。新增 **Textual 终端图形界面（TUI）**，提供三面板实时交互体验。
@@ -95,17 +97,10 @@ python Get_State.py
 python tui.py
 ```
 
-启动后，你将看到一个三面板终端界面，如下图所示：
-
-![TUI 界面截图](example.png)
-*三面板 TUI 界面：左侧 Chat 面板显示对话、中间 Thinking 面板显示思考过程、右侧 Tools 面板显示工具调用与执行结果*
-
-界面布局说明：
+启动后，你将看到一个三面板终端界面：
 - **左侧 Chat 面板**：显示用户输入和助手回答
 - **中间 Thinking 面板**：显示 DeepSeek 的思考链内容
-- **右侧 Tools 面板**：显示工具名称、参数、返回结果
-- **底部状态栏**：显示当前模型、状态（思考中/空闲/生成中）及 token 消耗量
-- **Shell 面板**（按 `` ` `` 反引键展开）：实时显示 Shell 命令的标准输出
+- **右侧 Tools 面板**：显示工具调用过程和结果
 
 #### TUI 快捷键
 
@@ -231,11 +226,6 @@ TUI 基于 Textual 框架构建，三个面板分别跟踪 Agent 的不同输出
 | Tools | 工具名称、参数、返回结果、验证结果 |
 
 Shell 面板（按 `` ` `` 展开）实时显示 `exec_shell_win` 命令的标准输出，实现终端命令的可视化执行反馈。
-
-底部状态栏包含三个关键信息：
-- **模型名称**：当前使用的 DeepSeek 模型（如 `deepseek-v4-flash`）
-- **工作状态**：`thinking`（思考中）、`tool_call`（调用工具）、`generating`（生成回答）、`idle`（空闲）
-- **Token 计数**：当前会话累计消耗的 token 数量
 
 ### System Prompt 设计
 
