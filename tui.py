@@ -1,0 +1,396 @@
+"""
+TUI for loop_agent_v2.py — three-panel chat interface powered by Textual.
+Run: python tui.py
+"""
+
+import queue
+import threading
+import json
+import os
+from datetime import datetime
+
+from textual.app import App, ComposeResult
+from textual.containers import Horizontal, Vertical
+from textual.screen import Screen
+from textual.widgets import RichLog, Input, Static
+from textual.binding import Binding
+
+from loop_agent_v2 import chat, messages as _agent_messages
+import loop_agent_v2
+
+
+class QuitDialog(Screen):
+    """Modal: save conversation before exit?"""
+
+    BINDINGS = [
+        Binding("y", "save_quit", "Save & Quit"),
+        Binding("n", "discard_quit", "Discard"),
+        Binding("escape", "cancel_quit", "Cancel"),
+    ]
+
+    CSS = """
+    QuitDialog {
+        align: center middle;
+    }
+
+    #quit-dialog {
+        padding: 1 2;
+        border: solid $primary;
+        background: $surface;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            "Save conversation before exit?\n\n"
+            "  [bold]y[/bold] — save to conversations/ and quit\n"
+            "  [bold]n[/bold] — discard and quit\n"
+            "  [bold]Esc[/bold] — cancel",
+            id="quit-dialog",
+        )
+
+    def action_save_quit(self) -> None:
+        self.dismiss("save")
+
+    def action_discard_quit(self) -> None:
+        self.dismiss("discard")
+
+    def action_cancel_quit(self) -> None:
+        self.dismiss("cancel")
+
+
+class AgentTUI(App):
+    """Three-panel TUI: Chat | Thinking | Tools."""
+
+    BINDINGS = [
+        Binding("1", "focus_panel('chat')", "Chat"),
+        Binding("2", "focus_panel('think')", "Think"),
+        Binding("3", "focus_panel('tool')", "Tools"),
+        Binding("i", "focus_input", "Input"),
+        Binding("tab", "focus_next", "Next"),
+        Binding("ctrl+c", "request_quit", "Quit"),
+        Binding("`", "toggle_shell", "Shell"),
+    ]
+
+    CSS = """
+    Vertical {
+        height: 100%;
+    }
+
+    #main-panels {
+        height: 1fr;
+    }
+
+    #chat-panel {
+        width: 1fr;
+        border: solid $primary;
+    }
+
+    #think-panel {
+        width: 1fr;
+        border: solid $secondary;
+    }
+
+    #tool-panel {
+        width: 1fr;
+        border: solid $accent;
+    }
+
+    #input-area {
+        height: 3;
+        margin: 0 0 1 0;
+    }
+
+    #footer-bar {
+        height: 1;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 1;
+    }
+
+    #shell-output {
+        height: 0;
+        border: solid $warning;
+        background: $surface;
+        overflow-y: scroll;
+    }
+
+    #shell-output.visible {
+        height: 10;
+    }
+    """
+
+    def __init__(self):
+        super().__init__()
+        self._event_queue: queue.Queue = queue.Queue()
+        self._shell_queue: queue.Queue = queue.Queue()
+        self._agent_busy: bool = False
+        self._token_total: int = 0
+        self._status: str = "idle"
+        self._stream_buffer: str = ""
+        self._shell_visible: bool = False
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield RichLog(id="shell-output", wrap=True, markup=True, max_lines=2000)
+            with Horizontal(id="main-panels"):
+                yield RichLog(id="chat-panel", wrap=True, markup=True, max_lines=5000)
+                yield RichLog(id="think-panel", wrap=True, markup=True, max_lines=5000)
+                yield RichLog(id="tool-panel", wrap=True, markup=True, max_lines=5000)
+            yield Input(id="input-area", placeholder="输入问题，Enter 发送...")
+            yield Static(id="footer-bar")
+
+    def on_mount(self) -> None:
+        self.query_one("#chat-panel", RichLog).border_title = " Chat "
+        self.query_one("#think-panel", RichLog).border_title = " Thinking "
+        self.query_one("#tool-panel", RichLog).border_title = " Tools "
+        self._update_footer()
+        self.set_interval(1 / 30, self._poll_queue)
+        self.query_one("#input-area", Input).focus()
+
+    # -- key bindings --
+
+    def action_focus_panel(self, name: str) -> None:
+        panel_map = {
+            "chat": "#chat-panel",
+            "think": "#think-panel",
+            "tool": "#tool-panel",
+        }
+        if panel_id := panel_map.get(name):
+            self.query_one(panel_id, RichLog).focus()
+
+    def action_focus_input(self) -> None:
+        self.query_one("#input-area", Input).focus()
+
+    def action_toggle_shell(self) -> None:
+        widget = self.query_one("#shell-output", RichLog)
+        self._shell_visible = not self._shell_visible
+        if self._shell_visible:
+            widget.add_class("visible")
+            widget.clear()
+            widget.border_title = " Terminal "
+        else:
+            widget.remove_class("visible")
+            widget.border_title = ""
+
+    def action_request_quit(self) -> None:
+        if self._has_content():
+            self.push_screen(QuitDialog(), self._on_quit_dialog)
+        else:
+            self.exit()
+
+    def _has_content(self) -> bool:
+        """Any real conversation beyond the system prompt?"""
+        return len(_agent_messages) > 1
+
+    def _on_quit_dialog(self, result: str) -> None:
+        if result == "save":
+            path = self._save_conversation()
+            self.notify(f"Saved → {path}", timeout=3)
+            self.exit()
+        elif result == "discard":
+            self.exit()
+        # "cancel": do nothing
+
+    def _save_conversation(self) -> str:
+        save_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversations")
+        os.makedirs(save_dir, exist_ok=True)
+        filename = f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        filepath = os.path.join(save_dir, filename)
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(_agent_messages, f, ensure_ascii=False, indent=2)
+        return filepath
+
+    # -- input handling --
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        question = event.value.strip()
+        if not question or self._agent_busy:
+            return
+
+        input_widget = self.query_one("#input-area", Input)
+        input_widget.value = ""
+        input_widget.disabled = True
+        self._agent_busy = True
+
+        chat_panel = self.query_one("#chat-panel", RichLog)
+        chat_panel.write(f"[bold white]You:[/bold white] {question}")
+
+        self._set_status("thinking")
+
+        threading.Thread(target=self._run_agent, args=(question,), daemon=True).start()
+
+    def _run_agent(self, question: str) -> None:
+        """Runs in background thread. Pushes events to queue."""
+        loop_agent_v2._shell_output_queue = self._shell_queue
+
+        def on_event(event):
+            self._event_queue.put(event)
+
+        try:
+            chat(question, on_event=on_event)
+        except Exception as e:
+            self._event_queue.put({"type": "error", "message": str(e)})
+        self._event_queue.put({"type": "__agent_done__"})
+
+    # -- event polling (main thread, ~30fps) --
+
+    def _poll_queue(self) -> None:
+        # Drain agent event queue
+        while True:
+            try:
+                event = self._event_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._handle_event(event)
+
+        # Drain shell output queue (only if panel is visible)
+        if self._shell_visible:
+            shell_log = self.query_one("#shell-output", RichLog)
+            while True:
+                try:
+                    item = self._shell_queue.get_nowait()
+                except queue.Empty:
+                    break
+                kind, data = item[0], item[1]
+                if kind == "shell_start":
+                    shell_log.write(f"[bold yellow]$ {data}[/bold yellow]")
+                elif kind == "shell_line":
+                    shell_log.write(data.rstrip("\n"))
+                elif kind == "shell_done":
+                    shell_log.write(f"[dim]--- exit code: {data} ---[/dim]")
+
+    def _handle_event(self, event: dict) -> None:
+        etype = event.get("type")
+
+        if etype == "__agent_done__":
+            self._flush_stream()
+            self._agent_busy = False
+            self._set_status("idle")
+            self.query_one("#input-area", Input).disabled = False
+            self.query_one("#input-area", Input).focus()
+            return
+
+        if etype == "error":
+            self.query_one("#tool-panel", RichLog).write(
+                f"[bold red]ERROR:[/bold red] {event.get('message')}"
+            )
+            return
+
+        handlers = {
+            "token_usage": self._h_token,
+            "stream_usage": self._h_token,
+            "thinking": self._h_thinking,
+            "thinking_chunk": self._h_thinking_chunk,
+            "tool_calls": self._h_tool_calls,
+            "tool_result": self._h_tool_result,
+            "self_check": self._h_self_check,
+            "response_chunk": self._h_response_chunk,
+            "response_done": self._h_response_done,
+            "status": self._h_status,
+        }
+        if handler := handlers.get(etype):
+            handler(event)
+
+    # -- per-event-type handlers --
+
+    def _h_token(self, e: dict) -> None:
+        usage = e.get("usage")
+        try:
+            if hasattr(usage, "total_tokens"):
+                self._token_total += usage.total_tokens
+            elif isinstance(usage, dict):
+                self._token_total += usage.get("total_tokens", 0)
+        except Exception:
+            pass
+        self._update_footer()
+
+    def _h_thinking(self, e: dict) -> None:
+        content = e.get("content", "")
+        if not content:
+            return
+        r = e.get("round", "?")
+        panel = self.query_one("#think-panel", RichLog)
+        if len(content) > 300:
+            panel.write(f"\n[dim]── Round {r} (enter to expand) ──[/dim]")
+            panel.write(f"{content[:300]}\n[dim]... ({len(content)} chars)[/dim]")
+        else:
+            panel.write(f"\n[dim]── Round {r} ──[/dim]")
+            panel.write(content)
+
+    def _h_thinking_chunk(self, e: dict) -> None:
+        content = e.get("content", "")
+        if content:
+            self.query_one("#think-panel", RichLog).write(content)
+
+    def _h_tool_calls(self, e: dict) -> None:
+        self._set_status("calling_tool")
+        chat_panel = self.query_one("#chat-panel", RichLog)
+        tool_panel = self.query_one("#tool-panel", RichLog)
+        for c in e.get("calls", []):
+            name = c["name"]
+            chat_panel.write(f"[dim]  calling {name}...[/dim]")
+            tool_panel.write(f"\n[bold yellow]→ {name}[/bold yellow]")
+            try:
+                args = json.loads(c.get("args", "{}"))
+                tool_panel.write(f"  [dim]{json.dumps(args, ensure_ascii=False)[:200]}[/dim]")
+            except Exception:
+                pass
+
+    def _h_tool_result(self, e: dict) -> None:
+        name = e.get("tool_name", "?")
+        result = str(e.get("result", ""))
+        panel = self.query_one("#tool-panel", RichLog)
+        truncated = result[:400]
+        panel.write(f"  [bold green]<- {name}[/bold green] [dim]{truncated}[/dim]")
+        if len(result) > 400:
+            panel.write(f"  [dim]... ({len(result)} chars total)[/dim]")
+
+    def _h_self_check(self, e: dict) -> None:
+        self.query_one("#tool-panel", RichLog).write(
+            f"  [bold red]! {e.get('tool_name', '?')}:[/bold red] {e.get('critique', '')}"
+        )
+
+    def _h_response_chunk(self, e: dict) -> None:
+        if self._status != "generating":
+            self._set_status("generating")
+            self.query_one("#chat-panel", RichLog).write("\n[bold]Assistant:[/bold]")
+        self._stream_buffer += e.get("content", "")
+        while "\n" in self._stream_buffer:
+            line, self._stream_buffer = self._stream_buffer.split("\n", 1)
+            self.query_one("#chat-panel", RichLog).write(line)
+
+    def _h_response_done(self, e: dict) -> None:
+        content = e.get("content", "")
+        self.query_one("#chat-panel", RichLog).write(f"\n[bold]Assistant:[/bold]\n{content}")
+
+    def _h_status(self, e: dict) -> None:
+        self._set_status(e.get("state", "idle"))
+
+    # -- helpers --
+
+    def _flush_stream(self) -> None:
+        if self._stream_buffer.strip():
+            self.query_one("#chat-panel", RichLog).write(self._stream_buffer)
+        self._stream_buffer = ""
+
+    def _set_status(self, state: str) -> None:
+        self._status = state
+        self._update_footer()
+
+    def _update_footer(self) -> None:
+        icons = {
+            "idle": "idle",
+            "thinking": "thinking...",
+            "calling_tool": "calling tool",
+            "generating": "generating",
+        }
+        status = icons.get(self._status, self._status)
+        tok = f"{self._token_total / 1000:.1f}k" if self._token_total else "0k"
+        self.query_one("#footer-bar", Static).update(
+            f" deepseek-v4-flash | {status} | {tok} tokens"
+        )
+
+
+if __name__ == "__main__":
+    AgentTUI().run()
