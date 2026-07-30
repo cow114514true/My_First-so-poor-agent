@@ -1,27 +1,26 @@
 @echo off
-chcp 65001 >nul
 setlocal enabledelayedexpansion
 
 :: ============================================================
-::  DeepSeek Agent — 一键安装 & 启动
-::  推荐在命令行 (cmd) 中运行，不建议从 PyCharm / IDE 启动
+::  DeepSeek Agent — One-click setup & launch
+::  Run from cmd.exe, not from PyCharm / IDE terminal
 :: ============================================================
 
 title DeepSeek Agent Setup
 
 echo.
-echo  ╔══════════════════════════════════════════════════════╗
-echo  ║   DeepSeek Agent — 一键安装 ^& 启动                  ║
-echo  ╚══════════════════════════════════════════════════════╝
+echo  +====================================================+
+echo  ^|   DeepSeek Agent — One-click setup ^& launch       ^|
+echo  +====================================================+
 echo.
-echo  ^> 请在命令行 (cmd) 中使用以下命令运行本脚本：
+echo  ^> Run this script in cmd.exe:
 echo     cd /d %~dp0
 echo     setup.bat
 echo.
-echo  ^> 不建议从 PyCharm 或其他 IDE 内置终端运行
-echo    （IDE 可能使用自己的 Python 环境，造成包找不到）
+echo  ^> Avoid IDE terminals (PyCharm, etc.)
+echo    They may use their own Python, causing import errors
 echo.
-echo  ═══════════════════════════════════════════════════════
+echo  ======================================================
 
 :: --- step tracking ---
 set STEP=0
@@ -36,106 +35,106 @@ if %errorlevel%==0 (
     if %errorlevel%==0 (
         set PY=py
     ) else (
-        call :fail "未找到 Python！请先安装 Python 3.8+：https://www.python.org/downloads/"
+        call :fail "Python not found! Install Python 3.8+: https://www.python.org/downloads/"
     )
 )
 
 :: --- paths ---
-set VENV=%~dp0.venv
-set ACTIVATE=%VENV%\Scripts\activate.bat
-set REQ=%~dp0requirements.txt
+set "VENV=%~dp0.venv"
+set "ACTIVATE=%VENV%\Scripts\activate.bat"
+set "REQ=%~dp0requirements.txt"
 
 :: ============================================================
-::  Step 1/6 — 检测当前环境已安装的包
+::  Step 1/6 — Show installed packages
 :: ============================================================
-call :next_step "检测全局 Python 环境"
+call :next_step "Check global Python environment"
 echo  Python: %PY%
-echo  路径 : where %PY%
+echo  Path  : where %PY%
 %PY% --version
 echo.
-echo  ── 全局环境已安装的包 ──
+echo  -- Global pip packages --
 %PY% -m pip list 2>&1
-echo  ──────────────────────────
+echo  -------------------------
 
 :: ============================================================
-::  Step 2/6 — 创建虚拟环境
+::  Step 2/6 — Create venv
 :: ============================================================
-call :next_step "创建虚拟环境 (.venv)"
+call :next_step "Create virtual environment (.venv)"
 if exist "%VENV%" (
-    echo  虚拟环境已存在，跳过创建。
+    echo  venv already exists, skipping.
 ) else (
     %PY% -m venv "%VENV%" 2>&1
-    if %errorlevel% neq 0 call :fail "创建虚拟环境失败"
-    echo  虚拟环境创建完成。
+    if %errorlevel% neq 0 call :fail "Failed to create venv"
+    echo  venv created.
 )
 
 :: ============================================================
-::  Step 3/6 — 安装 Python 依赖
+::  Step 3/6 — Install Python deps
 :: ============================================================
-call :next_step "安装 Python 依赖"
+call :next_step "Install Python dependencies"
 call "%ACTIVATE%"
 
 echo.
-echo  ── 虚拟环境中已有的包 ──
+echo  -- Packages in venv --
 pip list 2>&1
-echo  ──────────────────────────
+echo  -----------------------
 echo.
 
-echo  正在安装（已装过的会自动跳过）...
+echo  Installing (already-installed packages will be skipped)...
 echo.
 pip install -r "%REQ%" 2>&1
-if %errorlevel% neq 0 call :fail "依赖安装失败，请检查网络连接"
+if %errorlevel% neq 0 call :fail "pip install failed — check your network"
 
 :: ============================================================
-::  Step 4/6 — 安装 Chromium
+::  Step 4/6 — Install Chromium
 :: ============================================================
-call :next_step "安装 Chromium 浏览器（Playwright）"
+call :next_step "Install Chromium (Playwright)"
 call "%ACTIVATE%"
 playwright install chromium 2>&1
-if %errorlevel% neq 0 call :fail "Chromium 安装失败，请检查网络连接"
+if %errorlevel% neq 0 call :fail "Chromium install failed — check your network"
 
 :: ============================================================
-::  Step 5/6 — 检查 DS_KEY
+::  Step 5/6 — Check DS_KEY
 :: ============================================================
-call :next_step "检查 API Key (DS_KEY)"
+call :next_step "Check API Key (DS_KEY)"
 
 if defined DS_KEY (
-    echo  DS_KEY 已设置。
+    echo  DS_KEY is set.
 ) else (
     echo.
-    echo  DS_KEY 未设置。请输入你的 DeepSeek API Key：
-    echo  （获取地址：https://platform.deepseek.com/api_keys）
+    echo  DS_KEY is not set. Enter your DeepSeek API Key:
+    echo  (Get one at: https://platform.deepseek.com/api_keys)
     echo.
     set /p KEY_INPUT="  API Key: "
 
     if "!KEY_INPUT!"=="" (
-        echo  跳过 — 可稍后在 cmd 中运行 set DS_KEY=你的key 设置。
+        echo  Skipped — run `set DS_KEY=your-key` in cmd later.
     ) else (
         set DS_KEY=!KEY_INPUT!
-        echo  已临时设置 DS_KEY（仅本次终端会话有效）
+        echo  DS_KEY set (this terminal session only)
         echo.
-        echo  ─────────────────────────────────────────
-        echo  永久设置（以后不用每次输入）：
-        echo    打开 CMD，运行: setx DS_KEY "你的key"
-        echo    关闭并重新打开终端生效
-        echo  ─────────────────────────────────────────
+        echo  -------------------------------------------------
+        echo  To set permanently:
+        echo    Open cmd, run: setx DS_KEY "your-key"
+        echo    Then reopen terminal
+        echo  -------------------------------------------------
     )
 )
 
 :: ============================================================
-::  Step 6/6 — 启动 TUI
+::  Step 6/6 — Launch TUI
 :: ============================================================
-call :next_step "启动 TUI"
+call :next_step "Launch TUI"
 call "%ACTIVATE%"
 echo.
-echo  加载中...
+echo  Loading...
 echo.
 %PY% tui.py
 pause
 exit /b 0
 
 :: ============================================================
-::  子程序
+::  Subroutines
 :: ============================================================
 
 :next_step
@@ -144,10 +143,10 @@ set /a PCT=%STEP%*100/%TOTAL%
 set /a BARS=%PCT%/10
 set BAR=
 for /l %%i in (1,1,10) do (
-    if %%i leq !BARS! (set BAR=!BAR!█) else (set BAR=!BAR!░)
+    if %%i leq !BARS! (set BAR=!BAR!#) else (set BAR=!BAR!.)
 )
 echo.
-echo  [!BAR!] %PCT%%  [%STEP%/%TOTAL%] %~1
+echo  [!BAR!] %PCT%%%  [%STEP%/%TOTAL%] %~1
 exit /b
 
 :fail
