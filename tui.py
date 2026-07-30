@@ -7,12 +7,14 @@ import queue
 import threading
 import json
 import os
+import time
 from datetime import datetime
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.message import Message
 from textual.screen import Screen
-from textual.widgets import RichLog, Input, Static
+from textual.widgets import RichLog, TextArea, Static
 from textual.binding import Binding
 
 from loop_agent_v2 import chat, messages as _agent_messages
@@ -59,6 +61,27 @@ class QuitDialog(Screen):
         self.dismiss("cancel")
 
 
+class PanelLog(RichLog):
+    """RichLog with double-click detection for panel expansion."""
+
+    class ExpandRequest(Message):
+        """Posted when panel is double-clicked."""
+        def __init__(self, panel_id: str) -> None:
+            self.panel_id = panel_id
+            super().__init__()
+
+    def __init__(self, *args, panel_id: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        self.panel_id = panel_id
+        self._last_click: float = 0.0
+
+    def on_click(self, event) -> None:
+        now = time.monotonic()
+        if self._last_click and now - self._last_click < 0.4:
+            self.post_message(self.ExpandRequest(self.panel_id))
+        self._last_click = now
+
+
 class AgentTUI(App):
     """Three-panel TUI: Chat | Thinking | Tools."""
 
@@ -69,6 +92,8 @@ class AgentTUI(App):
         Binding("i", "focus_input", "Input"),
         Binding("tab", "focus_next", "Next"),
         Binding("ctrl+c", "noop", "", show=False),
+        Binding("escape", "collapse_panel", "", show=False),
+        Binding("ctrl+j", "submit_input", "Send"),
         Binding("`", "toggle_shell", "Shell"),
     ]
 
@@ -97,7 +122,9 @@ class AgentTUI(App):
     }
 
     #input-area {
-        height: 3;
+        height: auto;
+        min-height: 3;
+        max-height: 12;
         margin: 0 0 1 0;
     }
 
@@ -129,15 +156,16 @@ class AgentTUI(App):
         self._status: str = "idle"
         self._stream_buffer: str = ""
         self._shell_visible: bool = False
+        self._expanded_panel: str = ""  # non-empty when a panel is expanded
 
     def compose(self) -> ComposeResult:
         with Vertical():
             yield RichLog(id="shell-output", wrap=True, markup=True, max_lines=2000)
             with Horizontal(id="main-panels"):
-                yield RichLog(id="chat-panel", wrap=True, markup=True, max_lines=5000)
-                yield RichLog(id="think-panel", wrap=True, markup=True, max_lines=5000)
-                yield RichLog(id="tool-panel", wrap=True, markup=True, max_lines=5000)
-            yield Input(id="input-area", placeholder="输入问题，Enter 发送...")
+                yield PanelLog(id="chat-panel", panel_id="chat-panel", wrap=True, markup=True, max_lines=5000)
+                yield PanelLog(id="think-panel", panel_id="think-panel", wrap=True, markup=True, max_lines=5000)
+                yield PanelLog(id="tool-panel", panel_id="tool-panel", wrap=True, markup=True, max_lines=5000)
+            yield TextArea(id="input-area")
             yield Static(id="footer-bar")
 
     def on_mount(self) -> None:
@@ -146,7 +174,7 @@ class AgentTUI(App):
         self.query_one("#tool-panel", RichLog).border_title = " Tools "
         self._update_footer()
         self.set_interval(1 / 30, self._poll_queue)
-        self.query_one("#input-area", Input).focus()
+        self.query_one("#input-area", TextArea).focus()
 
     # -- key bindings --
 
@@ -160,7 +188,7 @@ class AgentTUI(App):
             self.query_one(panel_id, RichLog).focus()
 
     def action_focus_input(self) -> None:
-        self.query_one("#input-area", Input).focus()
+        self.query_one("#input-area", TextArea).focus()
 
     def action_toggle_shell(self) -> None:
         widget = self.query_one("#shell-output", RichLog)
@@ -183,6 +211,32 @@ class AgentTUI(App):
     def action_noop(self) -> None:
         """Swallow Ctrl+C — use /quit to exit properly."""
         pass
+
+    # -- panel expand / collapse --
+
+    def on_panel_log_expand_request(self, event: PanelLog.ExpandRequest) -> None:
+        self._toggle_expand(event.panel_id)
+
+    def _toggle_expand(self, panel_id: str) -> None:
+        if self._expanded_panel == panel_id:
+            self._restore_panels()
+        else:
+            self._expand_panel(panel_id)
+
+    def _expand_panel(self, panel_id: str) -> None:
+        for pid in ("#chat-panel", "#think-panel", "#tool-panel"):
+            p = self.query_one(pid, PanelLog)
+            p.styles.width = "1fr" if pid == f"#{panel_id}" else "0"
+        self._expanded_panel = panel_id
+
+    def _restore_panels(self) -> None:
+        for pid in ("#chat-panel", "#think-panel", "#tool-panel"):
+            self.query_one(pid, PanelLog).styles.width = "1fr"
+        self._expanded_panel = ""
+
+    def action_collapse_panel(self) -> None:
+        if self._expanded_panel:
+            self._restore_panels()
 
     def _has_content(self) -> bool:
         """Any real conversation beyond the system prompt?"""
@@ -336,15 +390,15 @@ class AgentTUI(App):
 
     # -- input handling --
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        question = event.value.strip()
+    def action_submit_input(self) -> None:
+        textarea = self.query_one("#input-area", TextArea)
+        question = textarea.text.strip()
         if not question or self._agent_busy:
             return
+        textarea.text = ""
+        textarea.focus()
 
-        input_widget = self.query_one("#input-area", Input)
-        input_widget.value = ""
-
-        # /clear — reset corrupted conversation
+        # /clear — reset conversation
         if question == "/clear":
             _agent_messages.clear()
             _agent_messages.append({"role": "system", "content": loop_agent_v2.system_prompt})
@@ -365,7 +419,7 @@ class AgentTUI(App):
             self.action_quit()
             return
 
-        input_widget.disabled = True
+        textarea.disabled = True
         self._agent_busy = True
 
         chat_panel = self.query_one("#chat-panel", RichLog)
@@ -422,8 +476,8 @@ class AgentTUI(App):
             self._flush_stream()
             self._agent_busy = False
             self._set_status("idle")
-            self.query_one("#input-area", Input).disabled = False
-            self.query_one("#input-area", Input).focus()
+            self.query_one("#input-area", TextArea).disabled = False
+            self.query_one("#input-area", TextArea).focus()
             return
 
         if etype == "error":

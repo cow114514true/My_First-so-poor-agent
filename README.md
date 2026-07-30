@@ -142,6 +142,8 @@ python tui.py
 | `i` | 聚焦输入框 |
 | `Tab` | 切换焦点 |
 | `` ` `` (反引号) | 展开/收起 Shell 终端面板 |
+| 双击面板 | 展开当前面板占满三面板区域（Esc 或再次双击恢复） |
+| `Ctrl+J` | 提交消息（Enter 换行） |
 
 #### TUI 命令（在输入框中输入）
 
@@ -331,6 +333,7 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.4**：面板双击展开（Esc 恢复）；输入框改为多行 TextArea（Enter 换行，Ctrl+J 提交）
 - **v2.3**：TUI 新增 /quit /load /clear 命令；/load 支持数字选择+对话标题预览；工具调用路径增加 DSML 垃圾过滤；未知工具错误列出可用工具；修复 SDK 对象 JSON 序列化崩溃
 - **v2.2**：新增 setup.bat 一键安装启动脚本、requirements.txt
 - **v2.1**：新增 TUI 界面、Shell 实时输出、安全文件读写、工具结果验证机制
