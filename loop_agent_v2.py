@@ -508,8 +508,22 @@ def chat(question, on_event=None):
         # 有工具调用
         _emit({"type": "tool_calls", "calls": [{"name": tc.function.name, "args": tc.function.arguments} for tc in use_tool_calls]})
         
-        # 添加助手的工具调用消息
-        messages.append(response_msg)
+        # 添加助手的工具调用消息（plain dict，避免 SDK 对象无法 JSON 序列化）
+        messages.append({
+            "role": response_msg.role,
+            "content": response_msg.content,
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": tc.type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    }
+                }
+                for tc in response_msg.tool_calls
+            ]
+        })
         
         all_tools_make_sense = True
         tool_results = []

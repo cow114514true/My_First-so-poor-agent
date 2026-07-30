@@ -7,7 +7,6 @@ import queue
 import threading
 import json
 import os
-import signal
 from datetime import datetime
 
 from textual.app import App, ComposeResult
@@ -69,7 +68,7 @@ class AgentTUI(App):
         Binding("3", "focus_panel('tool')", "Tools"),
         Binding("i", "focus_input", "Input"),
         Binding("tab", "focus_next", "Next"),
-        Binding("ctrl+c", "request_quit", "Quit"),
+        Binding("ctrl+c", "noop", "", show=False),
         Binding("`", "toggle_shell", "Shell"),
     ]
 
@@ -148,11 +147,6 @@ class AgentTUI(App):
         self._update_footer()
         self.set_interval(1 / 30, self._poll_queue)
         self.query_one("#input-area", Input).focus()
-        signal.signal(signal.SIGINT, self._on_sigint)
-
-    def _on_sigint(self, signum, frame):
-        """Intercept Ctrl+C → route through save-dialog flow."""
-        self.call_from_thread(self.action_request_quit)
 
     # -- key bindings --
 
@@ -179,11 +173,16 @@ class AgentTUI(App):
             widget.remove_class("visible")
             widget.border_title = ""
 
-    def action_request_quit(self) -> None:
+    def action_quit(self) -> None:
+        """All quit paths converge here — save dialog intercepts."""
         if self._has_content():
             self.push_screen(QuitDialog(), self._on_quit_dialog)
         else:
             self.exit()
+
+    def action_noop(self) -> None:
+        """Swallow Ctrl+C — use /quit to exit properly."""
+        pass
 
     def _has_content(self) -> bool:
         """Any real conversation beyond the system prompt?"""
@@ -205,6 +204,17 @@ class AgentTUI(App):
         filepath = os.path.join(save_dir, filename)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(_agent_messages, f, ensure_ascii=False, indent=2)
+
+        # Clean up corrupted files from previous failed saves
+        for f in os.listdir(save_dir):
+            if f.startswith("chat_") and f.endswith(".json") and f != filename:
+                try:
+                    with open(os.path.join(save_dir, f), "r", encoding="utf-8") as fh:
+                        if not isinstance(json.load(fh), list):
+                            os.remove(os.path.join(save_dir, f))
+                except Exception:
+                    os.remove(os.path.join(save_dir, f))
+
         return filepath
 
     @property
@@ -216,54 +226,97 @@ class AgentTUI(App):
         arg = question[5:].strip()
         os.makedirs(self._save_dir, exist_ok=True)
 
-        # List saved files
-        files = sorted(
+        all_files = sorted(
             [f for f in os.listdir(self._save_dir) if f.startswith("chat_") and f.endswith(".json")],
             reverse=True,
         )
 
-        if not files:
+        if not all_files:
             chat_panel.write("[dim]No saved conversations found.[/dim]")
             return
 
-        if not arg:
-            # Show available saves
-            chat_panel.write("[bold]Saved conversations:[/bold]")
-            for f in files:
-                # Extract timestamp from filename
-                stem = f[len("chat_"):-len(".json")]
-                try:
-                    dt = datetime.strptime(stem, "%Y%m%d_%H%M%S")
-                    label = dt.strftime("%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    label = stem
-                chat_panel.write(f"  [dim]•[/dim] {f}")
-            chat_panel.write("[dim]Usage: /load <filename>[/dim]")
-            return
+        # Separate valid from corrupted
+        valid_files = []
+        corrupted_files = []
+        for f in all_files:
+            filepath = os.path.join(self._save_dir, f)
+            try:
+                with open(filepath, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if not isinstance(data, list):
+                    corrupted_files.append(f)
+                else:
+                    valid_files.append((f, data))
+            except Exception:
+                corrupted_files.append(f)
 
-        # Load specific file
-        target = arg if arg.endswith(".json") else arg + ".json"
-        if not os.path.exists(target):
-            # try in save_dir
-            target = os.path.join(self._save_dir, target)
-        if not os.path.exists(target):
+        # Number selection → /load N (only counts valid files)
+        try:
+            idx = int(arg)
+            if 1 <= idx <= len(valid_files):
+                self._load_file(os.path.join(self._save_dir, valid_files[idx - 1][0]))
+                return
+            chat_panel.write(f"[bold red]Invalid number: {idx} (1-{len(valid_files)})[/bold red]")
+            return
+        except ValueError:
+            pass
+
+        # Filename → backward compat: /load chat_xxx.json
+        if arg and (arg.endswith(".json") or arg.startswith("chat_")):
+            target = arg if arg.endswith(".json") else arg + ".json"
+            if not os.path.exists(target):
+                target = os.path.join(self._save_dir, target)
+            if os.path.exists(target):
+                self._load_file(target)
+                return
             chat_panel.write(f"[bold red]Not found:[/bold red] {arg}")
             return
 
+        # No arg → list all with title preview
+        chat_panel.write("[bold]Saved conversations:[/bold]\n")
+        for i, (f, data) in enumerate(valid_files, 1):
+            stem = f[len("chat_"):-len(".json")]
+            try:
+                dt = datetime.strptime(stem, "%Y%m%d_%H%M%S")
+                label = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                label = stem
+            # Extract first user message as title
+            title = ""
+            for msg in data:
+                if msg.get("role") == "user":
+                    title = msg.get("content", "")
+                    break
+            title = title[:60].replace("\n", " ") + ("..." if len(title) > 60 else "")
+            chat_panel.write(f"  [bold]{i}[/bold]  {label}")
+            if title:
+                chat_panel.write(f"       [dim]\"{title}\"[/dim]")
+            else:
+                chat_panel.write(f"       [dim](empty)[/dim]")
+
+        if corrupted_files:
+            chat_panel.write(f"\n[dim yellow]Corrupted files (will be skipped on save cleanup):[/dim yellow]")
+            for f in corrupted_files:
+                chat_panel.write(f"  [dim]✗ {f}[/dim]")
+
+        if valid_files:
+            chat_panel.write(f"\n[dim]Usage: /load <number> (1-{len(valid_files)})[/dim]")
+
+    def _load_file(self, filepath: str) -> None:
+        """Load a conversation file and rebuild UI."""
+        chat_panel = self.query_one("#chat-panel", RichLog)
         try:
-            with open(target, "r", encoding="utf-8") as f:
+            with open(filepath, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
         except Exception as e:
             chat_panel.write(f"[bold red]Failed to load:[/bold red] {e}")
             return
 
-        # Replace global messages
         _agent_messages.clear()
         _agent_messages.extend(loaded)
 
-        # Rebuild chat panel from loaded messages
         chat_panel.clear()
-        chat_panel.write(f"[dim]--- Loaded {os.path.basename(target)} ---[/dim]")
+        chat_panel.write(f"[dim]--- Loaded {os.path.basename(filepath)} ---[/dim]")
         for msg in loaded:
             role = msg.get("role", "")
             content = msg.get("content", "")
@@ -305,6 +358,11 @@ class AgentTUI(App):
         # /load [name] — load a saved conversation
         if question.startswith("/load"):
             self._cmd_load(question)
+            return
+
+        # /quit — safe quit with save dialog
+        if question == "/quit":
+            self.action_quit()
             return
 
         input_widget.disabled = True
