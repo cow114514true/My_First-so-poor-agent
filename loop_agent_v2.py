@@ -509,9 +509,13 @@ def chat(question, on_event=None):
         _emit({"type": "tool_calls", "calls": [{"name": tc.function.name, "args": tc.function.arguments} for tc in use_tool_calls]})
         
         # 添加助手的工具调用消息（plain dict，避免 SDK 对象无法 JSON 序列化）
+        # 垃圾检测：content 可能夹带 DSML
+        safe_content = response_msg.content or ""
+        if _is_garbage_content(safe_content):
+            safe_content = ""
         messages.append({
             "role": response_msg.role,
-            "content": response_msg.content,
+            "content": safe_content,
             "tool_calls": [
                 {
                     "id": tc.id,
@@ -539,7 +543,8 @@ def chat(question, on_event=None):
                 try:
                     tool_fn = TOOL_CALL_MAP.get(tool_name)
                     if tool_fn is None:
-                        tool_result = f"[Error] Unknown tool: {tool_name}"
+                        available = ", ".join(TOOL_CALL_MAP.keys())
+                        tool_result = f"[Error] Unknown tool: '{tool_name}'. Available tools: {available}"
                         all_tools_make_sense = False
                     else:
                         tool_result = tool_fn(**tool_args)
