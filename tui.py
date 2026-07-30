@@ -419,6 +419,29 @@ class AgentTUI(App):
             self.action_quit()
             return
 
+        if question == "/help":
+            chat_panel = self.query_one("#chat-panel",RichLog)
+            help_txt = """
+键盘快捷键:
+║  1  — 聚焦聊天面板                                     
+║  2  — 聚焦思考面板                                     
+║  3  — 聚焦工具面板                                     
+║  i  — 聚焦输入框                                          
+║  Tab — 切换到下一个组件                                 
+║  Ctrl+J — 发送消息   
+║  `  — 切换终端输出面板                                 
+║  Esc — 折叠展开的面板                                  
+║  双击面板标题 — 展开/恢复该面板                        
+╠════════════════════════════════════════════════════════╣
+║ 命令：                                                 
+║  /clear       — 清空对话历史                           
+║  /load [编号] — 加载保存的对话                         
+║  /load        — 列出所有可加载的对话                   
+║  /quit        — 安全退出（可保存对话）
+║  /help        — 显示此帮助信息     
+            """
+            chat_panel.write(help_txt)
+            return
         textarea.disabled = True
         self._agent_busy = True
 
@@ -596,8 +619,9 @@ class AgentTUI(App):
         }
         status = icons.get(self._status, self._status)
         tok = f"{self._token_total / 1000:.1f}k" if self._token_total else "0k"
+        get_help = "/help"
         self.query_one("#footer-bar", Static).update(
-            f" deepseek-v4-flash | {status} | {tok} tokens"
+            f" deepseek-v4-flash | {status} | {tok} tokens | Get-help: {get_help}"
         )
 
 

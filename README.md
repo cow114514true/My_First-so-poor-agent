@@ -25,6 +25,7 @@
 ### 核心 Agent 能力
 - **多轮对话**：基于 DeepSeek API 的连续对话能力，自动维护对话历史
 - **工具调用（Function Calling）**：Agent 可自主决定调用各类工具
+- **通用网页浏览**：`browse_web` 工具可访问任意网站——自动导航、点击按钮、填写表单、执行搜索、截取页面截图，支持 profile 持久化登录状态
 - **思考链（CoT）**：通过 `extra_body` 启用 DeepSeek 的思考链能力，提升复杂推理质量
 - **工具结果验证**：内置 `validate_tool_result()` 函数，自动检测工具返回结果是否有效，无效时触发 Agent 重试
 - **循环保护**：最大工具调用轮次限制（默认 6 轮），防止无限循环
@@ -43,6 +44,7 @@
 - `get_weather`：查询天气（Mock 实现，建议搭配联网搜索使用）
 - `exec_shell_win`：在 Windows 上执行 CMD 或 PowerShell 命令，支持实时输出
 - `use_ds_from_web`：通过 Playwright 控制 DeepSeek 网页版，实现图片识别和联网搜索
+- `browse_web`：通用浏览器工具，可访问任意网站——导航、点击、填表、搜索、截图，支持 profile 持久化登录
 - `read_file`：安全读取工作目录内的文件内容
 - `write_file`：安全写入文件（自动创建目录，覆盖已有文件）
 
@@ -206,6 +208,23 @@ Agent调用工具: read_file
 🤖: 文件内容是：Hello World
 ```
 
+### 5. 通用网页浏览
+
+```
+😎 You: 帮我查一下 Python 3.13 的 release notes，看看有哪些新特性
+Agent调用工具: browse_web
+  URL: https://google.com
+  Actions: searched for 'Python 3.13 release notes'
+  (Agent 自动搜索、点击第一个结果、提取页面内容)
+🤖: Python 3.13 的主要新特性包括...
+
+😎 You: 去 GitHub 看看这个项目的最新 release
+Agent调用工具: browse_web
+  URL: https://github.com/xxx/yyy
+  Actions: clicked 'Releases'; scrolled down
+  (截图 → use_ds_from_web 识别 → 返回结构化结果)
+🤖: 最新版本是 v2.0.1，发布于...```
+
 ## 核心设计说明
 
 ### Agent 工作流程（带验证）
@@ -247,13 +266,23 @@ def _resolve_path(path):
 
 ### 网页桥接机制
 
-`use_ds_from_web` 工具通过 Playwright 控制浏览器，模拟用户操作 DeepSeek 网页版：
+**use_ds_from_web** — 控制 DeepSeek 网页版：
 
 1. 加载 `profile.json` 中的登录状态
 2. 导航到 `https://chat.deepseek.com`
 3. 可选上传图片文件
 4. 输入提示词并发送
 5. 等待并抓取回复内容（超时 300 秒，适应联网搜索场景）
+
+**browse_web** — 通用浏览器工具：
+
+1. 导航到指定 URL，等待页面加载完成（networkidle + 60s 兜底）
+2. 解析自然语言指令：`click`（点击按钮/链接）、`search`（搜索框输入）、`type`（表单填写）、`scroll`（滚动页面）
+3. 提取页面文本（去 script/style/nav，最大 8000 字符）或截图（`.png` 保存到 `screenshots/`）
+4. 截图可喂给 `use_ds_from_web` 做 OCR/分析（Agent 自动组合调用）
+5. 支持 `profile` 参数加载 `profiles/<name>.json` 持久化登录状态
+
+安全限制：禁止访问 localhost、内网 IP、`file://` 协议。
 
 ### 三面板 TUI 设计
 
@@ -333,6 +362,7 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.5**：新增 browse_web 通用浏览器工具（导航、交互、截图、profile 持久化）；合并 Playwright 单例修复 asyncio 冲突
 - **v2.4**：面板双击展开（Esc 恢复）；输入框改为多行 TextArea（Enter 换行，Ctrl+J 提交）
 - **v2.3**：TUI 新增 /quit /load /clear 命令；/load 支持数字选择+对话标题预览；工具调用路径增加 DSML 垃圾过滤；未知工具错误列出可用工具；修复 SDK 对象 JSON 序列化崩溃
 - **v2.2**：新增 setup.bat 一键安装启动脚本、requirements.txt
