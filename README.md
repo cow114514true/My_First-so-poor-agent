@@ -31,6 +31,8 @@
 - **循环保护**：最大工具调用轮次限制（默认 6 轮），防止无限循环
 - **流式输出**：最终回答以流式方式逐字输出，体验更流畅
 - **安全文件操作**：读写文件路径严格限定在项目工作目录内，防止路径遍历攻击
+- **代码索引（大文件智能阅读）**：`read_file` 遇到大文件自动返回结构大纲而非全文，支持按函数名或行号区间精准拉取；内置**双模式 token 估算器**（DeepSeek 官方 tokenizer / llama.cpp `/tokenize`），所有读取受预算上限约束，节省上下文与 API 成本
+- **上下文裁剪**：全局对话自动裁剪——`messages` 超过阈值时先删旧工具链、再删旧主干，并注入 `[Context trimmed]` 提示，防止上下文膨胀、避免本地模型上下文溢出
 
 ### TUI 图形界面
 - **三面板布局**：聊天面板、思考面板、工具面板，实时展示 Agent 工作流
@@ -45,7 +47,8 @@
 - `exec_shell_win`：在 Windows 上执行 CMD 或 PowerShell 命令，支持实时输出
 - `use_ds_from_web`：通过 Playwright 控制 DeepSeek 网页版，实现图片识别和联网搜索
 - `browse_web`：通用浏览器工具，可访问任意网站——导航、点击、填表、搜索、截图，支持 profile 持久化登录
-- `read_file`：安全读取工作目录内的文件内容
+- `read_file`：安全读取文件——小文件全文返回；大文件自动返回**结构大纲**（函数/类/import + 行号），可用 `function=`（按函数名拉取函数体）或 `start_line`/`end_line`（行号区间）精准读取，所有读取受 token 预算上限约束
+- `count_tokens`：估算文件（`path=`）或任意文本（`text=`）的 token 数，用于判断是否启用索引阅读
 - `write_file`：安全写入文件（自动创建目录，覆盖已有文件）
 
 ## 前置要求
@@ -264,6 +267,32 @@ def _resolve_path(path):
 
 所有文件操作都被限定在项目工作目录 `WORK_DIR` 内，防止路径遍历攻击（如 `../../etc/passwd`）。
 
+### 代码索引与大文件阅读
+
+`read_file` 采用**先大纲、后精准拉取**的流程，避免大文件全文进入上下文：
+
+1. 无参调用时，内部用 `estimate_tokens()` 估算文件 token 数，与预算比较：
+   - **≤ 预算** → 返回全文；
+   - **> 预算** → 代码文件返回**结构大纲**（`def`/`class`/`import` + 行号 + 总 token 数），非代码文件返回**头预览**（~2000 字符）。
+2. 拿到大纲后，按需拉取：
+   - `read_file(path, function="foo")` → 按函数名返回完整函数体；
+   - `read_file(path, start_line=N, end_line=M)` → 返回行号区间；
+   - 两者都受预算上限约束，超大区间会被截断并提示（防止模型"直读全文"绕过门槛）。
+
+**token 估算器（双模式精确）**：DeepSeek 后端加载官方 `tokenizer.json`（`tokenizers` 库）精确计数；本地后端调用 llama.cpp `POST /tokenize`；失败回退字符启发式。
+
+### 上下文裁剪
+
+全局 `messages` 列表按后端阈值自动裁剪，控制输入 token 总量（省钱 + 防本地模型上下文溢出）：
+
+1. **记账**：`_msg_size` 运行时估算，每次 API 响应后用 `response.usage.prompt_tokens` 同步为精确值。
+2. **触发**：每次 API 调用前检查，超过 `_prune_cap()` 即裁剪。
+3. **删除顺序**（从最旧开始）：
+   - 先删**已完成的 tool 链**（`assistant(tool_calls)` + 对应 `tool` 结果 + `[Self-check]`）；
+   - 仍超限则删**主干单条消息**（旧用户提问 / 旧回答）。
+   - system 提示词与当前回合永不删除。
+4. **注入提示**：裁剪后在当前问题前插入一条 `[Context trimmed]` 用户消息，告知模型旧内容已删、需要信息可用 `read_file` 重读（该提示在后续裁剪中也会被回收）。
+
 ### 网页桥接机制
 
 **use_ds_from_web** — 控制 DeepSeek 网页版：
@@ -325,6 +354,11 @@ system_prompt = """You are a helpful, self-critical assistant.
 | `reasoning_effort` | high | 推理努力程度 |
 | `thinking` | enabled | 是否启用思考链 |
 | `WORK_DIR` | 项目根目录 | 文件读写的安全根目录 |
+| `MODEL_BACKEND` | 空 | 后端切换：`local-3.5` / `local-3.6` 走本地 llama.cpp，空则 DeepSeek API |
+| `READ_BUDGET_LOCAL` | 2000 | 本地后端 `read_file` 单次读取 token 上限 |
+| `READ_BUDGET_DS` | 6000 | DeepSeek 后端 `read_file` 单次读取 token 上限 |
+| `PRUNE_CAP_LOCAL` | 上下文 50% | 本地后端对话裁剪阈值（3.5→8192，3.6→4096） |
+| `PRUNE_CAP_DS` | 8000 | DeepSeek 后端对话裁剪阈值 |
 
 ## 注意事项
 
@@ -362,6 +396,7 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.6**：read_file 大文件智能阅读（结构大纲 + `function=`/行号拉取 + token 预算上限）；新增 count_tokens 工具与双模式 token 估算器；全局上下文自动裁剪（先删工具链、后删主干，注入提示）；支持 MODEL_BACKEND 后端切换
 - **v2.5**：新增 browse_web 通用浏览器工具（导航、交互、截图、profile 持久化）；合并 Playwright 单例修复 asyncio 冲突
 - **v2.4**：面板双击展开（Esc 恢复）；输入框改为多行 TextArea（Enter 换行，Ctrl+J 提交）
 - **v2.3**：TUI 新增 /quit /load /clear 命令；/load 支持数字选择+对话标题预览；工具调用路径增加 DSML 垃圾过滤；未知工具错误列出可用工具；修复 SDK 对象 JSON 序列化崩溃

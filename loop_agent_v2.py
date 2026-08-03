@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 import subprocess
 from playwright.sync_api import sync_playwright
 import time
+import types
+
 
 tools = [
     {
@@ -77,13 +79,30 @@ tools = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a file. Path is resolved relative to the agent's working directory.",
+            "description": "Read a file. Small files return full content. Large files return a structure outline (defs/classes/imports with line numbers) instead — then fetch what you need with function= or start_line/end_line. Path is resolved relative to the agent's working directory.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path to read (relative or absolute within working directory)"}
+                    "path": {"type": "string", "description": "File path to read (relative or absolute within working directory)"},
+                    "function": {"type": "string", "description": "Name of a function/class to pull its full body (size-capped by the token budget)"},
+                    "start_line": {"type": "integer", "description": "First line of a range to read, 1-based (size-capped by the token budget)"},
+                    "end_line": {"type": "integer", "description": "Last line of a range to read, 1-based (size-capped by the token budget)"}
                 },
                 "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "count_tokens",
+            "description": "Estimate the token count of a file (path=) or arbitrary text (text=). Provide exactly one. Use to gauge context/cost before reading large files or sending large content.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to count (relative or absolute within working directory)"},
+                    "text": {"type": "string", "description": "Arbitrary text string to count"}
+                }
             }
         }
     },
@@ -201,15 +220,196 @@ def _resolve_path(path):
         raise ValueError(f"Access denied: '{path}' resolves outside working directory '{WORK_DIR}'")
     return resolved
 
-def read_file_mock(path):
+# ── code index: token estimator, outline, function-body pull ──
+
+_TOKENIZER_CACHE = None
+
+def _is_local_backend():
+    return os.environ.get("MODEL_BACKEND", "").startswith("local")
+
+def _char_heuristic(text):
+    """ASCII ≈ 1 token / 4 chars, CJK ≈ 1 token / char. Fallback for gate decisions."""
+    cjk = sum(1 for ch in text if ord(ch) > 0x2E80)
+    return cjk + (len(text) - cjk) // 4 + 1
+
+def _load_ds_tokenizer():
+    global _TOKENIZER_CACHE
+    if _TOKENIZER_CACHE is None:
+        from tokenizers import Tokenizer
+        _TOKENIZER_CACHE = Tokenizer.from_file(os.path.join(WORK_DIR, "tokenizer.json"))
+    return _TOKENIZER_CACHE
+
+def _local_tokenize(text):
+    """Exact token count from the local llama.cpp server's /tokenize endpoint."""
+    base = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:8080/v1")
+    server = base[:-3] if base.endswith("/v1") else base
+    import urllib.request
+    req = urllib.request.Request(
+        server + "/tokenize",
+        data=json.dumps({"content": text}).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return len(data.get("tokens", []))
+
+def estimate_tokens(text):
+    """Token count: DeepSeek official tokenizer / local /tokenize; heuristic on failure."""
+    if not text:
+        return 0
+    if _is_local_backend():
+        try:
+            return _local_tokenize(text)
+        except Exception:
+            return _char_heuristic(text)
+    try:
+        return len(_load_ds_tokenizer().encode(text).ids)
+    except Exception:
+        return _char_heuristic(text)
+
+def _read_budget():
+    """Per-backend read gate budget. Env-overridable."""
+    if _is_local_backend():
+        return int(os.environ.get("READ_BUDGET_LOCAL", "2000"))
+    return int(os.environ.get("READ_BUDGET_DS", "6000"))
+
+_CODE_OUTLINE_RE = re.compile(
+    r"^[ \t]*(?:(async\s+def|def|class)\s+([A-Za-z_]\w*)|(import|from)\s+([\w.]+))",
+    re.M,
+)
+
+def build_outline(content):
+    """Structure outline: list of (kind, name, 1-based line) for defs/classes/imports."""
+    out = []
+    for m in _CODE_OUTLINE_RE.finditer(content):
+        kind = (m.group(1) or m.group(3)).replace("async ", "").replace("from", "import")
+        name = m.group(2) or m.group(4)
+        line = content.count("\n", 0, m.start()) + 1
+        out.append((kind, name, line))
+    return out
+
+def extract_function(content, name):
+    """Return (body, start_line, end_line) for the first def/class named `name`.
+    Body ends at the next same-or-less-indented statement (decorators skipped); trailing blanks trimmed."""
+    m = re.search(r"^([ \t]*)(async\s+def|def|class)\s+" + re.escape(name) + r"\b", content, re.M)
+    if not m:
+        return None
+    start_indent = len(m.group(1))
+    lines = content.splitlines()
+    start_lineno = content.count("\n", 0, m.start())  # 0-based
+    end_lineno = len(lines)
+    for i in range(start_lineno + 1, len(lines)):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        if indent <= start_indent and not stripped.startswith("@"):
+            end_lineno = i
+            break
+    while end_lineno > start_lineno:  # trim trailing blank/comment lines
+        s = lines[end_lineno - 1].strip()
+        if s and not s.startswith("#"):
+            break
+        end_lineno -= 1
+    return "\n".join(lines[start_lineno:end_lineno]), start_lineno + 1, end_lineno
+
+_read_cache = {}
+
+def _cached_read_info(resolved, content):
+    key = (resolved, os.path.getmtime(resolved))
+    info = _read_cache.get(key)
+    if info is None:
+        info = {"tokens": estimate_tokens(content), "outline": build_outline(content)}
+        if len(_read_cache) > 200:
+            _read_cache.clear()
+        _read_cache[key] = info
+    return info
+
+def _cap_to_budget(slice_lines, budget, label):
+    """Return the slice in full if it fits the token budget, else a head truncated to within budget."""
+    body = "\n".join(slice_lines)
+    if estimate_tokens(body) <= budget:
+        return f"--- {label} ---\n{body}"
+    lo, hi = 0, len(slice_lines)  # largest prefix within budget (binary search)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if estimate_tokens("\n".join(slice_lines[:mid])) <= budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (f"[Large slice] {label} exceeds ~{budget}-token budget ({len(slice_lines)} lines total). "
+            f"Showing first {lo} lines.\n---\n{chr(10).join(slice_lines[:lo])}\n---\n"
+            f"Narrow the range, or read in chunks with start_line/end_line.")
+
+def read_file_mock(path, function=None, start_line=None, end_line=None):
+    """Read a file. Large files auto-return an outline; fetch parts via function= or a line range."""
     resolved = _resolve_path(path)
     if not os.path.exists(resolved):
         return f"[Error] File not found: {resolved}"
     try:
         with open(resolved, "r", encoding="utf-8") as f:
-            return f.read()
+            content = f.read()
     except UnicodeDecodeError:
         return f"[Error] Cannot read '{resolved}' as UTF-8 text (binary file?)"
+
+    total_lines = len(content.splitlines())
+
+    # 1. pull a named function/class body (token-capped like ranges)
+    if function:
+        got = extract_function(content, function)
+        if got is None:
+            return (f"[Error] No function/class named '{function}' found in {resolved}. "
+                    "Call read_file (no params) to see the outline, or use start_line/end_line.")
+        body, s, e = got
+        return _cap_to_budget(body.splitlines(), _read_budget(),
+                              f"{os.path.basename(resolved)}:{function} (lines {s}-{e})")
+
+    # 2. explicit line range (token-capped; start_line=1, end_line=total = whole file)
+    if start_line is not None or end_line is not None:
+        s = start_line if start_line is not None else 1
+        e = end_line if end_line is not None else total_lines
+        s, e = max(1, s), min(total_lines, e)
+        if s > total_lines:
+            return f"[Error] start_line {s} beyond file length ({total_lines} lines)"
+        slice_lines = content.splitlines()[s - 1:e]
+        return _cap_to_budget(slice_lines, _read_budget(),
+                              f"{os.path.basename(resolved)} (lines {s}-{e})")
+
+    # 3. full read, gated by the token budget
+    info = _cached_read_info(resolved, content)
+    budget = _read_budget()
+    if info["tokens"] <= budget:
+        return content
+
+    header = (f"[Large file] {os.path.basename(resolved)}: {total_lines} lines, ~{info['tokens']} tokens "
+              f"(budget {budget}).\n")
+    if info["outline"]:
+        lines = [header, "Outline (read_file with function=<name> pulls a body; start_line/end_line reads a range):"]
+        for kind, name, ln in info["outline"]:
+            lines.append(f"  {ln:>5}  {kind} {name}")
+        lines.append("Whole file: read_file(path, start_line=1, end_line=<total>).")
+        return "\n".join(lines)
+    # non-code file: head preview
+    preview = content[:2000]
+    return (f"{header}Non-code file — first ~2000 chars (1-{total_lines} lines available):\n---\n"
+            f"{preview}\n---\nRead further with read_file(path, start_line=N, end_line=M).")
+
+def count_tokens_mock(path=None, text=None):
+    if (path is None) == (text is None):
+        return "[Error] Provide exactly one of 'path' or 'text'."
+    if text is not None:
+        return f"~{estimate_tokens(text)} tokens (estimated)"
+    resolved = _resolve_path(path)
+    if not os.path.exists(resolved):
+        return f"[Error] File not found: {resolved}"
+    try:
+        with open(resolved, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        return f"[Error] Cannot read '{resolved}' as UTF-8 text (binary file?)"
+    n = len(content.splitlines())
+    return f"{os.path.basename(resolved)}: {n} lines, ~{estimate_tokens(content)} tokens (estimated)"
 
 def write_file_mock(path, content):
     resolved = _resolve_path(path)
@@ -595,6 +795,78 @@ def browse_web_mock(url, instructions, output="text", profile="", headed=False):
         return f"[Error] browse_web failed: {e}"
 
 
+# ── context pruning: bound the global messages list to a per-backend token cap ──
+
+_msg_size = None  # running token estimate of messages; synced to exact API usage when available
+_PRUNE_NOTICE = "[Context trimmed] 为控制上下文已删除 {n} 条较早消息（工具调用及结果等）。如需信息，请用 read_file 重新读取相关文件。"
+
+def _prune_cap():
+    """Per-backend prune threshold. Local: 50% of model ctx. DeepSeek: 8000. Both env-overridable."""
+    if _is_local_backend():
+        env = os.environ.get("PRUNE_CAP_LOCAL")
+        if env:
+            return int(env)
+        return max(1024, cfg["ctx"] // 2)
+    return int(os.environ.get("PRUNE_CAP_DS", "8000"))
+
+def _append_msg(msg):
+    """Append a message to the global list and keep the running token estimate."""
+    global _msg_size
+    messages.append(msg)
+    if _msg_size is not None:
+        _msg_size += estimate_tokens(json.dumps(msg, ensure_ascii=False))
+
+def _find_groups(q_idx):
+    """Deletable groups in messages[1:q_idx]: (start, end, size, priority).
+    Priority 0 = tool chains (transient, delete first); 1 = backbone/notice singletons."""
+    groups = []
+    i = 1  # keep system prompt at index 0
+    while i < q_idx:
+        m = messages[i]
+        if m.get("role") == "assistant" and "tool_calls" in m:
+            j = i + 1
+            while j < q_idx:
+                r = messages[j].get("role")
+                if r == "tool" or (r == "user" and str(messages[j].get("content", "")).startswith("[Self-check]")):
+                    j += 1
+                else:
+                    break
+            size = sum(estimate_tokens(json.dumps(messages[k], ensure_ascii=False)) for k in range(i, j))
+            groups.append((i, j, size, 0))
+            i = j
+        else:
+            size = estimate_tokens(json.dumps(m, ensure_ascii=False))
+            groups.append((i, i + 1, size, 1))
+            i += 1
+    return groups
+
+def _prune_messages(cap, q_idx):
+    """Prune messages[1:q_idx] (everything before the current question) when over cap.
+    Deletes tool chains first, then backbone singletons. Inserts a notice before the question.
+    Returns (new_q_idx, removed)."""
+    global _msg_size
+    if _msg_size is None or _msg_size <= cap:
+        return q_idx, 0
+    groups = sorted(_find_groups(q_idx), key=lambda g: (g[3], g[0]))
+    keep = set(range(len(messages)))
+    removed = 0
+    for start, end, size, prio in groups:
+        if _msg_size <= cap:
+            break
+        for k in range(start, end):
+            keep.discard(k)
+        _msg_size -= size
+        removed += end - start
+    if not removed:
+        return q_idx, 0
+    messages[:] = [m for i, m in enumerate(messages) if i in keep]
+    new_q = q_idx - removed
+    note = {"role": "user", "content": _PRUNE_NOTICE.format(n=removed)}
+    messages.insert(new_q, note)
+    if _msg_size is not None:
+        _msg_size += estimate_tokens(json.dumps(note, ensure_ascii=False))
+    return new_q + 1, removed
+
 def validate_tool_result(tool_name, result):
     """返回 (is_valid, critique)。
     critique 为空表示通过；不通过时 critique 直接作为质疑消息喂给模型。"""
@@ -670,6 +942,67 @@ def _is_garbage_content(text: str) -> bool:
         return True
     return False
 
+_XML_TOOLCALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.S)
+_XML_FN_RE = re.compile(r"<function=([^>\n]+)>", re.S)
+_XML_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>", re.S)
+
+def _parse_xml_tool_calls(text):
+    """Parse llama.cpp/Qwen `<tool_call>` XML blocks into OpenAI-style [{"name", "arguments"}].
+    Qwen-family local models sometimes emit tool calls as XML (often inside reasoning_content)
+    instead of JSON tool_calls; llama-server does not parse those out of the thinking block."""
+    if not text:
+        return []
+    calls = []
+    for block in _XML_TOOLCALL_RE.findall(text):
+        m = _XML_FN_RE.search(block)
+        if not m:
+            continue
+        args = {}
+        for k, v in _XML_PARAM_RE.findall(block):
+            k = k.strip()
+            v = v.strip()
+            try:
+                args[k] = json.loads(v)
+            except (json.JSONDecodeError, ValueError):
+                args[k] = v
+        calls.append({"name": m.group(1).strip(),
+                      "arguments": json.dumps(args, ensure_ascii=False)})
+    return calls
+
+# -- add api for qwen
+
+def _backend_config():
+    if os.environ.get("MODEL_BACKEND") == "local-3.5":
+        return {
+            "api_key": "sk_local",
+            "base_url": os.environ.get("LLM_BASE_URL","http://127.0.0.1:8080/v1"),
+            "model": os.environ.get("LLM_MODEL","qwen-3.5-9B"),
+            "extra_kwargs": {},
+            "max_tool_rounds": 3,
+            "ctx": 16384
+        }
+    elif os.environ.get("MODEL_BACKEND") == "local-3.6":
+        return {
+            "api_key": "sk_local",
+            "base_url": os.environ.get("LLM_BASE_URL","http://127.0.0.1:8080/v1"),
+            "model": os.environ.get("LLM_MODEL","qwen-3.6-35B"),
+            "extra_kwargs": {},
+            "max_tool_rounds": 3,
+            "ctx": 8192
+        }
+    else:
+        return {
+            "api_key": os.environ.get("DS_KEY"),
+            "base_url": os.environ.get("LLM_BASE_URL","https://api.deepseek.com"),
+            "model": "deepseek-v4-flash",
+            "extra_kwargs": {
+                "reasoning_effort": "high",
+                "extra_body": {"thinking": {"type": "enabled"}},
+            },
+            "max_tool_rounds": 6,
+            "ctx": 65536
+        }
+
 TOOL_CALL_MAP = {
     "get_date": get_date_mock,
     "get_weather": get_weather_mock,
@@ -677,13 +1010,17 @@ TOOL_CALL_MAP = {
     "use_ds_from_web": use_ds_from_web_mock,
     "browse_web": browse_web_mock,
     "read_file": read_file_mock,
+    "count_tokens": count_tokens_mock,
     "write_file": write_file_mock,
 }
 
-
+cfg = _backend_config()
+_current_raw = os.environ.get("MODEL_BACKEND", "<unset>")
+print(f"[backend] MODEL_BACKEND={_current_raw!r} → model={cfg['model']} base_url={cfg['base_url']}", flush=True)
+CURRENT_MODEL = cfg["model"]
 client = OpenAI(
-    api_key=os.environ.get("DS_KEY"),
-    base_url="https://api.deepseek.com"
+    api_key=cfg["api_key"],
+    base_url=cfg["base_url"]
 )
 
 system_prompt = """You are a helpful, self-critical assistant.
@@ -701,6 +1038,11 @@ system_prompt = """You are a helpful, self-critical assistant.
 
 ### use_ds_from_web
 - For DeepSeek's built-in web search and image recognition. Prefer browse_web for direct URL access.
+
+### read_file
+- Small files come back in full. Large files return a structure OUTLINE (functions/classes/imports with line numbers) instead — this is automatic, do not fight it.
+- After an outline, pull what you need: read_file(path, function="name") fetches one function/class body; read_file(path, start_line=N, end_line=M) reads a line range. All reads are capped at the token budget (~6000 DeepSeek / ~2000 local) — oversized ranges come back truncated with a hint, so prefer function= and narrow ranges over one giant slice.
+- count_tokens(path=...) / count_tokens(text=...) estimates token cost before sending large content.
 
 ## When to ask the user instead of guessing
 - If the user's request is ambiguous (multiple interpretations with different outcomes), ask for clarification.
@@ -748,11 +1090,13 @@ def _default_on_event(event):
     elif etype == "stream_usage":
         print(f"\n流式总量：{event.get('usage', '')}")
         _headless_streaming = False
+    elif etype == "pruned":
+        print(f"[pruned] 上下文裁剪：删除了 {event.get('removed')} 条旧消息")
     elif etype == "status":
         pass
 
 def chat(question, on_event=None):
-    global messages
+    global messages, _msg_size
 
     def _emit(event):
         if on_event:
@@ -760,26 +1104,36 @@ def chat(question, on_event=None):
         else:
             _default_on_event(event)
 
+    # 初始化消息 token 记账（首次）
+    if _msg_size is None:
+        _msg_size = estimate_tokens(json.dumps(messages, ensure_ascii=False))
+
     # 添加用户问题
-    messages.append({"role": "user", "content": question})
-    
-    MAX_TOOL_ROUNDS = 6
+    _append_msg({"role": "user", "content": question})
+    q_idx = len(messages) - 1  # 当前问题所在索引，其之前都是可裁剪的旧内容
+
+    MAX_TOOL_ROUNDS = cfg["max_tool_rounds"]
     tool_round = 0
 
     # 循环处理工具调用
     while tool_round < MAX_TOOL_ROUNDS:
         tool_round += 1
+        # 每次 API 调用前裁剪旧内容（超预算时）
+        q_idx, pruned = _prune_messages(_prune_cap(), q_idx)
+        if pruned:
+            _emit({"type": "pruned", "removed": pruned})
         # 调用 API（不使用流式）
         response = client.chat.completions.create(
-            model="deepseek-v4-flash",
+            model=cfg["model"],
             messages=messages,
             stream=False,
             tools=tools,
-            reasoning_effort="high",
-            extra_body={"thinking": {"type": "enabled"}}
+            **cfg["extra_kwargs"]
         )
-        
+
         _emit({"type": "token_usage", "usage": response.usage})
+        if response.usage:  # 用 API 精确计数同步记账
+            _msg_size = response.usage.prompt_tokens
 
         response_msg = response.choices[0].message
         use_tool_calls = response_msg.tool_calls
@@ -793,10 +1147,21 @@ def chat(question, on_event=None):
         if not use_tool_calls:
             content = response_msg.content or ""
             if _is_garbage_content(content):
-                messages.append({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"})
+                # Qwen 本地模型可能用 <tool_call> XML（常混在 reasoning 里）而非 JSON tool_calls
+                xml_calls = _parse_xml_tool_calls(reasoning or "") + _parse_xml_tool_calls(content)
+                if xml_calls:
+                    use_tool_calls = [
+                        types.SimpleNamespace(id=f"xml{i}", type="function",
+                                              function=types.SimpleNamespace(name=c["name"],
+                                                                             arguments=c["arguments"]))
+                        for i, c in enumerate(xml_calls)
+                    ]
+                else:
+                    _append_msg({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"})
+                    break
             else:
-                messages.append({"role": "assistant", "content": content})
-            break
+                _append_msg({"role": "assistant", "content": content})
+                break
         
         # 有工具调用
         _emit({"type": "tool_calls", "calls": [{"name": tc.function.name, "args": tc.function.arguments} for tc in use_tool_calls]})
@@ -806,7 +1171,7 @@ def chat(question, on_event=None):
         safe_content = response_msg.content or ""
         if _is_garbage_content(safe_content):
             safe_content = ""
-        messages.append({
+        _append_msg({
             "role": response_msg.role,
             "content": safe_content,
             "tool_calls": [
@@ -818,7 +1183,7 @@ def chat(question, on_event=None):
                         "arguments": tc.function.arguments,
                     }
                 }
-                for tc in response_msg.tool_calls
+                for tc in use_tool_calls
             ]
         })
         
@@ -849,7 +1214,7 @@ def chat(question, on_event=None):
                 tool_result = "[Error] Tool returned None (timeout or empty response)"
 
             _emit({"type": "tool_result", "tool_name": tool_name, "result": str(tool_result), "call_id": tool.id})
-            messages.append({
+            _append_msg({
                 "role": "tool",
                 "tool_call_id": tool.id,
                 "content": str(tool_result),
@@ -866,14 +1231,14 @@ def chat(question, on_event=None):
             is_valid, critique = validate_tool_result(tool_name, tool_result)
             if not is_valid:
                 _emit({"type": "self_check", "tool_name": tool_name, "critique": critique})
-                messages.append(
+                _append_msg(
                     {
                         "role": "user",
                         "content": f"[Self-check] Tool '{tool_name}' result is questionable:\n{critique}\n\nPlease critically evaluate this result and retry the tool if needed. If the result is actually usable, explain why and proceed."
                     }
                 )
         # 继续循环，让助手处理工具结果
-    
+
     # 所有工具调用完成后，流式输出最终答案
     # 注意：最后一条消息已经是助手的响应了，但我们想要流式输出，所以重新请求一次
     # 移除最后一条助手消息，用流式重新生成
@@ -883,18 +1248,22 @@ def chat(question, on_event=None):
         _emit({"type": "response_done", "content": last_msg["content"]})
         return
     # 用流式输出最终答案
+    q_idx, pruned = _prune_messages(_prune_cap(), q_idx)
+    if pruned:
+        _emit({"type": "pruned", "removed": pruned})
     response_stream = client.chat.completions.create(
-        model="deepseek-v4-flash",
+        model=cfg["model"],
         messages=messages,
         stream=True,
-        reasoning_effort="high",
-        extra_body={"thinking": {"type": "enabled"}},
-        stream_options={"include_usage": True}
+        stream_options={"include_usage": True},
+        **cfg["extra_kwargs"]
     )
-    
+
     full_response = ""
     _emit({"type": "status", "state": "generating"})
     for chunk in response_stream:
+        if not chunk.choices:
+            continue
         delta = chunk.choices[0].delta
         if getattr(delta, 'reasoning_content', None):
             _emit({"type": "thinking_chunk", "content": delta.reasoning_content, "round": tool_round})
@@ -902,13 +1271,14 @@ def chat(question, on_event=None):
             _emit({"type": "response_chunk", "content": delta.content})
             full_response += delta.content
         if chunk.usage is not None:
+            _msg_size = chunk.usage.prompt_tokens  # 流式结束也用精确计数同步
             _emit({"type": "stream_usage", "usage": chunk.usage})
 
     # 保存流式生成的助手回复（带垃圾检测）
     if _is_garbage_content(full_response):
-        messages.append({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"})
+        _append_msg({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"})
     else:
-        messages.append({"role": "assistant", "content": full_response})
+        _append_msg({"role": "assistant", "content": full_response})
         
 # 交互式连续对话
 if __name__ == "__main__":
