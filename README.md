@@ -13,7 +13,9 @@
 ├── setup.bat              # 一键安装 & 启动脚本（推荐）
 ├── requirements.txt       # Python 依赖清单
 ├── Get_State.py           # 登录 DeepSeek 网页版，保存浏览器状态
-├── loop_agent_v2.py       # 主 Agent 程序，支持多轮对话和工具调用
+├── loop_agent_v2.py       # 主 Agent 入口（薄壳：持有可变全局并再导出公共 API）
+├── loop_agent_core/       # 纯实现包（config/tokens/schemas/prompts/file_tools/shell_tools/
+│                          #   ds_web/browse/xmlutil/validation/context/events/runner）
 ├── tui.py                 # Textual TUI 界面（三面板图形交互）
 ├── profile.json           # 浏览器登录状态（运行 Get_State.py 后生成）
 ├── conversations/         # 自动保存的对话历史（JSON 格式）
@@ -29,6 +31,7 @@
 - **思考链（CoT）**：通过 `extra_body` 启用 DeepSeek 的思考链能力，提升复杂推理质量
 - **工具结果验证**：内置 `validate_tool_result()` 函数，自动检测工具返回结果是否有效，无效时触发 Agent 重试
 - **循环保护**：最大工具调用轮次限制（默认 6 轮），防止无限循环
+- **多 agent 委派**：`delegate_task` 工具将独立子任务委派给隔离上下文窗口的 sub-agent（共享工作目录与全部工具），防止单条对话上下文被长任务撑爆；内置递归守卫，sub-agent 内禁止再次委派
 - **流式输出**：最终回答以流式方式逐字输出，体验更流畅
 - **安全文件操作**：读写文件路径严格限定在项目工作目录内，防止路径遍历攻击
 - **代码索引（大文件智能阅读）**：`read_file` 遇到大文件自动返回结构大纲而非全文，支持按函数名或行号区间精准拉取；内置**双模式 token 估算器**（DeepSeek 官方 tokenizer / llama.cpp `/tokenize`），所有读取受预算上限约束，节省上下文与 API 成本
@@ -50,6 +53,7 @@
 - `read_file`：安全读取文件——小文件全文返回；大文件自动返回**结构大纲**（函数/类/import + 行号），可用 `function=`（按函数名拉取函数体）或 `start_line`/`end_line`（行号区间）精准读取，所有读取受 token 预算上限约束
 - `count_tokens`：估算文件（`path=`）或任意文本（`text=`）的 token 数，用于判断是否启用索引阅读
 - `write_file`：安全写入文件（自动创建目录，覆盖已有文件）
+- `delegate_task`：将独立子任务委派给隔离上下文的 sub-agent（共享工作目录与所有工具），返回其最终答案
 
 ## 前置要求
 
@@ -396,6 +400,7 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.7**：新增 `delegate_task` 多 agent 委派（隔离上下文 sub-agent + 递归守卫）；实现拆分到 `loop_agent_core/` 纯实现包，根目录 `loop_agent_v2.py` 收敛为薄壳（持有可变全局并再导出公共 API）；DSML 污染标记过滤与 XML 工具调用解析规范化，修复本地模型乱码导致的解析崩溃
 - **v2.6**：read_file 大文件智能阅读（结构大纲 + `function=`/行号拉取 + token 预算上限）；新增 count_tokens 工具与双模式 token 估算器；全局上下文自动裁剪（先删工具链、后删主干，注入提示）；支持 MODEL_BACKEND 后端切换
 - **v2.5**：新增 browse_web 通用浏览器工具（导航、交互、截图、profile 持久化）；合并 Playwright 单例修复 asyncio 冲突
 - **v2.4**：面板双击展开（Esc 恢复）；输入框改为多行 TextArea（Enter 换行，Ctrl+J 提交）

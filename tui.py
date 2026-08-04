@@ -14,10 +14,11 @@ from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import Screen
-from textual.widgets import RichLog, TextArea, Static
+from textual.widgets import RichLog, TextArea, Static, ProgressBar
 from textual.binding import Binding
 
 from loop_agent_v2 import chat, messages as _agent_messages
+from loop_agent_v2 import CURRENT_MODEL
 import loop_agent_v2
 
 
@@ -62,7 +63,7 @@ class QuitDialog(Screen):
 
 
 class PanelLog(RichLog):
-    """RichLog with double-click detection for panel expansion."""
+    """RichLog with double-click detection for panel expansion + reflow on resize."""
 
     class ExpandRequest(Message):
         """Posted when panel is double-clicked."""
@@ -74,6 +75,30 @@ class PanelLog(RichLog):
         super().__init__(*args, **kwargs)
         self.panel_id = panel_id
         self._last_click: float = 0.0
+        self._history: list = []  # 写入过的原始行，用于展开后按新宽度重排
+        self._last_width: int = 0
+
+    def write(self, content, *args, **kwargs):
+        self._history.append(content)
+        return super().write(content, *args, **kwargs)
+
+    def clear(self):
+        self._history.clear()
+        return super().clear()
+
+    def on_resize(self, event) -> None:
+        w = event.size.width
+        if w != self._last_width and w >= 2:
+            self._last_width = w
+            self.call_after_refresh(self.reflow)
+
+    def reflow(self) -> None:
+        """按当前面板宽度重排所有已上屏的行（RichLog 行一旦渲染宽度就固定，需整体重建）。"""
+        y = self.scroll_offset.y
+        super().clear()
+        for line in self._history:
+            super().write(line, scroll_end=False)
+        self.scroll_to(y=min(y, self.max_scroll_y), animate=False, immediate=True)
 
     def on_click(self, event) -> None:
         now = time.monotonic()
@@ -145,7 +170,27 @@ class AgentTUI(App):
     #shell-output.visible {
         height: 10;
     }
+
+    #progress-row {
+        height: 1;
+        background: $surface;
+        padding: 0 1;
+    }
+
+    #progress-label {
+        color: $text-muted;
+        width: 12;
+    }
+
+    #progress-bar {
+        width: 1fr;
+        height: 1;
+    }
     """
+
+    # 各阶段进度条目标（百分比）与标签。bar 每帧向当前阶段目标推进，阶段切换时平滑过渡。
+    _PROGRESS_TARGET = {"thinking": 15, "calling_tool": 70, "generating": 100, "idle": 0}
+    _PROGRESS_LABEL = {"thinking": "思考中…", "calling_tool": "调用工具…", "generating": "生成中…", "idle": ""}
 
     def __init__(self):
         super().__init__()
@@ -155,8 +200,12 @@ class AgentTUI(App):
         self._token_total: int = 0
         self._status: str = "idle"
         self._stream_buffer: str = ""
+        self._think_buffer: str = ""
+        self._think_round = None
         self._shell_visible: bool = False
         self._expanded_panel: str = ""  # non-empty when a panel is expanded
+        self._progress_current: float = 0.0
+        self._progress_target: int = 0
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -166,6 +215,9 @@ class AgentTUI(App):
                 yield PanelLog(id="think-panel", panel_id="think-panel", wrap=True, markup=True, max_lines=5000)
                 yield PanelLog(id="tool-panel", panel_id="tool-panel", wrap=True, markup=True, max_lines=5000)
             yield TextArea(id="input-area")
+            with Horizontal(id="progress-row"):
+                yield Static(id="progress-label")
+                yield ProgressBar(id="progress-bar", total=100)
             yield Static(id="footer-bar")
 
     def on_mount(self) -> None:
@@ -492,11 +544,15 @@ class AgentTUI(App):
                 elif kind == "shell_done":
                     shell_log.write(f"[dim]--- exit code: {data} ---[/dim]")
 
+        # 推进进度条
+        self._tick_progress()
+
     def _handle_event(self, event: dict) -> None:
         etype = event.get("type")
 
         if etype == "__agent_done__":
             self._flush_stream()
+            self._flush_think()
             self._agent_busy = False
             self._set_status("idle")
             self.query_one("#input-area", TextArea).disabled = False
@@ -517,6 +573,8 @@ class AgentTUI(App):
             "tool_calls": self._h_tool_calls,
             "tool_result": self._h_tool_result,
             "self_check": self._h_self_check,
+            "worker_start": self._h_worker_start,
+            "worker_done": self._h_worker_done,
             "response_chunk": self._h_response_chunk,
             "response_done": self._h_response_done,
             "status": self._h_status,
@@ -552,8 +610,28 @@ class AgentTUI(App):
 
     def _h_thinking_chunk(self, e: dict) -> None:
         content = e.get("content", "")
-        if content:
-            self.query_one("#think-panel", RichLog).write(content)
+        if not content:
+            return
+        rnd = e.get("round", self._think_round)
+        panel = self.query_one("#think-panel", RichLog)
+        if rnd != self._think_round:
+            # 新轮次：flush 上一轮残量 + 分隔线
+            if self._think_buffer:
+                panel.write(self._think_buffer)
+                self._think_buffer = ""
+            if self._think_round is not None:
+                panel.write(f"\n[dim]── Round {rnd} ──[/dim]")
+            self._think_round = rnd
+        self._think_buffer += content
+        # 完整行立即上屏；半行在句末标点或接近面板宽度时才 commit（同 chat 面板）
+        while "\n" in self._think_buffer:
+            line, self._think_buffer = self._think_buffer.split("\n", 1)
+            panel.write(line)
+        width = panel.content_region.width
+        if (len(self._think_buffer) >= max(1, 2*width // 3)
+                or self._think_buffer.rstrip().endswith(("。", "！", "？", "!", "?", "；", ";"))):
+            panel.write(self._think_buffer)
+            self._think_buffer = ""
 
     def _h_tool_calls(self, e: dict) -> None:
         self._set_status("calling_tool")
@@ -583,14 +661,32 @@ class AgentTUI(App):
             f"  [bold red]! {e.get('tool_name', '?')}:[/bold red] {e.get('critique', '')}"
         )
 
+    def _h_worker_start(self, e: dict) -> None:
+        self.query_one("#tool-panel", RichLog).write(
+            f"\n[bold cyan]⏳ 子任务派发 → [/bold cyan][dim]{e.get('task', '')}[/dim]"
+        )
+
+    def _h_worker_done(self, e: dict) -> None:
+        self.query_one("#tool-panel", RichLog).write(
+            f"  [bold cyan]✅ 子任务完成:[/bold cyan] [dim]{e.get('result', '')}[/dim]"
+        )
+
     def _h_response_chunk(self, e: dict) -> None:
         if self._status != "generating":
             self._set_status("generating")
             self.query_one("#chat-panel", RichLog).write("\n[bold]Assistant:[/bold]")
         self._stream_buffer += e.get("content", "")
+        chat = self.query_one("#chat-panel", RichLog)
+        # 完整行（含换行）立即上屏
         while "\n" in self._stream_buffer:
             line, self._stream_buffer = self._stream_buffer.split("\n", 1)
-            self.query_one("#chat-panel", RichLog).write(line)
+            chat.write(line)
+        # 半行只在句末标点或接近面板宽度时 commit，避免逐 token 写把文字切碎
+        width = chat.content_region.width
+        if (len(self._stream_buffer) >= max(1, width*2 // 3)
+                or self._stream_buffer.rstrip().endswith(("。", "！", "？", "!", "?", "；", ";"))):
+            chat.write(self._stream_buffer)
+            self._stream_buffer = ""
 
     def _h_response_done(self, e: dict) -> None:
         content = e.get("content", "")
@@ -606,9 +702,26 @@ class AgentTUI(App):
             self.query_one("#chat-panel", RichLog).write(self._stream_buffer)
         self._stream_buffer = ""
 
+    def _flush_think(self) -> None:
+        if self._think_buffer:
+            self.query_one("#think-panel", RichLog).write(self._think_buffer)
+        self._think_buffer = ""
+
     def _set_status(self, state: str) -> None:
         self._status = state
+        self._progress_target = self._PROGRESS_TARGET.get(state, 0)
+        self.query_one("#progress-label", Static).update(self._PROGRESS_LABEL.get(state, ""))
+        if state == "idle":
+            self._progress_current = 0.0
+            self.query_one("#progress-bar", ProgressBar).update(progress=0)
         self._update_footer()
+
+    def _tick_progress(self) -> None:
+        """每帧把进度条向当前阶段目标推进（30fps）；idle 时不动。"""
+        if self._status == "idle":
+            return
+        self._progress_current += (self._progress_target - self._progress_current) * 0.07
+        self.query_one("#progress-bar", ProgressBar).update(progress=self._progress_current)
 
     def _update_footer(self) -> None:
         icons = {
@@ -620,8 +733,9 @@ class AgentTUI(App):
         status = icons.get(self._status, self._status)
         tok = f"{self._token_total / 1000:.1f}k" if self._token_total else "0k"
         get_help = "/help"
+        model_show = CURRENT_MODEL
         self.query_one("#footer-bar", Static).update(
-            f" deepseek-v4-flash | {status} | {tok} tokens | Get-help: {get_help}"
+            f" {CURRENT_MODEL} | {status} | {tok} tokens | Get-help: {get_help}"
         )
 
 
