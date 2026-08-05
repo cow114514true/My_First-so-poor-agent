@@ -473,25 +473,23 @@ class AgentTUI(App):
 
         if question == "/help":
             chat_panel = self.query_one("#chat-panel",RichLog)
-            help_txt = """
-键盘快捷键:
-║  1  — 聚焦聊天面板                                     
-║  2  — 聚焦思考面板                                     
-║  3  — 聚焦工具面板                                     
-║  i  — 聚焦输入框                                          
-║  Tab — 切换到下一个组件                                 
-║  Ctrl+J — 发送消息   
-║  `  — 切换终端输出面板                                 
-║  Esc — 折叠展开的面板                                  
-║  双击面板标题 — 展开/恢复该面板                        
-╠════════════════════════════════════════════════════════╣
-║ 命令：                                                 
-║  /clear       — 清空对话历史                           
-║  /load [编号] — 加载保存的对话                         
-║  /load        — 列出所有可加载的对话                   
-║  /quit        — 安全退出（可保存对话）
-║  /help        — 显示此帮助信息     
-            """
+            help_txt = """键盘快捷键
+  1           聚焦聊天面板
+  2           聚焦思考面板
+  3           聚焦工具面板
+  i           聚焦输入框
+  Tab         切换焦点到下一个组件
+  Ctrl+J      发送消息（Enter 换行）
+  `           展开/收起 Shell 终端面板
+  Esc         折叠展开的面板
+  双击面板     展开/恢复该面板
+
+命令
+  /clear      清空对话历史，重置上下文
+  /load       列出所有可加载的对话
+  /load N     加载指定编号的对话
+  /quit       安全退出（可保存对话）
+  /help       显示此帮助信息"""
             chat_panel.write(help_txt)
             return
         textarea.disabled = True

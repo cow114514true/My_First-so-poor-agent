@@ -171,3 +171,26 @@ def write_file_mock(path, content):
         f.write(content)
     size = os.path.getsize(resolved)
     return f"Written {size} bytes to {resolved}"
+
+
+def edit_file_mock(path, old_string, new_string="", replace_all=False):
+    """精确替换 old_string。默认要求唯一（找不到/不唯一报错且不写入）；
+    replace_all=True 时替换全部出现。"""
+    resolved = _resolve_path(path)
+    if not os.path.exists(resolved):
+        return f"[Error] File not found: {resolved}"
+    try:
+        with open(resolved, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        return f"[Error] Cannot read '{resolved}' as UTF-8 text (binary file?)"
+    n = content.count(old_string)
+    if n == 0:
+        return f"[Error] '{old_string[:40]}' not found in {os.path.basename(resolved)}"
+    if not replace_all and n > 1:
+        return (f"[Error] '{old_string[:40]}' appears {n} times in {os.path.basename(resolved)}. "
+                "Set replace_all=True to replace every occurrence, or widen old_string to be unique.")
+    new_content = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
+    with open(resolved, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    return f"Edited {os.path.basename(resolved)}: {n} occurrence(s) replaced ({os.path.getsize(resolved)} bytes now)"

@@ -4,7 +4,7 @@ from openai import OpenAI
 
 WORK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # agent/（包上一层，即项目根）
 _PROFILES_DIR = os.path.join(WORK_DIR, "profiles")  # 浏览器登录态 profile 持久化目录
-
+_TAVILY_API_KEY = os.environ.get("TAVILY_KEY", "")
 
 def _is_local_backend():
     return os.environ.get("MODEL_BACKEND", "").startswith("local")

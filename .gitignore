@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Backups & scratch (not project features)
+*.bak
+*.backup
+backup_conflict_files/
+_verify_fix.py
+agent.py
+progress_bar.py
+progress_bar_integration_plan.md
+vi_2.py
+test_progress.py
+temp_tui.ps1
+long_text.txt
+tools_work/
+git/
+
+# Runtime data & secrets — never commit
+memories/
+conversations/
+profile.json
+web_key.txt
+clipboard_history.json
+clipboard_history.py
+screenshots/

@@ -97,7 +97,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "write_file",
-            "description": "Write content to a file. Creates new files, overwrites existing ones. Path is resolved relative to the agent's working directory. Use exec_shell_win with 'dir' to list existing files first.",
+            "description": "⚠ OVERWRITES THE WHOLE FILE. Use to create new files or replace entire files. To change part of an existing file, prefer edit_file.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -111,34 +111,17 @@ tools = [
     {
         "type": "function",
         "function": {
-            "name": "browse_web",
-            "description": "Browse any website — navigate, click, fill forms, scroll, extract content. Use for accessing the open web: Google searches, documentation, articles, any URL. For DeepSeek's built-in search/image-recognition, prefer use_ds_from_web.",
+            "name": "edit_file",
+            "description": "Precisely edit a file: replace old_string with new_string. By default old_string must be unique (fails without writing if missing or not unique); pass replace_all=True to replace every occurrence (e.g. renaming a repeated word). Safer than write_file for modifying existing files. Empty new_string deletes.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {
-                        "type": "string",
-                        "description": "The URL to navigate to. Must start with http:// or https://"
-                    },
-                    "instructions": {
-                        "type": "string",
-                        "description": "What to do, in plain English. 'extract the page content' to just read. 'search for X' to find search box and submit. 'click the Login button then fill the form' for interactions. 'scroll down and extract the article' to scroll first."
-                    },
-                    "output": {
-                        "type": "string",
-                        "enum": ["text", "screenshot", "both"],
-                        "description": "Return format. 'text' = page text (default). 'screenshot' = image (feed to use_ds_from_web for analysis). 'both' = both."
-                    },
-                    "profile": {
-                        "type": "string",
-                        "description": "Browser profile name for saved logins (e.g. 'github', 'taobao'). Omit for a clean session."
-                    },
-                    "headed": {
-                        "type": "boolean",
-                        "description": "Show browser window. Default false (headless)."
-                    }
+                    "path": {"type": "string", "description": "File path to edit (relative or absolute within working directory)"},
+                    "old_string": {"type": "string", "description": "Exact existing text to replace."},
+                    "new_string": {"type": "string", "description": "Replacement text. Empty string deletes old_string."},
+                    "replace_all": {"type": "boolean", "description": "False (default): old_string must be unique. True: replace every occurrence."}
                 },
-                "required": ["url", "instructions"]
+                "required": ["path", "old_string", "new_string"]
             }
         }
     },
@@ -153,6 +136,98 @@ tools = [
                     "task": {"type": "string", "description": "Complete, self-contained instructions for the sub-agent, including any file paths, constraints and the expected deliverable."}
                 },
                 "required": ["task"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall",
+            "description": "查询跨会话记忆。输入关键词或主题，返回匹配的记忆条目。不输入 topic 则返回最近 5 条。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "要查询的主题或关键词。留空返回最近记忆。"
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "记住一条跨会话事实。同 topic 自动覆盖更新。系统级（system）用于用户偏好/行为准则，项目级（project，默认）用于本代码库事实。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "description": "记忆主题，作为唯一标识用于去重覆盖"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "要记住的完整事实，自包含、不依赖上下文即可读懂"
+                    },
+                    "level": {
+                        "type": "string",
+                        "enum": ["system", "project"],
+                        "description": "分级：system=用户偏好/行为准则，project(默认)=本代码库事实"
+                    }
+                },
+            "required": ["topic", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browser_act",
+            "description": "Operate a real browser, ONE step per call. The session persists between calls. Each call performs a single action, then returns the page URL, title, a numbered list of interactive elements, and page text. Study the element list and drive the next step by number. Actions: open(url=), click(target=), type(target=, text=), press_enter(), scroll(text='down'/'up'), wait(text=seconds), back(), screenshot(), close(). For quick web searches or just reading a page, prefer search_web or use_ds_from_web; reserve browser_act for sites needing real interaction (login, forms, JS).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["open", "click", "type", "press_enter", "scroll", "wait", "back", "screenshot", "close"]},
+                    "url": {"type": "string", "description": "For open: the http(s) URL."},
+                    "target": {"type": "integer", "description": "For click/type: element number from the last returned element list (1-based)."},
+                    "text": {"type": "string", "description": "For type: text to fill. For scroll: 'down' or 'up'. For wait: seconds (max 10)."},
+                    "profile": {"type": "string", "description": "Optional profile name for saved logins (e.g. 'github'). Omit for a clean session."},
+                    "headed": {"type": "boolean", "description": "Show the browser window. Default false (headless)."}
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": "Search the web (Tavily). Returns a list of result titles, URLs and content snippets. Use for fact lookup, latest information, docs, news — much faster than opening a browser.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "The search query."},
+                    "max_results": {"type": "integer", "description": "Max results to return (default 5)."},
+                    "search_depth": {"type": "string", "enum": ["basic", "advanced"], "description": "Basic = faster & cheaper (default). Advanced = deeper crawl."}
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Read a specific web page's cleaned text content (Tavily extract). Use when you have a concrete URL and want its content without opening a full browser.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The http(s) URL to read."},
+                    "max_chars": {"type": "integer", "description": "Max characters to return (default 8000)."}
+                },
+                "required": ["url"]
             }
         }
     }

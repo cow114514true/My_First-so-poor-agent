@@ -35,11 +35,20 @@ def _store_tool_args(name, arguments):
     return arguments
 
 
-def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn):
+def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=False):
     """执行一批工具调用：逐个执行、发事件、追加消息、结果自检。
     delegate_fn 由薄壳注入（运行时查壳命名空间，保留 monkeypatch 语义）。"""
     for tool in use_tool_calls:
         tool_name = tool.function.name
+
+        if is_worker and tool_name in ("delegate_task", "recall", "remember"):
+            emit({"type": "tool_result", "tool_name": tool_name,
+                "result": f"[Error] {tool_name} 在 sub-agent 内不可用。将你的结果返回给主 agent 处理。",
+                "call_id": tool.id})
+            # 追加 tool 结果消息后 continue（跳过实际工具调用）
+            _append_msg({"role": "tool", "tool_call_id": tool.id,
+                    "content": f"[Error] {tool_name} 在 sub-agent 内不可用。"}, conv)
+            continue
         try:
             tool_args = json.loads(tool.function.arguments)
         except json.JSONDecodeError as e:
@@ -77,7 +86,10 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn):
             stored = stored[:cap] + f"\n...(stored truncated, {total} chars total; re-read via read_file if needed)"
         _append_msg({"role": "tool", "tool_call_id": tool.id, "content": stored}, conv)
 
-        is_valid, critique = validate_tool_result(tool_name, tool_result)
+        try:
+            is_valid, critique = validate_tool_result(tool_name, tool_result)
+        except Exception:
+            is_valid, critique = True, ""  # 自检不该有权限中断整批工具执行
         if not is_valid:
             emit({"type": "self_check", "tool_name": tool_name, "critique": critique})
             _append_msg({"role": "user",
@@ -118,7 +130,7 @@ def _safe_create(conv, **kwargs):
 
 
 def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
-              default_on_event=_default_on_event):
+              default_on_event=_default_on_event,is_main_session=False):
     """主循环实现。API 调用一律 messages=conv["messages"]（worker 隔离）。"""
     def _emit(event):
         if on_event:
@@ -129,7 +141,14 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # 初始化消息 token 记账（首次）
     if conv["size"] is None:
         conv["size"] = estimate_tokens(json.dumps(conv["messages"], ensure_ascii=False))
-
+    if is_main_session and not any(
+        m.get("role") == "user" and str(m.get("content", "")).startswith("[长期记忆")
+        for m in conv["messages"]
+    ):
+        from .memory import build_memory_injection
+        injection = build_memory_injection()
+        if injection is not None:
+            _append_msg({"role": "user", "content": injection}, conv)
     # 添加用户问题
     _append_msg({"role": "user", "content": question}, conv)
     q_idx = len(conv["messages"]) - 1  # 当前问题所在索引，其之前都是可裁剪的旧内容
@@ -152,10 +171,13 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         _cbuf, _rbuf = "", ""
         tc_frags = {}  # OpenAI JSON tool_calls 分片（index -> 累积片段），DeepSeek 用
         for chunk in response:
-            if not chunk.choices:
-                if chunk.usage is not None:
-                    _emit({"type": "token_usage", "usage": chunk.usage})
-                    conv["size"] = chunk.usage.prompt_tokens  # 用 API 精确计数同步记账
+            # include_usage：usage 只在最终 chunk（choices=[]）携带，须先于空 choices 分支处理
+            if chunk.usage is not None:
+                _emit({"type": "token_usage", "usage": chunk.usage})
+                conv["size"] = chunk.usage.prompt_tokens  # 用 API 精确计数同步记账
+                if not chunk.choices:
+                    continue
+            elif not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
             r = getattr(delta, "reasoning_content", None)
@@ -249,7 +271,13 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         _emit({"type": "status", "state": "generating"})
         _buf, _think_buf = "", ""
         for chunk in response_stream:
-            if not chunk.choices:
+            # include_usage：usage 只在最终 chunk（choices=[]）携带，须先于空 choices 跳过处理
+            if chunk.usage is not None:
+                conv["size"] = chunk.usage.prompt_tokens  # 流式结束也用精确计数同步
+                _emit({"type": "stream_usage", "usage": chunk.usage})
+                if not chunk.choices:
+                    continue
+            elif not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
             r = getattr(delta, 'reasoning_content', None)
@@ -261,9 +289,6 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 _buf += delta.content
                 full_response += delta.content
                 _buf = _stream_strip_xml(_buf, lambda s: _emit({"type": "response_chunk", "content": s}))
-            if chunk.usage is not None:
-                conv["size"] = chunk.usage.prompt_tokens  # 流式结束也用精确计数同步
-                _emit({"type": "stream_usage", "usage": chunk.usage})
 
         # 流结束：flush 残余缓冲（未闭合的 XML 片段不上屏）
         if _think_buf and "<tool_call" not in _think_buf:
@@ -288,7 +313,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                             for tc in use_tool_calls
                         ]
                     }, conv)
-                    run_tools(use_tool_calls, _emit, conv, tool_call_map, delegate_fn)
+                    run_tools(use_tool_calls, _emit, conv, tool_call_map, delegate_fn,is_worker=not is_main_session)
                 continue  # 模型还会再请求，直到给出正文
 
         # 正常答案：剥 XML + 垃圾检测后保存

@@ -27,7 +27,7 @@
 ### 核心 Agent 能力
 - **多轮对话**：基于 DeepSeek API 的连续对话能力，自动维护对话历史
 - **工具调用（Function Calling）**：Agent 可自主决定调用各类工具
-- **通用网页浏览**：`browse_web` 工具可访问任意网站——自动导航、点击按钮、填写表单、执行搜索、截取页面截图，支持 profile 持久化登录状态
+- **通用网页浏览**：`browser_act` 工具可访问任意网站——单步操作（打开/点击/填表/回车/滚动/截图），返回页面状态与可交互元素清单，支持 profile 持久化登录状态；`search_web`/`fetch_url`（Tavily）提供快速搜索与读页
 - **思考链（CoT）**：通过 `extra_body` 启用 DeepSeek 的思考链能力，提升复杂推理质量
 - **工具结果验证**：内置 `validate_tool_result()` 函数，自动检测工具返回结果是否有效，无效时触发 Agent 重试
 - **循环保护**：最大工具调用轮次限制（默认 6 轮），防止无限循环
@@ -49,7 +49,9 @@
 - `get_weather`：查询天气（Mock 实现，建议搭配联网搜索使用）
 - `exec_shell_win`：在 Windows 上执行 CMD 或 PowerShell 命令，支持实时输出
 - `use_ds_from_web`：通过 Playwright 控制 DeepSeek 网页版，实现图片识别和联网搜索
-- `browse_web`：通用浏览器工具，可访问任意网站——导航、点击、填表、搜索、截图，支持 profile 持久化登录
+- `browser_act`：通用浏览器工具——单步操作（open/click/type/press_enter/scroll/wait/back/screenshot/close），每次返回页面状态 + 可交互元素清单，支持 profile 持久化登录
+- `search_web`：Tavily 网页搜索，返回标题/URL/内容片段（1 credit/次，快速查资料）
+- `fetch_url`：Tavily 读指定网页正文（extract，每 5 URL 1 credit）
 - `read_file`：安全读取文件——小文件全文返回；大文件自动返回**结构大纲**（函数/类/import + 行号），可用 `function=`（按函数名拉取函数体）或 `start_line`/`end_line`（行号区间）精准读取，所有读取受 token 预算上限约束
 - `count_tokens`：估算文件（`path=`）或任意文本（`text=`）的 token 数，用于判断是否启用索引阅读
 - `write_file`：安全写入文件（自动创建目录，覆盖已有文件）
@@ -219,14 +221,14 @@ Agent调用工具: read_file
 
 ```
 😎 You: 帮我查一下 Python 3.13 的 release notes，看看有哪些新特性
-Agent调用工具: browse_web
+Agent调用工具: browser_act
   URL: https://google.com
   Actions: searched for 'Python 3.13 release notes'
   (Agent 自动搜索、点击第一个结果、提取页面内容)
 🤖: Python 3.13 的主要新特性包括...
 
 😎 You: 去 GitHub 看看这个项目的最新 release
-Agent调用工具: browse_web
+Agent调用工具: browser_act
   URL: https://github.com/xxx/yyy
   Actions: clicked 'Releases'; scrolled down
   (截图 → use_ds_from_web 识别 → 返回结构化结果)
@@ -307,7 +309,7 @@ def _resolve_path(path):
 4. 输入提示词并发送
 5. 等待并抓取回复内容（超时 300 秒，适应联网搜索场景）
 
-**browse_web** — 通用浏览器工具：
+**browser_act** — 单步浏览器操作工具（替换 browse_web）：
 
 1. 导航到指定 URL，等待页面加载完成（networkidle + 60s 兜底）
 2. 解析自然语言指令：`click`（点击按钮/链接）、`search`（搜索框输入）、`type`（表单填写）、`scroll`（滚动页面）
@@ -400,6 +402,7 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.8**：网络能力升级——`browse_web` 替换为单步 `browser_act`（专用浏览器线程根治 thread-switch 崩溃、goto 不再死等 networkidle、按元素清单编号操作）；新增 Tavily `search_web`/`fetch_url`（stdlib urllib 实现，零新依赖，`TAVILY_API_KEY` 环境变量）
 - **v2.7**：新增 `delegate_task` 多 agent 委派（隔离上下文 sub-agent + 递归守卫）；实现拆分到 `loop_agent_core/` 纯实现包，根目录 `loop_agent_v2.py` 收敛为薄壳（持有可变全局并再导出公共 API）；DSML 污染标记过滤与 XML 工具调用解析规范化，修复本地模型乱码导致的解析崩溃
 - **v2.6**：read_file 大文件智能阅读（结构大纲 + `function=`/行号拉取 + token 预算上限）；新增 count_tokens 工具与双模式 token 估算器；全局上下文自动裁剪（先删工具链、后删主干，注入提示）；支持 MODEL_BACKEND 后端切换
 - **v2.5**：新增 browse_web 通用浏览器工具（导航、交互、截图、profile 持久化）；合并 Playwright 单例修复 asyncio 冲突

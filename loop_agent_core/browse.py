@@ -1,4 +1,11 @@
-"""通用浏览器：URL 校验、Playwright 会话、指令解析、截图、profile 持久化。"""
+"""通用浏览器底座：browser_act 单步操作（专用线程 + 持久会话 + 元素清单）。
+
+取代 browse_web。核心改动：
+- 专用浏览器线程：所有 Playwright 调用经 ds_web._executor 归入单一线程，
+  根治 "cannot switch to a different thread"（真实会话里反复出现）。
+- goto 改 domcontentloaded + 短超时，不再死等 networkidle（大页 60s 超时）。
+- 每次调用只做一个动作，返回页面状态 + 可交互元素清单（编号），模型按编号驱动下一步。
+"""
 import ipaddress
 import os
 import re
@@ -6,7 +13,15 @@ from datetime import datetime
 from urllib.parse import urlparse
 
 from .config import _PROFILES_DIR, WORK_DIR
-from .ds_web import _get_playwright
+from .ds_web import _executor, _get_playwright
+
+_ELEMENT_SELECTORS = (
+    "button", "a[href]", "input:not([type='hidden'])",
+    "textarea", "select", "[role='button']", "[role='link']", "[role='textbox']",
+)
+
+# 会话缓存：key=(profile, headed)。全程只在 executor 线程内访问。
+_browser_sessions = {}
 
 
 def _validate_url(url: str) -> str:
@@ -28,33 +43,25 @@ def _validate_url(url: str) -> str:
     return url
 
 
-# ponytail: shared browser instances keyed by (profile, headed)
-_browser_sessions = {}
-
-
 def _get_browser_page(profile: str, headed: bool):
-    """Return (page, ctx, browser) for the given profile. Lazily creates and caches."""
+    """Return (page, ctx, browser) for the given profile. Lazily creates and caches.
+    MUST be called inside an _executor closure (owns the browser thread)."""
     key = (profile or "__default__", headed)
     if key in _browser_sessions:
         sess = _browser_sessions[key]
         try:
-            # Return existing page (reuse tab)
             return sess["page"], sess["ctx"], sess["browser"]
         except Exception:
             pass  # stale session, recreate
 
-    pw = _get_playwright()
-    browser = pw.chromium.launch(headless=not headed)
-
-    # Load storage state if profile exists
+    browser = _get_playwright().chromium.launch(headless=not headed)
     storage_path = os.path.join(_PROFILES_DIR, f"{profile}.json") if profile else None
     if storage_path and os.path.exists(storage_path):
         ctx = browser.new_context(storage_state=storage_path)
     else:
         ctx = browser.new_context()
-
     page = ctx.new_page()
-    _browser_sessions[key] = {"page": page, "ctx": ctx, "browser": browser, "playwright": pw}
+    _browser_sessions[key] = {"page": page, "ctx": ctx, "browser": browser}
     return page, ctx, browser
 
 
@@ -67,105 +74,6 @@ def _save_profile(profile: str, ctx) -> None:
     ctx.storage_state(path=storage_path)
 
 
-def _execute_instructions(page, instructions: str) -> str:
-    """Parse instructions and execute browser actions. Returns a summary."""
-    actions_done = []
-
-    # ── click ──
-    for m in re.finditer(
-        r'click\s+(?:on\s+)?(?:the\s+)?["\']?(?P<target>.+?)["\']?\s*(?:button|link|element|tab)?\s*(?:$|[,;.]|\s+(?:and|then|after|to))',
-        instructions, re.I,
-    ):
-        target = m.group("target").strip().rstrip('"\' ')
-        if not target:
-            continue
-        try:
-            # Click based on element type
-            found = page.get_by_role("button", name=re.compile(target, re.I)).first
-            if not found or not found.is_visible():
-                found = page.get_by_role("link", name=re.compile(target, re.I)).first
-            if not found or not found.is_visible():
-                found = page.get_by_text(target).first
-            if found and found.is_visible():
-                found.click()
-                actions_done.append(f"clicked '{target}'")
-                page.wait_for_timeout(1500)
-        except Exception as e:
-            actions_done.append(f"click '{target}' failed: {e}")
-
-    # ── type / fill ──
-    for m in re.finditer(
-        r'(?:type|fill|enter|input)\s+["\']?(?P<text>.+?)["\']?\s+(?:in|into|on)\s+(?:the\s+)?["\']?(?P<target>.+?)["\']?\s*(?:field|input|box|form)?\s*(?:$|[,;.]|\s+(?:and|then))',
-        instructions, re.I,
-    ):
-        text = m.group("text").strip().rstrip('"\' ')
-        target = m.group("target").strip().rstrip('"\' ')
-        if not text or not target:
-            continue
-        try:
-            # Find input by placeholder, label, or nearby text
-            el = (
-                page.get_by_placeholder(target).first
-                or page.get_by_label(target).first
-                or page.locator(f"input[name*='{target}']").first
-            )
-            if not el or not el.is_visible():
-                # Fallback: find any visible input near the target text
-                el = page.get_by_text(target).first
-                if el and el.is_visible():
-                    # Try to find input near this text
-                    pass  # too complex for v1
-            if el and el.is_visible():
-                el.fill(text)
-                actions_done.append(f"typed '{text}' into '{target}'")
-                page.wait_for_timeout(500)
-        except Exception as e:
-            actions_done.append(f"type '{text}' failed: {e}")
-
-    # ── search ──
-    for m in re.finditer(
-        r'search\s+(?:for\s+)?["\']?(?P<query>.+?)["\']?(?:\s*$|\s*(?:and|then|after|\.))',
-        instructions, re.I,
-    ):
-        query = m.group("query").strip().rstrip('"\' ')
-        if not query:
-            continue
-        try:
-            # Find search input
-            search_el = (
-                page.get_by_role("searchbox").first
-                or page.get_by_placeholder(re.compile(r"search|搜索", re.I)).first
-                or page.locator("input[type='search']").first
-                or page.locator("input[name='q']").first  # common search param
-            )
-            if search_el and search_el.is_visible():
-                search_el.fill(query)
-                search_el.press("Enter")
-                actions_done.append(f"searched for '{query}'")
-                page.wait_for_timeout(2000)
-        except Exception as e:
-            actions_done.append(f"search '{query}' failed: {e}")
-
-    # ── scroll ──
-    if re.search(r'scroll\s+down', instructions, re.I):
-        page.keyboard.press("PageDown")
-        actions_done.append("scrolled down")
-        page.wait_for_timeout(500)
-    if re.search(r'scroll\s+up', instructions, re.I):
-        page.keyboard.press("PageUp")
-        actions_done.append("scrolled up")
-        page.wait_for_timeout(500)
-
-    # ── wait ──
-    wait_m = re.search(r'wait\s+(\d+)\s*(?:seconds?|s)', instructions, re.I)
-    if wait_m:
-        secs = min(int(wait_m.group(1)), 10)  # cap at 10s
-        page.wait_for_timeout(secs * 1000)
-        actions_done.append(f"waited {secs}s")
-
-    return "; ".join(actions_done) if actions_done else "no actions executed"
-
-
 def _extract_page_text(page) -> str:
     """Extract readable text from the page."""
     try:
@@ -176,7 +84,6 @@ def _extract_page_text(page) -> str:
             clone.querySelectorAll('script, style, noscript, nav, footer, [role="navigation"]').forEach(el => el.remove());
             return clone.innerText || '';
         }""")
-        # Clean up excessive whitespace
         body_text = re.sub(r'\n{3,}', '\n\n', body_text).strip()
         return f"Title: {title}\n\n{body_text}"
     except Exception as e:
@@ -184,7 +91,7 @@ def _extract_page_text(page) -> str:
 
 
 def _take_screenshot(page) -> str:
-    """Take screenshot, save to temp file, return path."""
+    """Take screenshot, save to screenshots/, return path."""
     tmp_dir = os.path.join(WORK_DIR, "screenshots")
     os.makedirs(tmp_dir, exist_ok=True)
     path = os.path.join(tmp_dir, f"page_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png")
@@ -192,42 +99,112 @@ def _take_screenshot(page) -> str:
     return path
 
 
-def browse_web_mock(url, instructions, output="text", profile="", headed=False):
-    """Browse any website and return content."""
-    url = _validate_url(url)
-    page, ctx, browser = _get_browser_page(profile, headed)
+def _visible_elements(page):
+    """按固定选择器顺序收集可见元素——列表展示和编号点击必须用同一顺序。"""
+    els = []
+    for sel in _ELEMENT_SELECTORS:
+        for el in page.locator(sel).all():
+            try:
+                if el.is_visible():
+                    els.append(el)
+            except Exception:
+                continue
+    return els
 
+
+def _describe(el):
     try:
-        page.goto(url, wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(1000)  # extra settle time for SPAs
+        tag = el.evaluate("e => e.tagName.toLowerCase()") or "el"
+        role = el.get_attribute("role")
+        kind = role or {"a": "link", "input": "input", "textarea": "input",
+                        "select": "select"}.get(tag, tag)
+        label = (el.get_attribute("placeholder") or el.get_attribute("aria-label")
+                 or el.get_attribute("title")
+                 or (el.inner_text() or "").strip().replace("\n", " ")
+                 or (el.get_attribute("name") or ""))
+        return f"<{kind}> {label.strip()[:60]}"
+    except Exception:
+        return "<el> ?"
 
-        action_summary = _execute_instructions(page, instructions)
 
-        # Wait for any post-action navigation
+def _list_interactive_elements(page, limit=30):
+    return [f"[{i+1}] {_describe(el)}" for i, el in enumerate(_visible_elements(page)) if i < limit]
+
+
+def _find_element(page, target):
+    try:
+        idx = int(target)
+    except (TypeError, ValueError):
+        raise ValueError(f"target 必须是元素清单里的编号，拿到: {target!r}")
+    els = _visible_elements(page)
+    if 1 <= idx <= len(els):
+        return els[idx - 1]
+    raise ValueError(f"元素编号 {idx} 超出范围 (1-{len(els)})。用最新返回的元素清单。")
+
+
+def _page_state(page):
+    """返回 URL + Title + 元素清单 + 页面文本（截断 4000）。"""
+    out = [f"URL: {page.url}", f"Title: {page.title() or ''}"]
+    elements = _list_interactive_elements(page)
+    if elements:
+        out.append("Elements:")
+        out.extend(elements)
+    body = _extract_page_text(page)
+    if len(body) > 4000:
+        body = body[:4000] + f"\n... (truncated, {len(body)} chars total)"
+    out.append(f"--- Page Content ---\n{body}")
+    return "\n".join(out)
+
+
+def browser_act_mock(action, url="", target=None, text="", profile="", headed=False):
+    """单步浏览器操作：每次只做一个动作，返回页面状态 + 可交互元素清单。"""
+    def work():
+        page, ctx, browser = _get_browser_page(profile, headed)
+        out = [f"[browser_act] action: {action}"]
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)
-        except Exception:
-            pass  # timeout on networkidle is OK
+            if action == "open":
+                page.goto(_validate_url(url), wait_until="domcontentloaded", timeout=30000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=5000)
+                except Exception:
+                    pass
+                page.wait_for_timeout(500)
+                out.append("OK: navigated")
+            elif action == "click":
+                _find_element(page, target).click()
+                page.wait_for_timeout(800)
+                out.append(f"OK: clicked element #{target}")
+            elif action == "type":
+                _find_element(page, target).fill(text)
+                page.wait_for_timeout(500)
+                out.append(f"OK: typed into element #{target}")
+            elif action == "press_enter":
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(800)
+                out.append("OK: pressed Enter")
+            elif action == "scroll":
+                page.keyboard.press("PageDown" if str(text).lower() in ("", "down") else "PageUp")
+                out.append("OK: scrolled")
+            elif action == "wait":
+                secs = min(int(text or 1), 10)
+                page.wait_for_timeout(secs * 1000)
+                out.append(f"OK: waited {secs}s")
+            elif action == "back":
+                page.go_back(wait_until="domcontentloaded", timeout=30000)
+                out.append("OK: went back")
+            elif action == "screenshot":
+                out.append(f"Screenshot saved: {_take_screenshot(page)}")
+            elif action == "close":
+                _browser_sessions.pop((profile or "__default__", headed), None)
+                browser.close()
+                out.append("OK: closed browser session")
+            else:
+                raise ValueError(f"Unknown action: {action!r}. Valid: open, click, type, press_enter, scroll, wait, back, screenshot, close")
 
-        result_parts = [f"[browse_web] URL: {url}"]
-        if action_summary:
-            result_parts.append(f"Actions: {action_summary}")
-
-        if output in ("text", "both", ""):
-            text = _extract_page_text(page)
-            # Truncate very long pages
-            if len(text) > 8000:
-                text = text[:8000] + f"\n\n... (truncated, {len(text)} chars total)"
-            result_parts.append(f"--- Page Content ---\n{text}")
-
-        if output in ("screenshot", "both"):
-            screenshot_path = _take_screenshot(page)
-            result_parts.append(f"--- Screenshot saved ---\n{screenshot_path}\n[Use use_ds_from_web with this path to analyze. Ask briefly: 'Describe this screenshot concisely in plain text. No fluff.']")
-
-        # Persist profile state on each use
-        _save_profile(profile, ctx)
-
-        return "\n\n".join(result_parts)
-
-    except Exception as e:
-        return f"[Error] browse_web failed: {e}"
+            if action != "close":
+                _save_profile(profile, ctx)
+                out.append(_page_state(page))
+            return "\n".join(out)
+        except Exception as e:
+            return f"[Error] browser_act failed: {e}"
+    return _executor.call(work)

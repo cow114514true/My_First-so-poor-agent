@@ -36,11 +36,14 @@ def validate_tool_result(tool_name, result):
         if len(text) < 50:
             return False, f"Web capture too short ({len(text)} chars), likely truncated. Retry with shorter ask_prompt or check page state."
 
-    elif tool_name == "browse_web":
+    elif tool_name == "browser_act":
         if "[Error]" in text and "Access denied" in text:
             return False, f"URL blocked: {text[:200]}. Use a different URL."
         if text.startswith("[Error]"):
-            return False, f"browse_web failed: {text[:300]}. Retry with adjusted instructions or check the URL."
+            return False, f"browser_act failed: {text[:300]}. Retry with a different action or element index."
+    elif tool_name in ("search_web", "fetch_url"):
+        if text.startswith("[Error]"):
+            return False, f"{tool_name} failed: {text[:200]}. Retry or handle it directly."
 
     elif tool_name == "delegate_task":
         if "[Error]" in text:
@@ -59,7 +62,23 @@ def validate_tool_result(tool_name, result):
             return False, f"Write failed: {text[:200]}. Check path and retry."
         if "Written" in text and "bytes" in text:
             return True, ""  # 明确成功
-
+    elif tool_name == "edit_file":
+        if text.startswith("[Error]"):
+            return False, f"Edit failed: {text[:200]}"
+        if text.startswith("Edited"):
+            return True, ""
+    elif tool_name == "recall":
+        if len(str(result)) < 10:
+            return False, "recall 返回过短"
+        return True, ""
+    elif tool_name == "remember":
+        ts = str(result)
+        if ts.startswith("[Error]"):
+            return False, ts
+        # "已记住" 或 "已更新" 开头即为正常
+        if ts.startswith("已记住") or ts.startswith("已更新"):
+            return True, ""
+        return False, f"remember 结果异常: {ts[:100]}"
     # get_date: 基本不可能出错，跳过
 
     return True, ""

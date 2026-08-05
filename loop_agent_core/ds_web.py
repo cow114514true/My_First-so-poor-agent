@@ -2,16 +2,45 @@
 import os
 import sys
 import time
+import queue
+import threading
 from playwright.sync_api import sync_playwright
-
 from .config import _PROFILES_DIR
 
 _shared_pw = None  # ponytail: single sync_playwright instance shared by all tools
 _ds_session = None
 
+class BrowserExecutor:
+    """把所有 Playwright 调用归入单一专用线程（sync API 跨线程必崩）。"""
+
+    def __init__(self):
+        self._jobs = queue.Queue()
+        self._thread = threading.Thread(target=self._run, name="browser-executor", daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            fn, result_q = self._jobs.get()
+            try:
+                result_q.put(("ok", fn()))
+            except Exception as e:
+                result_q.put(("error", e))
+
+    def call(self, fn):
+        """在浏览器线程执行 fn，返回其结果；异常上抛给调用方。"""
+        result_q = queue.Queue()
+        self._jobs.put((fn, result_q))
+        status, value = result_q.get()
+        if status == "error":
+            raise value
+        return value
+
+
+_executor = BrowserExecutor()
+
 
 def _get_playwright():
-    """Return singleton sync_playwright instance. Safe to call from any thread."""
+    """Return singleton sync_playwright instance. 只在 executor 线程内调用。"""
     global _shared_pw
     if _shared_pw is None:
         _shared_pw = sync_playwright().start()
@@ -144,13 +173,15 @@ def get_response(session):
 
 
 def use_ds_from_web_mock(file_path, ask_prompt):
-    global _ds_session
-    if _ds_session is None:
-        _ds_session = log_in()
-    if file_path and file_path.strip():
-        upload_files(_ds_session, file_path)
-    input_prompt(_ds_session, ask_prompt)
-    enter_confirm(_ds_session)
-    response = get_response(_ds_session)
-
-    return response
+    def work():
+        global _ds_session
+        if _ds_session is None:
+            _ds_session = log_in()
+        if file_path and file_path.strip():
+            upload_files(_ds_session, file_path)
+        input_prompt(_ds_session, ask_prompt)
+        enter_confirm(_ds_session)
+        response = get_response(_ds_session)
+        return response
+    return _executor.call(work)
+    
