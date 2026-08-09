@@ -51,12 +51,12 @@ def _cleanup_backup(resolved, restore=False):
         try:
             shutil.copy2(resolved + ".bak", resolved)
         except Exception:
-            pass
+            pass  # 恢复失败：主写操作已失败，.bak 保留供人工抢救，比覆盖成空文件好
     try:
         if os.path.exists(resolved + ".bak"):
             os.remove(resolved + ".bak")
     except Exception:
-        pass
+        pass  # 清理失败无害：.bak 留在原地，下次写会覆盖
 
 
 def _suggest_files(path):

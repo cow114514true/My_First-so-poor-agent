@@ -13,6 +13,8 @@ import re
 from datetime import datetime
 from urllib.parse import urlparse
 
+from .debuglog import log_error
+
 from .config import _PROFILES_DIR, WORK_DIR
 from .ds_web import _executor, _get_playwright
 
@@ -84,8 +86,8 @@ def _get_browser_page(profile: str, headless: bool):
             if url:
                 try:
                     page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                except Exception:
-                    pass
+                except Exception as e:
+                    log_error("browse restore goto", e)
     _browser_sessions[key] = {"page": page, "ctx": ctx, "browser": browser}
     _last_active = key
     return page, ctx, browser
@@ -104,8 +106,8 @@ def _save_profile(profile: str, ctx, page=None) -> None:
               if page is not None else {})
         with open(os.path.join(_PROFILES_DIR, f"{profile}_session.json"), "w", encoding="utf-8") as f:
             json.dump({"url": url, "session_storage": ss}, f, ensure_ascii=False)
-    except Exception:
-        pass
+    except Exception as e:
+        log_error("save_profile session", e)
 
 
 def _load_session(profile: str):
@@ -242,7 +244,7 @@ def _do_browser(action, url, target, text, profile, headless):
         try:
             page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
-            pass
+            pass  # networkidle 对长轮询页面是常态超时，不算错误，继续
         page.wait_for_timeout(500)
         out.append("OK: navigated")
     elif action == "click":

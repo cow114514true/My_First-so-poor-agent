@@ -4,6 +4,7 @@ import subprocess
 from datetime import datetime
 
 from .control import interrupt_event
+from .debuglog import log_error
 
 
 def get_date_mock():
@@ -36,8 +37,8 @@ def exec_shell_win_mock(shell_cmd, q=None):
             all_lines.append(line)
             if q:
                 q.put(("shell_line", line))
-    except Exception:
-        pass
+    except Exception as e:
+        log_error("exec_shell read stdout", e)
 
     try:
         proc.wait(timeout=120)
