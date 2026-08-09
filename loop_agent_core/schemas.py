@@ -245,5 +245,21 @@ tools = [
                 "required": ["url"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "visual_locate",
+            "description": "当 browser_act 返回的元素清单描述不清（图标、图片按钮、'<el> ?' 等无文本元素）时用：对当前浏览器页面截图并给可交互元素画上编号框，让本地视觉模型定位目标元素，返回可点击的编号。拿到编号后再用 browser_act(click, target=编号) 执行动作。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "要定位的元素描述，如 '搜索框'、'登录按钮'、'关闭弹窗的 X'"},
+                    "profile": {"type": "string", "description": "可选：浏览器登录态名，与 browser_act 的 profile 一致"},
+                    "headless": {"type": "boolean", "description": "可选：true = 无头（默认）。false = 显示窗口。"}
+                },
+                "required": ["target"]
+            }
+        }
     }
 ]

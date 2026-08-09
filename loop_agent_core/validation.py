@@ -41,6 +41,12 @@ def validate_tool_result(tool_name, result):
             return False, f"URL blocked: {text[:200]}. Use a different URL."
         if text.startswith("[Error]"):
             return False, f"browser_act failed: {text[:300]}. Retry with a different action or element index."
+    elif tool_name == "visual_locate":
+        if text.startswith("[Error]"):
+            return False, f"visual_locate failed: {text[:200]}. Retry with a clearer target description or verify the page is open."
+        if text.startswith("[visual_locate]") and "编号 [" in text:
+            return True, ""
+        return False, f"visual_locate 结果异常: {text[:100]}"
     elif tool_name in ("search_web", "fetch_url"):
         if text.startswith("[Error]"):
             return False, f"{tool_name} failed: {text[:200]}. Retry or handle it directly."

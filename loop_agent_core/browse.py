@@ -18,9 +18,16 @@ from .debuglog import log_error
 from .config import _PROFILES_DIR, WORK_DIR
 from .ds_web import _executor, _get_playwright
 
+# input 类选择器排前，避免被 button/a 淹没导致搜索框排在 30 之后（bilibili 搜索框曾排第 75）。
+# _visible_elements 用 _css_path 去重，所以跨类别重叠（button 带 role=button 等）不会产生重复项。
 _ELEMENT_SELECTORS = (
-    "button", "a[href]", "input:not([type='hidden'])",
-    "textarea", "select", "[role='button']", "[role='link']", "[role='textbox']",
+    "input:not([type='hidden'])", "textarea", "select",
+    "[contenteditable]", "[role='search']", "[role='searchbox']", "[role='combobox']",
+    "button", "a[href]", "[role='button']", "[role='link']", "[role='textbox']",
+    "label", "summary",
+    "[role='checkbox']", "[role='radio']", "[role='switch']", "[role='tab']", "[role='menuitem']",
+    "video", "audio", "[onclick]",
+    "[tabindex]:not([tabindex='-1'])",
 )
 
 # 会话缓存：key=profile（headless 只在首次创建生效）。全程只在 executor 线程内访问。
@@ -143,30 +150,135 @@ def _take_screenshot(page) -> str:
     return path
 
 
+# 补充扫描：cursor:pointer 的"裸可点击"元素（如登录按钮是 <span>，无 role/onclick）。
+# 标准类别已覆盖的（a/button/input 及其内部）用 closest 过滤，避免重复灌入。
+# 扫描加了 节点预算(3500) + 时间预算(2s)，且用廉价预筛（可见叶子+有文本）把候选砍小，
+# 最后才对少数候选查 getComputedStyle——否则大页（视频页 DOM 数千节点）会卡死（实测挂 >90s）。
+_POINTER_SCAN_JS = r"""() => {
+    const out = [];
+    const start = performance.now();
+    const COVER = 'a, button, input, textarea, select, label, summary, video, audio, [contenteditable], [onclick], [role="button"], [role="link"], [role="textbox"], [role="search"], [role="searchbox"], [role="combobox"], [role="checkbox"], [role="radio"], [role="switch"], [role="tab"], [role="menuitem"]';
+    const all = document.querySelectorAll('body *');
+    let scanned = 0;
+    for (const el of all) {
+        if (++scanned > 3500 || performance.now() - start > 2000) break;
+        const tag = el.tagName;
+        if (tag === 'SCRIPT' || tag === 'STYLE') continue;
+        if (el.offsetParent === null) continue;          // 隐藏（display:none）——廉价检查
+        if (el.children.length > 0) continue;            // 只查叶子，容器交给叶子代表
+        const t = (el.textContent || '').trim().replace(/\s+/g, ' ');
+        if (!t && !el.getAttribute('aria-label')) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4 || r.top < 0 || r.left < 0) continue;
+        if (el.closest(COVER)) continue;                 // 已被标准类别或其祖先覆盖
+        if (getComputedStyle(el).cursor !== 'pointer') continue;  // 最后才查样式
+        out.push({ path: uniq(el) });
+        if (out.length >= 30) break;
+    }
+    return out;
+    function uniq(el) {
+        const parts = [];
+        let n = el;
+        while (n && n.nodeType === 1 && n.tagName.toLowerCase() !== 'body') {
+            if (n.id) { parts.unshift('#' + CSS.escape(n.id)); break; }
+            const kids = n.parentElement ? [...n.parentElement.children] : [];
+            parts.unshift(n.tagName.toLowerCase() + ':nth-child(' + (kids.indexOf(n) + 1) + ')');
+            n = n.parentElement;
+        }
+        return parts.join(' > ');
+    }
+}"""
+
+
+def _pointer_leaves(page):
+    """返回 cursor:pointer 且未被标准选择器覆盖的可点击元素（路径列表）。"""
+    try:
+        return page.evaluate(_POINTER_SCAN_JS)
+    except Exception:
+        return []
+
+
+_LINK_CAP = 40  # 链接类（a[href]/role=link）每页上限：防相关视频等被动链接洪水把交互控件挤出列表
+
+
 def _visible_elements(page):
-    """按固定选择器顺序收集可见元素——列表展示和编号点击必须用同一顺序。"""
+    """按固定选择器顺序收集可见元素——列表展示和编号点击必须用同一顺序。
+    遍历 page.frames() 主框架 + 所有 iframe（嵌入式播放器/登录框常在 iframe 里）。
+    用 "帧序:css_path" 去重：一个元素可能命中多个选择器（button 带 role=button 等），
+    且不同帧可能产生相同 css_path，帧序保证去重不误杀。_find_element 用编号拿到的
+    frame 元素句柄可直接点击（Playwright 跨帧操作）。"""
     els = []
-    for sel in _ELEMENT_SELECTORS:
-        for el in page.locator(sel).all():
-            try:
-                if el.is_visible():
+    seen = set()
+    link_count = 0
+    for fi, frame in enumerate(page.frames):
+        try:
+            for sel in _ELEMENT_SELECTORS:
+                for el in frame.locator(sel).all():
+                    if sel in ("a[href]", "[role='link']") and link_count >= _LINK_CAP:
+                        continue
+                    try:
+                        if not el.is_visible():
+                            continue
+                    except Exception:
+                        continue
+                    p = _css_path(el)
+                    if p == "?":  # 路径计算失败：不去重，全保留
+                        p = f"?{len(els)}"
+                    key = f"{fi}:{p}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if sel in ("a[href]", "[role='link']"):
+                        link_count += 1
                     els.append(el)
-            except Exception:
-                continue
+            for item in _pointer_leaves(frame):
+                try:
+                    el = frame.locator(item["path"]).first
+                    if not el.is_visible():
+                        continue
+                    p = _css_path(el)
+                except Exception:
+                    continue
+                if p == "?":
+                    p = f"?{len(els)}"
+                key = f"{fi}:{p}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                els.append(el)
+        except Exception:
+            continue  # 帧被移除（Frame detached）/加载中：跳过整帧不崩
     return els
+
+
+# 一次 evaluate 批量取 tag/role/label（含祖先 title 兜底），替代逐属性多次往返。
+# 注意：用 textContent 而非 innerText——innerText 每次调用都强制全页布局，
+# 视频页布局巨大时 78 个元素就是 60s+；textContent 是纯文本拼接，不触发布局。
+_DESCRIBE_JS = r"""(e) => {
+    const tag = e.tagName.toLowerCase();
+    const role = e.getAttribute('role');
+    let label = (e.getAttribute('placeholder') || e.getAttribute('aria-label')
+        || e.getAttribute('title')
+        || (e.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100)
+        || e.getAttribute('name') || '');
+    if (!label && (tag === 'video' || tag === 'audio')) label = tag + ' player';
+    if (!label || (label.length < 8 && /^[\d.,万kK%+ ]+$/.test(label))) {
+        let p = e.parentElement;
+        for (let i = 0; p && i < 3; i++, p = p.parentElement) {
+            const t = p.getAttribute && (p.getAttribute('title') || p.getAttribute('aria-label'));
+            if (t) { label = label ? t + ' ' + label : t; break; }
+        }
+    }
+    return { tag, role, label };
+}"""
 
 
 def _describe(el):
     try:
-        tag = el.evaluate("e => e.tagName.toLowerCase()") or "el"
-        role = el.get_attribute("role")
-        kind = role or {"a": "link", "input": "input", "textarea": "input",
-                        "select": "select"}.get(tag, tag)
-        label = (el.get_attribute("placeholder") or el.get_attribute("aria-label")
-                 or el.get_attribute("title")
-                 or (el.inner_text() or "").strip().replace("\n", " ")
-                 or (el.get_attribute("name") or ""))
-        return f"<{kind}> {label.strip()[:60]}"
+        d = el.evaluate(_DESCRIBE_JS)
+        kind = d["role"] or {"a": "link", "input": "input", "textarea": "input",
+                             "select": "select", "video": "video", "audio": "audio"}.get(d["tag"], d["tag"])
+        return f"<{kind}> {(d['label'] or '').strip()[:60]}"
     except Exception:
         return "<el> ?"
 
@@ -196,7 +308,9 @@ def _css_path(el):
         return "?"
 
 
-def _list_interactive_elements(page, limit=30):
+_LIST_LIMIT = 120  # 列表上限：视频页可达 119 元素，80 会把互动栏（投币按钮 #110）截掉
+
+def _list_interactive_elements(page, limit=_LIST_LIMIT):
     return [f"[{i+1}] {_describe(el)} — css={_css_path(el)}" for i, el in enumerate(_visible_elements(page)) if i < limit]
 
 
@@ -218,8 +332,19 @@ def _find_element(page, target):
     raise ValueError(f"元素编号 {idx} 超出范围 (1-{len(els)})。用最新返回的元素清单。")
 
 
+def _pause_videos(page):
+    """暂停页面上所有 <video>（含 iframe 内嵌播放器）——视频播放占满主线程会让
+    每次 Playwright 往返从 5ms 飙到 50-100ms，元素列表构建从 4s 拖到 40s+。"""
+    try:
+        for f in page.frames:
+            f.evaluate("() => { for (const v of document.querySelectorAll('video')) { v.pause(); } }")
+    except Exception:
+        pass  # 暂停失败不阻塞页面状态
+
+
 def _page_state(page):
     """返回 URL + Title + 元素清单 + 页面文本（截断 4000）。"""
+    _pause_videos(page)  # 先停视频，让后续往返恢复低延迟
     out = [f"URL: {page.url}", f"Title: {page.title() or ''}"]
     elements = _list_interactive_elements(page)
     if elements:

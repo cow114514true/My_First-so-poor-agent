@@ -19,7 +19,7 @@
 ├── loop_agent_v2.py       # 主 Agent 入口（薄壳：持有可变全局并再导出公共 API）
 ├── loop_agent_core/       # 纯实现包（config/tokens/schemas/prompts/file_tools/shell_tools/
 │                          #   ds_web/browse/xmlutil/validation/context/events/runner/
-│                          #   memory/tavily_tool/vision/confirm/control/debuglog）
+│                          #   memory/tavily_tool/vision/visual_locate/confirm/control/debuglog）
 ├── tui.py                 # Textual TUI 界面（三面板图形交互）
 ├── BUG_LEDGER.md          # 开发以来全部 bug 记录（现象/根因/修复/验证）
 ├── profile.json           # 浏览器登录状态（运行 Get_State.py 后生成）
@@ -56,7 +56,8 @@
 - `exec_shell_win`：在 Windows 上执行 CMD 或 PowerShell 命令，支持实时输出
 - `use_ds_from_web`：通过 Playwright 控制 DeepSeek 网页版，实现图片识别和联网搜索
 - `analyze_image`：**本地视觉模型**识别本地图片（截图/图表/照片）——base64 送 llama.cpp VLM，返回文字分析；图片路径不限 WORK_DIR，由确认门把关
-- `browser_act`：通用浏览器工具——单步操作（open/click/type/press_enter/hover/select_option/scroll/wait/back/screenshot/close），目标支持编号 / `css=` / `xpath=`，每次返回页面状态 + 带 CSS 选择器的元素清单，profile 持久化登录 + SPA 会话恢复
+- `browser_act`：通用浏览器工具——单步操作（open/click/type/press_enter/hover/select_option/scroll/wait/back/screenshot/close），目标支持编号 / `css=` / `xpath=`，每次返回页面状态 + 带 CSS 选择器的元素清单，profile 持久化登录 + SPA 会话恢复；元素捕获泛化——列表去重、`cursor:pointer` 裸元素扫描（登录/投币这类无 role 的 span/div）、祖先 title 命名、链接类别上限、iframe 内元素跨帧捕获、open shadow DOM 自动穿透；打开页面默认暂停视频
+- `visual_locate`：元素清单描述不清（图标/图片按钮）时的视觉兜底——截图让本地视觉模型给出目标元素粗包围框，吸附最近 DOM 元素返回编号，供 `browser_act` 点击
 - `search_web`：Tavily 网页搜索，返回标题/URL/内容片段（1 credit/次，快速查资料）
 - `fetch_url`：Tavily 读指定网页正文（extract，每 5 URL 1 credit）
 - `read_file`：安全读取文件——小文件全文返回；大文件自动返回**结构大纲**（函数/类/import + 行号），可用 `function=`（按函数名拉取函数体）或 `start_line`/`end_line`（行号区间）精准读取，所有读取受 token 预算上限约束
@@ -423,6 +424,7 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.10**：元素捕获泛化 + 性能修复——`browser_act` 元素清单去重（bilibili 158→64）、`cursor:pointer` 裸元素扫描（登录/投币等无 role 的 span/div）、祖先 title 命名（计数 span → "投币（W） 410"）、链接类别上限 + 列表上限 120、iframe 跨帧捕获 + Frame-detached 容错、open shadow DOM 自动穿透；性能——打开页面默认暂停视频、`_describe` 批量 evaluate、`innerText`→`textContent`（视频页 40s+ → 7s）；新增 `visual_locate` 工具（VLM 粗包围框 + 吸附最近 DOM 元素，视觉兜底）
 - **v2.9**：任务可中断——Esc（agent 忙碌时）设共享中断事件，流式每 chunk / 每工具前 / 每轮 API 前检查，中断时部分正文落库不丢；长 shell 命令被杀；浏览器 `browser_act` 升级——目标支持 `css=`/`xpath=`、元素清单附 CSS 选择器、新增 hover/select_option、profile 恢复 URL+sessionStorage 解决 SPA 会话丢失
 - **v2.8**：网络能力升级——`browse_web` 替换为单步 `browser_act`（专用浏览器线程根治 thread-switch 崩溃、goto 不再死等 networkidle、按元素清单编号操作）；新增 Tavily `search_web`/`fetch_url`（stdlib urllib 实现，零新依赖，`TAVILY_API_KEY` 环境变量）
 - **v2.8**：新增本地视觉能力 `analyze_image` 工具（llama.cpp VLM）+ 确认门（Allow/Deny/本会话放行，headless 自动放行，worker 请求经主会话 UI 弹窗）；`start_local_llm.bat` 加 `-p 2` 解决同一 server 自调死锁

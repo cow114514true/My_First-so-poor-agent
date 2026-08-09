@@ -35,6 +35,7 @@ from loop_agent_core.runner import run_tools as _core_run_tools
 from loop_agent_core.memory import recall_mock, remember_mock
 import loop_agent_core.memory as memory_mod
 from loop_agent_core.vision import analyze_image_mock
+from loop_agent_core.visual_locate import visual_locate_mock
 import loop_agent_core.confirm as confirm_mod
 from loop_agent_core.control import interrupt_event
 
@@ -56,6 +57,7 @@ TOOL_CALL_MAP = {
     "use_ds_from_web": use_ds_from_web_mock,
     "analyze_image": analyze_image_mock,
     "browser_act": browser_act_mock,
+    "visual_locate": visual_locate_mock,
     "search_web": search_web_mock,
     "fetch_url": fetch_url_mock,
     "read_file": read_file_mock,
