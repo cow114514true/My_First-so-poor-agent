@@ -1,9 +1,12 @@
 """主循环与工具执行：_chat 实现。依赖经参数注入（工具表/delegate/默认事件），不碰薄壳可变全局。
 API 调用一律用 conv["messages"]（修 worker 子 agent 把主线程历史发给模型的隔离 bug）。"""
 import json
+import os
 import types
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .config import _is_local_backend, client, cfg
+from .config import _is_local_backend, client, cfg, WORK_DIR
+from .control import interrupt_event
 from .context import _append_msg, _prune_cap, _prune_messages, _rollback_tool_round
 from .events import _default_on_event
 from .schemas import tools
@@ -11,6 +14,50 @@ from .tokens import estimate_tokens
 from .validation import validate_tool_result
 from .xmlutil import (_is_garbage_content, _parse_xml_tool_calls, _strip_dsml,
                       _strip_toolcall_xml, _XML_TOOLCALL_RE)
+
+
+def _dump_filtered(reason, snippet):
+    """Diagnostic: dump what got filtered so we can see why (debug_filtered.txt)."""
+    try:
+        with open(os.path.join(WORK_DIR, "debug_filtered.txt"), "a", encoding="utf-8") as f:
+            f.write(f"=== {reason} ===\n{snippet}\n\n")
+    except Exception:
+        pass
+
+
+def _dump_api_error(e, conv, kwargs):
+    """API 400 时把错误正文 + 消息结构落盘（api_error.log），便于追查。
+    含 assistant tool_calls 的 arguments（最常背锅：参数非合法 JSON 会被 DeepSeek 拒）。"""
+    import time as _t
+    try:
+        msgs = conv.get("messages", [])
+        tool_calls = [
+            {"idx": i, "id": tc.get("id"), "name": tc.get("function", {}).get("name"),
+             "arguments": tc.get("function", {}).get("arguments", "")[:2000]}
+            for i, m in enumerate(msgs) if m.get("role") == "assistant" and m.get("tool_calls")
+            for tc in m["tool_calls"]
+        ]
+        summary = {
+            "time": _t.strftime("%Y-%m-%d %H:%M:%S"),
+            "status": getattr(e, "status_code", None),
+            "error": getattr(e, "body", None) or str(e)[:1000],
+            "n_messages": len(msgs),
+            "roles": [m.get("role") for m in msgs][-30:],
+            "tool_calls": tool_calls,
+        }
+        with open(os.path.join(WORK_DIR, "api_error.log"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(summary, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+# 本地 Qwen 经常整轮只输出 thinking（reasoning_content）而 content 为空、也没工具调用 →
+# 不是垃圾，是回合没走完。注入提示让模型继续，而不是掐断整回合。
+_EMPTY_NUDGE = ("[Self-check] 你刚才只输出了思考过程，没有调用工具也没有给出回答。"
+                "请继续：调用下一步需要的工具，或直接给出最终回答。")
+# nudge 耗尽仍卡 → 准确说明是思考循环，不是乱码
+_STUCK_MSG = ("[模型陷入思考循环：连续多轮只输出思考、没有工具调用或回答。"
+              "任务未能完成，请重试，或换用 DeepSeek 后端处理复杂任务。]")
 
 
 def _xml_to_tool_calls(xml_calls):
@@ -35,47 +82,102 @@ def _store_tool_args(name, arguments):
     return arguments
 
 
+_WORKER_FORBIDDEN = ("delegate_task", "recall", "remember")  # worker 内禁用的工具
+_SYNC_MAX = 8  # 同步工具并发上限（工具多为 I/O 密集，线程池并发即够）
+
+
+def _worker_pool_size():
+    """子 agent 并发上限：本地单槽 server 并行无收益（还会抢同一 ctx）；DeepSeek 无本地模型约束。"""
+    return 1 if _is_local_backend() else 3
+
+
+def _call_tool(tool, tool_call_map):
+    """并发执行单个同步工具，返回 (call_id, result)。线程安全：不碰 conv/emit。"""
+    name = tool.function.name
+    try:
+        args = json.loads(tool.function.arguments)
+    except json.JSONDecodeError as e:
+        return tool.id, f"[Error] Invalid JSON arguments: {e}\nRaw: {tool.function.arguments}"
+    fn = tool_call_map.get(name)
+    if fn is None:
+        available = ", ".join(tool_call_map.keys())
+        return tool.id, f"[Error] Unknown tool: '{name}'. Available tools: {available}"
+    try:
+        return tool.id, fn(**args)
+    except Exception as e:
+        return tool.id, f"[Error] Tool execution failed: {e}"
+
+
+def _run_worker(task, delegate_fn):
+    """在 worker 线程跑单个子 agent（阻塞 chat），结果回主线程结算。"""
+    return delegate_fn(task)
+
+
 def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=False):
-    """执行一批工具调用：逐个执行、发事件、追加消息、结果自检。
+    """执行一批工具调用：同步工具并发（线程池）+ delegate_task 子 agent 受控并发（异步队列）。
+    并发阶段只收集结果（不碰 conv/emit，线程安全）；结算阶段按原调用顺序发事件、追加消息、结果自检。
     delegate_fn 由薄壳注入（运行时查壳命名空间，保留 monkeypatch 语义）。"""
+    if interrupt_event.is_set():
+        # 中断：回滚本工具轮（assistant tool_calls 与其 tool 结果），保持历史一致
+        _rollback_tool_round(conv)
+        return
+
+    results = {}  # call_id -> result
+    worker_meta = {}  # call_id -> task（结算阶段补发 worker_done）
+
+    # ── 1) 并发执行阶段（只收集结果）────────────────────────
+    # 同步工具：线程池并发。worker 内禁用的工具不执行，结算阶段给错误。
+    sync = [t for t in use_tool_calls
+            if t.function.name != "delegate_task"
+            and not (is_worker and t.function.name in _WORKER_FORBIDDEN)]
+    if sync:
+        with ThreadPoolExecutor(max_workers=_SYNC_MAX) as ex:
+            fut = {ex.submit(_call_tool, t, tool_call_map): t for t in sync}
+            for f in as_completed(fut):
+                cid, res = f.result()
+                results[cid] = res
+
+    # delegate_task：子 agent 异步队列（仅主 agent 可委托，受控并发）。
+    if not is_worker:
+        delegated = [t for t in use_tool_calls if t.function.name == "delegate_task"]
+        if delegated:
+            with ThreadPoolExecutor(max_workers=_worker_pool_size()) as ex:
+                futs = []
+                for t in delegated:
+                    try:
+                        task = str(json.loads(t.function.arguments).get("task", ""))
+                    except json.JSONDecodeError as e:
+                        results[t.id] = f"[Error] Invalid JSON arguments: {e}\nRaw: {t.function.arguments}"
+                        continue
+                    worker_meta[t.id] = task
+                    emit({"type": "worker_start", "task": task[:200]})  # 主线程发，worker 跑起来前先上屏
+                    futs.append((t, ex.submit(_run_worker, task, delegate_fn)))
+                for t, f in futs:
+                    try:
+                        results[t.id] = f.result()
+                    except Exception as e:
+                        results[t.id] = f"[Error] Sub-agent execution failed: {e}"
+
+    # ── 2) 结算阶段：按原调用顺序，逐分支与旧逻辑一致 ─────────
     for tool in use_tool_calls:
+        if interrupt_event.is_set():
+            _rollback_tool_round(conv)
+            return
         tool_name = tool.function.name
 
-        if is_worker and tool_name in ("delegate_task", "recall", "remember"):
-            emit({"type": "tool_result", "tool_name": tool_name,
-                "result": f"[Error] {tool_name} 在 sub-agent 内不可用。将你的结果返回给主 agent 处理。",
-                "call_id": tool.id})
-            # 追加 tool 结果消息后 continue（跳过实际工具调用）
-            _append_msg({"role": "tool", "tool_call_id": tool.id,
-                    "content": f"[Error] {tool_name} 在 sub-agent 内不可用。"}, conv)
+        if is_worker and tool_name in _WORKER_FORBIDDEN:
+            # worker 内禁止委托/记忆工具：发事件 + 落库后 continue（跳过自检）
+            err = f"[Error] {tool_name} 在 sub-agent 内不可用。将你的结果返回给主 agent 处理。"
+            emit({"type": "tool_result", "tool_name": tool_name, "result": err, "call_id": tool.id})
+            _append_msg({"role": "tool", "tool_call_id": tool.id, "content": err}, conv)
             continue
-        try:
-            tool_args = json.loads(tool.function.arguments)
-        except json.JSONDecodeError as e:
-            tool_result = f"[Error] Invalid JSON arguments: {e}\nRaw: {tool.function.arguments}"
-        else:
-            try:
-                if tool_name == "delegate_task":
-                    # 特判：不在 tool_call_map 中，worker 无法嵌套调用（递归守卫见薄壳 delegate_task_mock）
-                    task = str(tool_args.get("task", ""))
-                    emit({"type": "worker_start", "task": task[:200]})
-                    try:
-                        tool_result = delegate_fn(task)
-                    except Exception as e:
-                        tool_result = f"[Error] Sub-agent execution failed: {e}"
-                    emit({"type": "worker_done", "task": task[:200], "result": str(tool_result)[:300]})
-                else:
-                    tool_fn = tool_call_map.get(tool_name)
-                    if tool_fn is None:
-                        available = ", ".join(tool_call_map.keys())
-                        tool_result = f"[Error] Unknown tool: '{tool_name}'. Available tools: {available}"
-                    else:
-                        tool_result = tool_fn(**tool_args)
-            except Exception as e:
-                tool_result = f"[Error] Tool execution failed: {e}"
 
+        tool_result = results.get(tool.id)
         if tool_result is None:
             tool_result = "[Error] Tool returned None (timeout or empty response)"
+
+        if tool_name == "delegate_task" and tool.id in worker_meta:
+            emit({"type": "worker_done", "task": worker_meta[tool.id][:200], "result": str(tool_result)[:300]})
 
         emit({"type": "tool_result", "tool_name": tool_name, "result": str(tool_result), "call_id": tool.id})
         # 落库进上下文的结果按预算截断（本地窗口小）；显示仍走上面的完整事件
@@ -126,6 +228,7 @@ def _safe_create(conv, **kwargs):
     except Exception as e:
         if getattr(e, "status_code", None) == 400:
             _rollback_tool_round(conv)
+            _dump_api_error(e, conv, kwargs)
         raise
 
 
@@ -139,6 +242,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             default_on_event(event)
 
     # 初始化消息 token 记账（首次）
+    conv["_empty_retries"] = 0  # thinking-only 回合的重试计数（有界，防死循环）
     if conv["size"] is None:
         conv["size"] = estimate_tokens(json.dumps(conv["messages"], ensure_ascii=False))
     if is_main_session and not any(
@@ -159,6 +263,8 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # 循环处理工具调用
     while tool_round < MAX_TOOL_ROUNDS:
         tool_round += 1
+        if interrupt_event.is_set():  # 用户已按 Esc 中断
+            return "[Interrupted by user]"
         # 每次 API 调用前裁剪旧内容（超预算时）
         q_idx, pruned = _prune_messages(_prune_cap(), q_idx, conv)
         if pruned:
@@ -171,6 +277,8 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         _cbuf, _rbuf = "", ""
         tc_frags = {}  # OpenAI JSON tool_calls 分片（index -> 累积片段），DeepSeek 用
         for chunk in response:
+            if interrupt_event.is_set():  # 流式中断：停流，部分内容稍后落库
+                break
             # include_usage：usage 只在最终 chunk（choices=[]）携带，须先于空 choices 分支处理
             if chunk.usage is not None:
                 _emit({"type": "token_usage", "usage": chunk.usage})
@@ -204,6 +312,17 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         if _cbuf and "<tool_call" not in _cbuf:
             _emit({"type": "response_chunk", "content": _cbuf})
 
+        if interrupt_event.is_set():
+            # 中断：把已生成的部分正文落库（避免流式信息丢失），再停回合
+            try:
+                response.close()
+            except Exception:
+                pass
+            partial = _strip_toolcall_xml(content).strip()
+            if partial and not _is_garbage_content(partial):
+                _append_msg({"role": "assistant", "content": partial}, conv)
+            return "[Interrupted by user]"
+
         # 组装工具调用：优先 OpenAI JSON tool_calls，其次本地模型的 XML（在 reasoning/content 里）。
         # 非本地后端忽略 XML 调用（DeepSeek 只认自己签发的 tool_call id，合成 id 回送会 400）。
         if tc_frags:
@@ -223,9 +342,21 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 if cleaned and not _is_garbage_content(cleaned):
                     _append_msg({"role": "assistant", "content": cleaned}, conv)
                     return cleaned
+                if "<tool_call" in (reasoning + content):
+                    # 模型想调工具但 XML 没解析出来（常见于工具调用写在 thinking 里）→ 重试，别掐断回合
+                    continue
+                if reasoning.strip() and not cleaned:
+                    # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
+                    conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
+                    if conv["_empty_retries"] <= 3:
+                        _append_msg({"role": "user", "content": _EMPTY_NUDGE}, conv)
+                        continue
+                    msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
                 else:
-                    _append_msg({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"}, conv)
-                    return "[Response filtered: detected garbled output. Please rephrase your request.]"
+                    msg = "[Response filtered: detected garbled output. Please rephrase your request.]"
+                _dump_filtered("main_no_toolcall", f"reasoning={reasoning[:400]} content={content[:400]}")
+                _append_msg({"role": "assistant", "content": msg}, conv)
+                return msg
 
         # 有工具调用
         _emit({"type": "tool_calls", "calls": [{"name": tc.function.name, "args": tc.function.arguments} for tc in use_tool_calls]})
@@ -252,6 +383,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         }, conv)
 
         run_tools(use_tool_calls, _emit, conv, tool_call_map, delegate_fn)
+        conv["_empty_retries"] = 0  # 有产出（工具调用）→ 重置 thinking-only 计数
         # 继续循环，让助手处理工具结果
 
     # 主循环已实时输出正文；若工具轮次耗尽仍无正文，交给下面的最终流式阶段
@@ -260,6 +392,8 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # 最终流式阶段循环直到给出正文答案；期间遇到工具调用（content 或 reasoning 里的 <tool_call>）
     # 就执行并重试。上限固定 12，够写完多文件又不至于死循环拖太久。
     for _ in range(12):
+        if interrupt_event.is_set():  # 用户已按 Esc 中断
+            return "[Interrupted by user]"
         q_idx, pruned = _prune_messages(_prune_cap(), q_idx, conv)
         if pruned:
             _emit({"type": "pruned", "removed": pruned})
@@ -271,6 +405,8 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         _emit({"type": "status", "state": "generating"})
         _buf, _think_buf = "", ""
         for chunk in response_stream:
+            if interrupt_event.is_set():  # 流式中断：停流，部分内容稍后落库
+                break
             # include_usage：usage 只在最终 chunk（choices=[]）携带，须先于空 choices 跳过处理
             if chunk.usage is not None:
                 conv["size"] = chunk.usage.prompt_tokens  # 流式结束也用精确计数同步
@@ -296,6 +432,16 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         if _buf and "<tool_call" not in _buf:
             _emit({"type": "response_chunk", "content": _buf})
 
+        if interrupt_event.is_set():
+            try:
+                response_stream.close()
+            except Exception:
+                pass
+            partial = _strip_toolcall_xml(full_response).strip()
+            if partial and not _is_garbage_content(partial):
+                _append_msg({"role": "assistant", "content": partial}, conv)
+            return "[Interrupted by user]"
+
         # 模型还没读完/还在发工具调用（本地模型常把 <tool_call> 写在 reasoning 里）→ 执行后重试。
         # 非本地后端忽略 XML 调用（DeepSeek 只认自己签发的 id，合成 id 回送会 400）。
         if _is_local_backend():
@@ -314,17 +460,29 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                         ]
                     }, conv)
                     run_tools(use_tool_calls, _emit, conv, tool_call_map, delegate_fn,is_worker=not is_main_session)
+                    conv["_empty_retries"] = 0  # 有产出（工具调用）→ 重置 thinking-only 计数
                 continue  # 模型还会再请求，直到给出正文
 
         # 正常答案：剥 XML + 垃圾检测后保存
         save_response = _strip_toolcall_xml(full_response).strip()
         if _is_garbage_content(save_response):
-            _append_msg({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"}, conv)
-            return "[Response filtered: detected garbled output. Please rephrase your request.]"
+            if full_thinking.strip() and not save_response:
+                # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
+                conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
+                if conv["_empty_retries"] <= 3:
+                    _append_msg({"role": "user", "content": _EMPTY_NUDGE}, conv)
+                    continue
+                msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
+            else:
+                msg = "[Response filtered: detected garbled output. Please rephrase your request.]"
+            _dump_filtered("final_stage", f"thinking={full_thinking[:400]} response={full_response[:400]}")
+            _append_msg({"role": "assistant", "content": msg}, conv)
+            return msg
         else:
             _append_msg({"role": "assistant", "content": save_response}, conv)
             return save_response
 
     # 多次重试仍无正文（极端情况），兜底
+    _dump_filtered("fallback", f"thinking={full_thinking[:400]} response={full_response[:400]}")
     _append_msg({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"}, conv)
     return "[Response filtered: detected garbled output. Please rephrase your request.]"

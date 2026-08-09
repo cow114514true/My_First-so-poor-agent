@@ -10,6 +10,23 @@ def _is_local_backend():
     return os.environ.get("MODEL_BACKEND", "").startswith("local")
 
 
+def check_local_llm(timeout=1.0):
+    """检测本地 llama.cpp 服务端口是否可达。返回 (reachable: bool, detail: str)。
+    非 local 后端直接返回 (True, 'cloud')。TCP 连接即够——端口通即认为服务在（模型是否加载好由后续 API 调用判断）。"""
+    if not _is_local_backend():
+        return True, "cloud"
+    from urllib.parse import urlparse
+    import socket
+    base_url = cfg["base_url"].rstrip("/")
+    root = base_url[:-3] if base_url.endswith("/v1") else base_url  # 去掉 OpenAI 兼容 /v1 前缀
+    try:
+        p = urlparse(root)
+        socket.create_connection((p.hostname or "127.0.0.1", p.port or 8080), timeout=timeout).close()
+        return True, "alive"
+    except Exception:
+        return False, "unreachable"
+
+
 def _backend_config():
     if os.environ.get("MODEL_BACKEND") == "local-3.5":
         return {

@@ -1,9 +1,12 @@
 """文件工具：路径沙箱、token 估算、代码大纲、函数体拉取、读写 mock。"""
 import os
 import re
+import shutil
+import subprocess
 
 from .config import WORK_DIR
 from .tokens import _read_budget, estimate_tokens
+from . import confirm
 
 
 def _resolve_path(path):
@@ -16,6 +19,62 @@ def _resolve_path(path):
     if os.path.commonpath([resolved, WORK_DIR]) != os.path.abspath(WORK_DIR):
         raise ValueError(f"Access denied: '{path}' resolves outside working directory '{WORK_DIR}'")
     return resolved
+
+
+def _git_diff_after_edit(file_path):
+    """编辑后取 git diff 文本（空串 = 无改动/未跟踪/非 git 仓库）。只读，线程安全。"""
+    try:
+        rel = os.path.relpath(file_path, WORK_DIR)
+        r = subprocess.run(
+            ["git", "diff", "--", rel],
+            cwd=WORK_DIR, capture_output=True, text=True, timeout=10,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _backup_before_write(resolved):
+    """写前备份为 <file>.bak。返回 True 表示原本有文件（已备份）。"""
+    if not os.path.exists(resolved):
+        return False
+    try:
+        shutil.copy2(resolved, resolved + ".bak")
+        return True
+    except Exception:
+        return False
+
+
+def _cleanup_backup(resolved, restore=False):
+    """restore=True（写失败）时从 .bak 恢复；随后无论成败删除 .bak。"""
+    if restore:
+        try:
+            shutil.copy2(resolved + ".bak", resolved)
+        except Exception:
+            pass
+    try:
+        if os.path.exists(resolved + ".bak"):
+            os.remove(resolved + ".bak")
+    except Exception:
+        pass
+
+
+def _suggest_files(path):
+    """文件不存在时，列出同目录下名字相似的文件，帮模型纠错（如 HANDOFF → HANDOFF_NEXT_SESSION.md）。"""
+    base = os.path.basename(path)
+    stem = os.path.splitext(base)[0].lower()
+    d = os.path.dirname(path) or "."
+    if not os.path.isdir(d):
+        return []
+    out = []
+    try:
+        for name in os.listdir(d):
+            low = name.lower()
+            if low.startswith(stem) or stem in low:
+                out.append(name)
+    except OSError:
+        return []
+    return out[:8]
 
 
 _CODE_OUTLINE_RE = re.compile(
@@ -97,7 +156,11 @@ def read_file_mock(path, function=None, start_line=None, end_line=None):
     """Read a file. Large files auto-return an outline; fetch parts via function= or a line range."""
     resolved = _resolve_path(path)
     if not os.path.exists(resolved):
-        return f"[Error] File not found: {resolved}"
+        sim = _suggest_files(path)
+        msg = f"[Error] File not found: {resolved}"
+        if sim:
+            msg += f"\nSimilar files in the same directory: {sim}"
+        return msg
     try:
         with open(resolved, "r", encoding="utf-8") as f:
             content = f.read()
@@ -154,7 +217,11 @@ def count_tokens_mock(path=None, text=None):
         return f"~{estimate_tokens(text)} tokens (estimated)"
     resolved = _resolve_path(path)
     if not os.path.exists(resolved):
-        return f"[Error] File not found: {resolved}"
+        sim = _suggest_files(path)
+        msg = f"[Error] File not found: {resolved}"
+        if sim:
+            msg += f"\nSimilar files in the same directory: {sim}"
+        return msg
     try:
         with open(resolved, "r", encoding="utf-8") as f:
             content = f.read()
@@ -165,20 +232,37 @@ def count_tokens_mock(path=None, text=None):
 
 
 def write_file_mock(path, content):
+    """覆盖写入。写前备份（已有文件时），写失败自动恢复，返回附 git diff 供模型自检。"""
     resolved = _resolve_path(path)
+    if not confirm.request("write_file", resolved):
+        return "[Denied by user]"
+    existed = _backup_before_write(resolved)
     os.makedirs(os.path.dirname(resolved), exist_ok=True)
-    with open(resolved, "w", encoding="utf-8") as f:
-        f.write(content)
+    try:
+        with open(resolved, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        _cleanup_backup(resolved, restore=True)
+        return f"[Error] write_file failed: {e}. Original file restored from backup."
+    _cleanup_backup(resolved)  # 成功则只清理 .bak，不恢复
     size = os.path.getsize(resolved)
-    return f"Written {size} bytes to {resolved}"
+    msg = f"{'Written' if not existed else 'Overwritten'} {size} bytes to {resolved}"
+    diff = _git_diff_after_edit(resolved)
+    if diff:
+        msg += f"\n[diff for self-check]\n{diff[:500]}"
+    return msg
 
 
 def edit_file_mock(path, old_string, new_string="", replace_all=False):
     """精确替换 old_string。默认要求唯一（找不到/不唯一报错且不写入）；
-    replace_all=True 时替换全部出现。"""
+    replace_all=True 时替换全部出现。写前备份，写失败自动恢复，返回附 git diff 供模型自检。"""
     resolved = _resolve_path(path)
     if not os.path.exists(resolved):
-        return f"[Error] File not found: {resolved}"
+        sim = _suggest_files(path)
+        msg = f"[Error] File not found: {resolved}"
+        if sim:
+            msg += f"\nSimilar files in the same directory: {sim}"
+        return msg
     try:
         with open(resolved, "r", encoding="utf-8") as f:
             content = f.read()
@@ -186,11 +270,32 @@ def edit_file_mock(path, old_string, new_string="", replace_all=False):
         return f"[Error] Cannot read '{resolved}' as UTF-8 text (binary file?)"
     n = content.count(old_string)
     if n == 0:
-        return f"[Error] '{old_string[:40]}' not found in {os.path.basename(resolved)}"
+        # 找不到：给出相近行候补，帮本地模型纠错（空白/缩进偏差常见）
+        suggestions = []
+        for i, line in enumerate(content.splitlines(), 1):
+            stripped = line.strip()
+            if len(old_string) > 5 and (old_string[:5] in stripped or stripped[:5] in old_string):
+                suggestions.append(f"  line {i}: {stripped[:60]}")
+        hint = ""
+        if suggestions:
+            hint = "\nPossible close matches (check whitespace/indentation):\n" + "\n".join(suggestions[:5])
+        return f"[Error] '{old_string[:40]}' not found in {os.path.basename(resolved)}.{hint}"
+    if not confirm.request("edit_file", resolved):
+        return "[Denied by user]"
     if not replace_all and n > 1:
         return (f"[Error] '{old_string[:40]}' appears {n} times in {os.path.basename(resolved)}. "
                 "Set replace_all=True to replace every occurrence, or widen old_string to be unique.")
+    backed_up = _backup_before_write(resolved)
     new_content = content.replace(old_string, new_string) if replace_all else content.replace(old_string, new_string, 1)
-    with open(resolved, "w", encoding="utf-8") as f:
-        f.write(new_content)
-    return f"Edited {os.path.basename(resolved)}: {n} occurrence(s) replaced ({os.path.getsize(resolved)} bytes now)"
+    try:
+        with open(resolved, "w", encoding="utf-8") as f:
+            f.write(new_content)
+    except Exception as e:
+        _cleanup_backup(resolved, restore=True)
+        return f"[Error] edit_file failed: {e}. Original file restored from backup."
+    _cleanup_backup(resolved)
+    diff = _git_diff_after_edit(resolved)
+    msg = f"Edited {os.path.basename(resolved)}: {n} occurrence(s) replaced ({os.path.getsize(resolved)} bytes now)"
+    if diff:
+        msg += f"\n[diff for self-check]\n{diff[:500]}"
+    return msg

@@ -28,6 +28,34 @@ def _load_memories(path) -> list:
 def _save_memories(path,records:list) -> None:
     os.makedirs(os.path.dirname(path),exist_ok=True)
     json.dump(records, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+def _short_hint(content: str, limit: int = 60) -> str:
+    """取 content 首行作为索引提示，去 markdown 前缀并截断。"""
+    text = content.strip()
+    if not text:
+        return ""
+    first_line = text.splitlines()[0].lstrip("#-* \t")
+    if len(first_line) > limit:
+        first_line = first_line[:limit] + "…"
+    return first_line
+
+def _format_index(records: list) -> str:
+    """把全部记录格式化成索引（一行一条：topic + 日期 + 首行提示），供 recall 空参数使用。"""
+    records = sorted(records, key=lambda r: r.get("ts", ""), reverse=True)
+    system_g = [r for r in records if r.get("level") == "system"]
+    project_g = [r for r in records if r.get("level") == "project"]
+    lines = [f"[记忆索引 — 共 {len(records)} 条，输入 recall(主题) 查看详情]"]
+    if system_g:
+        lines.append(f"### 系统级记忆 ({len(system_g)})")
+        for r in system_g:
+            hint = _short_hint(r.get("content", ""))
+            lines.append(f"- {r['topic']} ({r.get('ts','')[:10]})" + (f": {hint}" if hint else ""))
+    if project_g:
+        lines.append(f"### 项目级记忆 ({len(project_g)})")
+        for r in project_g:
+            hint = _short_hint(r.get("content", ""))
+            lines.append(f"- {r['topic']} ({r.get('ts','')[:10]})" + (f": {hint}" if hint else ""))
+    return "\n".join(lines)
+
 def recall_mock(topic:str = "") -> str:
     if _worker_check and _worker_check():
         return "[Error] recall 在 sub-agent 内不可用。"
@@ -42,7 +70,7 @@ def recall_mock(topic:str = "") -> str:
     if not merge_record:
         return "暂无记忆。可用 remember(topic, content) 添加"
     if not topic.strip():
-        hits = merge_record
+        return _format_index(merge_record)
     else:
         for record in merge_record:
             if topic.lower() in (record["topic"] + "" + record["content"]).lower():

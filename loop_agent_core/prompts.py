@@ -1,5 +1,7 @@
 """系统提示词（主 agent + worker 子 agent）。"""
-from .config import _is_local_backend
+import os
+
+from .config import _is_local_backend, WORK_DIR
 
 _BASE_SYSTEM_PROMPT = """You are a helpful, self-critical assistant.
 
@@ -31,6 +33,13 @@ _BASE_SYSTEM_PROMPT = """You are a helpful, self-critical assistant.
 - The worker runs autonomously with the same working directory and returns its final answer. Multiple delegations run serially.
 - Do NOT delegate trivial lookups you can do with a single tool call — an isolated context is worth its cost only for substantial sub-tasks.
 
+## Local file work
+- For project/文件 questions, READ LOCAL FILES with read_file — do NOT call search_web / fetch_url / browser_act for things answerable from the local files. Web search is for external facts only.
+- If read_file reports "File not found", the error message lists similar filenames in the same directory — use one of those, or list the directory first with exec_shell_win(dir) to get exact names. Never guess a filename twice.
+- A large file's read_file returns an OUTLINE with line numbers: fetch what you need with function=<name> or start_line/end_line, and stay within the file's stated length (out-of-range lines are an error).
+- Before editing a file, READ the exact lines to edit first. edit_file requires old_string to match EXACTLY (every space/indentation/newline) — copy it verbatim from read_file output, do not retype it.
+- Every write_file / edit_file result includes a git diff (for tracked files; new/untracked files show none). After receiving it, verify the change matches your intent; if the diff shows something unexpected, re-read the file and retry with a corrected edit.
+
 ## When to ask the user instead of guessing
 - If the user's request is ambiguous (multiple interpretations with different outcomes), ask for clarification.
 - If you need information only the user can provide (file paths, credentials, preferences, personal context), ask — do not fabricate.
@@ -50,7 +59,16 @@ _DS_TOOL_FORMAT_NOTE = """
 - NEVER write tool calls as XML (<tool_call>...</tool_call>) — on this backend XML tool calls are ignored and stripped, never executed. Only native JSON tool_calls are run.
 """
 
-system_prompt = _BASE_SYSTEM_PROMPT + (_DS_TOOL_FORMAT_NOTE if not _is_local_backend() else "")
+# 环境事实注入：给模型真实路径，杜绝它猜 C:\Users\Public 或写死 %USERNAME%
+_ENV_FACTS = f"""
+## Environment
+- OS: Windows
+- User home directory: {os.path.expanduser('~')}
+- Agent working directory: {WORK_DIR}
+- The user's personal files live under the home directory above (Windows screenshots default to <home>\\Pictures\\Screenshots). NEVER use 'C:\\Users\\Public' or a literal '%USERNAME%' in a path; if the exact path is unclear, list the home directory with exec_shell_win (dir) to discover it.
+"""
+
+system_prompt = _BASE_SYSTEM_PROMPT + _ENV_FACTS + (_DS_TOOL_FORMAT_NOTE if not _is_local_backend() else "")
 
 # 子 agent（worker）的 system prompt：复用主提示的工具使用指引，追加子任务模式约束
 WORKER_SYSTEM_PROMPT = system_prompt + """

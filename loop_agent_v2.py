@@ -5,8 +5,10 @@ tui.py / 测试 import 的符号都必须保持可访问（详见 HANDOFF_NEXT_S
 """
 
 # 薄壳：可变全局与再导出。
+import threading
+
 from loop_agent_core.config import (WORK_DIR, _is_local_backend, _backend_config,
-                                    cfg, CURRENT_MODEL, client)
+                                    cfg, CURRENT_MODEL, client, check_local_llm)
 from loop_agent_core.tokens import (estimate_tokens, _read_budget, _char_heuristic,
                                     _local_tokenize, _load_ds_tokenizer)
 from loop_agent_core.schemas import tools
@@ -32,6 +34,9 @@ from loop_agent_core.runner import (_xml_to_tool_calls, _store_tool_args, _strea
 from loop_agent_core.runner import run_tools as _core_run_tools
 from loop_agent_core.memory import recall_mock, remember_mock
 import loop_agent_core.memory as memory_mod
+from loop_agent_core.vision import analyze_image_mock
+import loop_agent_core.confirm as confirm_mod
+from loop_agent_core.control import interrupt_event
 
 # ponytail: shared queue for TUI live shell output; None in headless mode
 _shell_output_queue = None
@@ -49,6 +54,7 @@ TOOL_CALL_MAP = {
     "get_weather": get_weather_mock,
     "exec_shell_win": exec_shell_win_mock,
     "use_ds_from_web": use_ds_from_web_mock,
+    "analyze_image": analyze_image_mock,
     "browser_act": browser_act_mock,
     "search_web": search_web_mock,
     "fetch_url": fetch_url_mock,
@@ -60,32 +66,38 @@ TOOL_CALL_MAP = {
     "remember": remember_mock
 }
 
-memory_mod._worker_check = lambda: _in_worker
+_worker_state = threading.local()  # 每线程 worker 标志：并发子 agent 互不干扰（thread-local，非全局布尔）
+
+
+def _is_worker():
+    """当前线程是否运行在子 agent 内（递归守卫 / worker 内工具禁用判断）。"""
+    return getattr(_worker_state, "in_worker", False)
+
+
+memory_mod._worker_check = _is_worker
+confirm_mod._worker_check = _is_worker
 
 messages = [
     {"role": "system", "content": system_prompt}
 ]
 
-_in_worker = False  # recursion guard: sub-agents cannot delegate
-
 
 def delegate_task_mock(task):
     """Run a sub-agent with a fresh isolated context. Returns its final text answer."""
-    global _in_worker
-    if _in_worker:
+    if _is_worker():
         return "[Error] delegate_task is not allowed inside a sub-agent. Handle the task directly in your current context."
     worker_conv = {"messages": [{"role": "system", "content": WORKER_SYSTEM_PROMPT}], "size": None}
-    _in_worker = True
+    _worker_state.in_worker = True
     try:
         return chat(task, on_event=lambda e: None, _conv=worker_conv)
     finally:
-        _in_worker = False
+        _worker_state.in_worker = False
 
 
 def _run_tools(use_tool_calls, emit, conv):
     """薄壳包装：注入 TOOL_CALL_MAP 与 delegate（保留 la._run_tools 3 参数签名 + monkeypatch 语义）。"""
     return _core_run_tools(use_tool_calls, emit, conv, TOOL_CALL_MAP,
-                           lambda task: delegate_task_mock(task),is_worker=_in_worker)
+                           lambda task: delegate_task_mock(task),is_worker=_is_worker())
 
 
 def chat(question, on_event=None, _conv=None):

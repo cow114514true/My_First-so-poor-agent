@@ -128,6 +128,21 @@ tools = [
     {
         "type": "function",
         "function": {
+            "name": "analyze_image",
+            "description": "Read a local image file with the vision model (screenshots, diagrams, photos, UI captures) and get a text description or answer to your question. Requires user confirmation. Use when you need to see what's in an image.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the image file (absolute, or relative to the working directory)"},
+                    "question": {"type": "string", "description": "What to ask about the image. Omit for a general description."}
+                },
+                "required": ["path"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delegate_task",
             "description": "Run a self-contained sub-task as an isolated sub-agent with its own fresh context window (shares the working directory and all other tools). Use when a sub-task is independent and doing it inline would bloat this conversation — e.g. a long multi-file coding job, an independent research chunk, a big write_file batch. Put EVERYTHING the worker needs in 'task' (file paths, requirements, constraints, expected deliverable) because it starts from a fresh context. The worker runs autonomously and returns its final answer.",
             "parameters": {
@@ -143,13 +158,13 @@ tools = [
         "type": "function",
         "function": {
             "name": "recall",
-            "description": "查询跨会话记忆。输入关键词或主题，返回匹配的记忆条目。不输入 topic 则返回最近 5 条。",
+            "description": "查询跨会话记忆。不输入 topic 则返回全部记忆索引（每条一行：topic + 日期 + 首行提示），便于挑选后再查询详情；输入关键词或主题则返回匹配条目的完整内容。",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
-                        "description": "要查询的主题或关键词。留空返回最近记忆。"
+                        "description": "要查询的主题或关键词。留空则返回全部记忆索引。"
                     }
                 }
             }
@@ -185,16 +200,16 @@ tools = [
         "type": "function",
         "function": {
             "name": "browser_act",
-            "description": "Operate a real browser, ONE step per call. The session persists between calls. Each call performs a single action, then returns the page URL, title, a numbered list of interactive elements, and page text. Study the element list and drive the next step by number. Actions: open(url=), click(target=), type(target=, text=), press_enter(), scroll(text='down'/'up'), wait(text=seconds), back(), screenshot(), close(). For quick web searches or just reading a page, prefer search_web or use_ds_from_web; reserve browser_act for sites needing real interaction (login, forms, JS).",
+            "description": "Operate a real browser, ONE step per call. The session persists between calls (and across agent restarts for a named profile: cookies, localStorage, sessionStorage and last URL are restored). Each call performs a single action, then returns the page URL, title, a numbered list of interactive elements (each with a css= selector), and page text. Study the element list and drive the next step by number, or target any element with css=<selector> / xpath=<expression>. Actions: open(url=), click(target=), type(target=, text=), press_enter(), press_key(text='Space'/'Escape'/...), hover(target=), select_option(target=, text=), scroll(text='down'/'up'), wait(text=seconds), back(), screenshot(), close(). For video pause use press_key(text='Space'). For quick web searches or just reading a page, prefer search_web or use_ds_from_web; reserve browser_act for sites needing real interaction (login, forms, JS).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["open", "click", "type", "press_enter", "scroll", "wait", "back", "screenshot", "close"]},
+                    "action": {"type": "string", "enum": ["open", "click", "type", "press_enter", "press_key", "hover", "select_option", "scroll", "wait", "back", "screenshot", "close"]},
                     "url": {"type": "string", "description": "For open: the http(s) URL."},
-                    "target": {"type": "integer", "description": "For click/type: element number from the last returned element list (1-based)."},
-                    "text": {"type": "string", "description": "For type: text to fill. For scroll: 'down' or 'up'. For wait: seconds (max 10)."},
-                    "profile": {"type": "string", "description": "Optional profile name for saved logins (e.g. 'github'). Omit for a clean session."},
-                    "headed": {"type": "boolean", "description": "Show the browser window. Default false (headless)."}
+                    "target": {"type": ["integer", "string"], "description": "For click/type/hover/select_option: element number from the last element list (1-based), or css=<selector> / xpath=<expression> to target any element."},
+                    "text": {"type": "string", "description": "For type: text to fill. For select_option: the option value/label. For press_key: key name e.g. 'Space'/'Escape'/'Enter'. For scroll: 'down' or 'up'. For wait: seconds (max 10)."},
+                    "profile": {"type": "string", "description": "Optional profile name for saved logins + session restore (e.g. 'github'). Omit for a clean session."},
+                    "headless": {"type": "boolean", "description": "true = no window (default). false = show the browser window — use false when you need the user to log in or solve a captcha."}
                 },
                 "required": ["action"]
             }

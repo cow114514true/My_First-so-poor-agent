@@ -21,13 +21,13 @@ def test_worker_system_prompt():
 
 
 def test_recursion_guard():
-    la._in_worker = True
+    la._worker_state.in_worker = True
     try:
         res = la.delegate_task_mock("nested task")
         assert "[Error]" in res and "not allowed" in res
     finally:
-        la._in_worker = False
-    assert la._in_worker is False  # 守卫已复位
+        la._worker_state.in_worker = False
+    assert la._is_worker() is False  # 守卫已复位
 
 
 def test_delegate_dispatch_and_events():
@@ -68,7 +68,7 @@ def test_worker_isolated_context():
 
     orig_chat = la.chat
     la.chat = fake_chat
-    la._in_worker = False
+    la._worker_state.in_worker = False
     try:
         res = la.delegate_task_mock("isolated task")
     finally:
@@ -80,7 +80,7 @@ def test_worker_isolated_context():
     assert [m["role"] for m in conv["messages"]] == ["system"]
     assert conv["messages"][0]["content"] == la.WORKER_SYSTEM_PROMPT
     assert captured["on_event"] is not None  # worker 内部事件被抑制（黑盒）
-    assert la._in_worker is False
+    assert la._is_worker() is False
 
 
 def test_validate():
@@ -128,10 +128,49 @@ def test_chat_impl_passes_conv_messages():
         la._msg_size = None
 
 
+def test_run_tools_concurrent_mixed():
+    """混合轮：同步工具并发 + delegate 子 agent，结算按原调用顺序（call_id 关联）。"""
+    import loop_agent_core.runner as runner_mod
+
+    def fake_tool(a=0):
+        return f"RESULT_{a}"
+
+    counter = iter(range(10))
+
+    def mk(name, args):
+        return types.SimpleNamespace(
+            id=f"call_{next(counter)}",
+            function=types.SimpleNamespace(name=name, arguments=json.dumps(args)))
+
+    calls = [
+        mk("fake_tool", {"a": 1}),
+        mk("delegate_task", {"task": "Do X"}),
+        mk("fake_tool", {"a": 2}),
+    ]
+    emitted = []
+    conv = {"messages": [{"role": "system", "content": "s"}], "size": None}
+
+    orig_validate = runner_mod.validate_tool_result
+    runner_mod.validate_tool_result = lambda name, res: (True, "")
+    try:
+        runner_mod.run_tools(calls, emitted.append, conv, {"fake_tool": fake_tool},
+                             lambda task: "WORKER_DONE", is_worker=False)
+    finally:
+        runner_mod.validate_tool_result = orig_validate
+
+    msgs = [m for m in conv["messages"] if m["role"] == "tool"]
+    assert [m["tool_call_id"] for m in msgs] == ["call_0", "call_1", "call_2"]  # 原始顺序
+    assert [m["content"] for m in msgs] == ["RESULT_1", "WORKER_DONE", "RESULT_2"]
+    kinds = [e["type"] for e in emitted]
+    assert kinds[0] == "worker_start" and emitted[0]["task"] == "Do X"
+    assert "worker_done" in kinds
+    assert len([e for e in emitted if e["type"] == "tool_result"]) == 3
+
+
 if __name__ == "__main__":
     for fn in [test_tool_definition, test_worker_system_prompt, test_recursion_guard,
                test_delegate_dispatch_and_events, test_worker_isolated_context, test_validate,
-               test_chat_impl_passes_conv_messages]:
+               test_chat_impl_passes_conv_messages, test_run_tools_concurrent_mixed]:
         fn()
         print(f"ok: {fn.__name__}")
     print("all multi-agent self-checks passed")

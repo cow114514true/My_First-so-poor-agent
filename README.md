@@ -27,11 +27,12 @@
 ### 核心 Agent 能力
 - **多轮对话**：基于 DeepSeek API 的连续对话能力，自动维护对话历史
 - **工具调用（Function Calling）**：Agent 可自主决定调用各类工具
-- **通用网页浏览**：`browser_act` 工具可访问任意网站——单步操作（打开/点击/填表/回车/滚动/截图），返回页面状态与可交互元素清单，支持 profile 持久化登录状态；`search_web`/`fetch_url`（Tavily）提供快速搜索与读页
+- **通用网页浏览**：`browser_act` 工具可访问任意网站——单步操作（打开/点击/填表/回车/悬停/下拉/滚动/截图），目标支持元素编号、`css=` 选择器、`xpath=` 表达式；返回页面状态 + 带 CSS 选择器的可交互元素清单；profile 持久化登录状态 + SPA 会话（URL/sessionStorage）恢复；`search_web`/`fetch_url`（Tavily）提供快速搜索与读页
 - **思考链（CoT）**：通过 `extra_body` 启用 DeepSeek 的思考链能力，提升复杂推理质量
 - **工具结果验证**：内置 `validate_tool_result()` 函数，自动检测工具返回结果是否有效，无效时触发 Agent 重试
 - **循环保护**：最大工具调用轮次限制（默认 6 轮），防止无限循环
 - **多 agent 委派**：`delegate_task` 工具将独立子任务委派给隔离上下文窗口的 sub-agent（共享工作目录与全部工具），防止单条对话上下文被长任务撑爆；内置递归守卫，sub-agent 内禁止再次委派
+- **本地视觉能力**：`analyze_image` 工具调用本地 llama.cpp 视觉模型（Qwen3.5-9B VLM）识别图片；**确认门**——读图/写文件/改文件在 TUI 弹窗征求同意（Allow/Deny/本会话放行），worker 子任务的敏感操作也经主会话 UI 弹窗
 - **流式输出**：最终回答以流式方式逐字输出，体验更流畅
 - **安全文件操作**：读写文件路径严格限定在项目工作目录内，防止路径遍历攻击
 - **代码索引（大文件智能阅读）**：`read_file` 遇到大文件自动返回结构大纲而非全文，支持按函数名或行号区间精准拉取；内置**双模式 token 估算器**（DeepSeek 官方 tokenizer / llama.cpp `/tokenize`），所有读取受预算上限约束，节省上下文与 API 成本
@@ -49,7 +50,8 @@
 - `get_weather`：查询天气（Mock 实现，建议搭配联网搜索使用）
 - `exec_shell_win`：在 Windows 上执行 CMD 或 PowerShell 命令，支持实时输出
 - `use_ds_from_web`：通过 Playwright 控制 DeepSeek 网页版，实现图片识别和联网搜索
-- `browser_act`：通用浏览器工具——单步操作（open/click/type/press_enter/scroll/wait/back/screenshot/close），每次返回页面状态 + 可交互元素清单，支持 profile 持久化登录
+- `analyze_image`：**本地视觉模型**识别本地图片（截图/图表/照片）——base64 送 llama.cpp VLM，返回文字分析；图片路径不限 WORK_DIR，由确认门把关
+- `browser_act`：通用浏览器工具——单步操作（open/click/type/press_enter/hover/select_option/scroll/wait/back/screenshot/close），目标支持编号 / `css=` / `xpath=`，每次返回页面状态 + 带 CSS 选择器的元素清单，profile 持久化登录 + SPA 会话恢复
 - `search_web`：Tavily 网页搜索，返回标题/URL/内容片段（1 credit/次，快速查资料）
 - `fetch_url`：Tavily 读指定网页正文（extract，每 5 URL 1 credit）
 - `read_file`：安全读取文件——小文件全文返回；大文件自动返回**结构大纲**（函数/类/import + 行号），可用 `function=`（按函数名拉取函数体）或 `start_line`/`end_line`（行号区间）精准读取，所有读取受 token 预算上限约束
@@ -234,6 +236,17 @@ Agent调用工具: browser_act
   (截图 → use_ds_from_web 识别 → 返回结构化结果)
 🤖: 最新版本是 v2.0.1，发布于...```
 
+### 6. 本地图片识别（analyze_image）
+
+需要先运行 `start_local_llm.bat`（选 3.5，含视觉 mmproj）。TUI 会弹出确认框征求同意。
+
+```
+😎 You: 看看这张截图里有没有报错
+Agent调用工具: analyze_image
+  (TUI 弹窗确认 → base64 送本地视觉模型)
+🤖: 截图里有一个红色错误弹窗：'ImportError: No module named x'...
+```
+
 ## 核心设计说明
 
 ### Agent 工作流程（带验证）
@@ -363,6 +376,9 @@ system_prompt = """You are a helpful, self-critical assistant.
 | `MODEL_BACKEND` | 空 | 后端切换：`local-3.5` / `local-3.6` 走本地 llama.cpp，空则 DeepSeek API |
 | `READ_BUDGET_LOCAL` | 2000 | 本地后端 `read_file` 单次读取 token 上限 |
 | `READ_BUDGET_DS` | 6000 | DeepSeek 后端 `read_file` 单次读取 token 上限 |
+| `VISION_BASE_URL` | `http://127.0.0.1:8080/v1` | `analyze_image` 连接的本地视觉 server |
+| `VISION_MODEL` | `Qwen3.5-9B` | 视觉模型名 |
+| `VISION_MAX_TOKENS` | 1024 | 视觉返回文字上限（防淹没上下文） |
 | `PRUNE_CAP_LOCAL` | 上下文 50% | 本地后端对话裁剪阈值（3.5→8192，3.6→4096） |
 | `PRUNE_CAP_DS` | 8000 | DeepSeek 后端对话裁剪阈值 |
 
@@ -402,7 +418,9 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.9**：任务可中断——Esc（agent 忙碌时）设共享中断事件，流式每 chunk / 每工具前 / 每轮 API 前检查，中断时部分正文落库不丢；长 shell 命令被杀；浏览器 `browser_act` 升级——目标支持 `css=`/`xpath=`、元素清单附 CSS 选择器、新增 hover/select_option、profile 恢复 URL+sessionStorage 解决 SPA 会话丢失
 - **v2.8**：网络能力升级——`browse_web` 替换为单步 `browser_act`（专用浏览器线程根治 thread-switch 崩溃、goto 不再死等 networkidle、按元素清单编号操作）；新增 Tavily `search_web`/`fetch_url`（stdlib urllib 实现，零新依赖，`TAVILY_API_KEY` 环境变量）
+- **v2.8**：新增本地视觉能力 `analyze_image` 工具（llama.cpp VLM）+ 确认门（Allow/Deny/本会话放行，headless 自动放行，worker 请求经主会话 UI 弹窗）；`start_local_llm.bat` 加 `-p 2` 解决同一 server 自调死锁
 - **v2.7**：新增 `delegate_task` 多 agent 委派（隔离上下文 sub-agent + 递归守卫）；实现拆分到 `loop_agent_core/` 纯实现包，根目录 `loop_agent_v2.py` 收敛为薄壳（持有可变全局并再导出公共 API）；DSML 污染标记过滤与 XML 工具调用解析规范化，修复本地模型乱码导致的解析崩溃
 - **v2.6**：read_file 大文件智能阅读（结构大纲 + `function=`/行号拉取 + token 预算上限）；新增 count_tokens 工具与双模式 token 估算器；全局上下文自动裁剪（先删工具链、后删主干，注入提示）；支持 MODEL_BACKEND 后端切换
 - **v2.5**：新增 browse_web 通用浏览器工具（导航、交互、截图、profile 持久化）；合并 Playwright 单例修复 asyncio 冲突

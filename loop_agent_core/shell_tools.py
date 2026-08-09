@@ -3,6 +3,8 @@ import json
 import subprocess
 from datetime import datetime
 
+from .control import interrupt_event
+
 
 def get_date_mock():
     return datetime.now().strftime("%Y-%m-%d")
@@ -24,8 +26,13 @@ def exec_shell_win_mock(shell_cmd, q=None):
     )
 
     all_lines = []
+    interrupted = False
     try:
         for line in proc.stdout:
+            if interrupt_event.is_set():  # 用户按 Esc：杀掉子进程
+                proc.kill()
+                interrupted = True
+                break
             all_lines.append(line)
             if q:
                 q.put(("shell_line", line))
@@ -41,6 +48,8 @@ def exec_shell_win_mock(shell_cmd, q=None):
 
     stdout_text = "".join(all_lines)
 
+    if interrupted and q:
+        q.put(("shell_line", "\n--- [interrupted by user] ---\n"))
     if q:
         q.put(("shell_done", proc.returncode))
 
@@ -49,4 +58,5 @@ def exec_shell_win_mock(shell_cmd, q=None):
         "stderr": "",
         "returncode": proc.returncode,
         "success": proc.returncode == 0,
+        "interrupted": interrupted,
     }, ensure_ascii=False, indent=2)

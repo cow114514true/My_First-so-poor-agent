@@ -345,11 +345,56 @@ def test_rollback_tool_round():
     assert la._rollback_tool_round(conv2) is False
     assert len(conv2["messages"]) == 2
 
+def test_file_not_found_suggests():
+    # 文件名猜错时提示相似文件，帮模型纠错
+    r = la.read_file_mock("HANDOFF")
+    assert "File not found" in r and "HANDOFF_NEXT_SESSION.md" in r, r
+    r2 = la.count_tokens_mock(path="HANDOFF")
+    assert "HANDOFF_NEXT_SESSION.md" in r2, r2
+    # 无相似文件时不附加
+    assert "Similar files" not in la.read_file_mock("_definitely_missing_file_zzz.py")
+
+def test_edit_git_guard():
+    """write/edit 前置备份、写失败恢复、返回附 diff；不留 .bak 残留。"""
+    import loop_agent_core.file_tools as ft
+    probe = "_selftest_guard.txt"
+    tmp = os.path.join(la.WORK_DIR, probe)
+    for f in (tmp, tmp + ".bak"):
+        if os.path.exists(f):
+            os.remove(f)
+    try:
+        r1 = la.write_file_mock(probe, "alpha beta\nline2\n")
+        assert "Written" in r1, r1
+        r2 = la.edit_file_mock(probe, "alpha beta", "ALPHA BETA")
+        assert "Edited" in r2 and "1 occurrence(s) replaced" in r2, r2
+        r3 = la.edit_file_mock(probe, "line2", "LINE2")
+        assert "Edited" in r3, r3
+        with open(tmp, encoding="utf-8") as f:
+            content = f.read()
+        assert "ALPHA BETA" in content and "LINE2" in content
+        assert not os.path.exists(tmp + ".bak")  # 成功路径清理 .bak
+        # 找不到 old_string：不写入、返回错误（可能带相近行提示）
+        before = open(tmp, encoding="utf-8").read()
+        r4 = la.edit_file_mock(probe, "zebra_does_not_exist", "x")
+        assert r4.startswith("[Error]"), r4
+        assert open(tmp, encoding="utf-8").read() == before  # 未写入
+    finally:
+        for f in (tmp, tmp + ".bak"):
+            if os.path.exists(f):
+                os.remove(f)
+
+def test_check_local_llm_cloud():
+    """云端后端健康检查直接返回 cloud，不探测端口。"""
+    from loop_agent_core.config import check_local_llm, _is_local_backend
+    if not _is_local_backend():  # 默认 DeepSeek
+        assert check_local_llm() == (True, "cloud")
+
 if __name__ == "__main__":
     for fn in [test_outline, test_extract, test_count, test_gate, test_noncode_preview, test_count_tool,
                test_strip_and_garbage, test_parse_xml_tool_calls, test_parse_qwen3_toolcalls, test_dsml_corrupted_tags,
-               test_stream_strip_xml, test_store_tool_args, test_rollback_tool_round,
-               test_run_tools, test_prune_cap, test_prune, test_prune_notice_recycle, test_no_prune_when_small]:
+               test_stream_strip_xml, test_store_tool_args, test_rollback_tool_round, test_file_not_found_suggests,
+               test_run_tools, test_prune_cap, test_prune, test_prune_notice_recycle, test_no_prune_when_small,
+               test_edit_git_guard, test_check_local_llm_cloud]:
         fn()
         print(f"ok: {fn.__name__}")
     print("all code-index + pruning self-checks passed")

@@ -7,19 +7,23 @@ import queue
 import threading
 import json
 import os
+import re
 import time
+import atexit
 from datetime import datetime
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
 from textual.screen import Screen
-from textual.widgets import RichLog, TextArea, Static, ProgressBar
+from textual.widgets import RichLog, TextArea, Static, ProgressBar, Button
 from textual.binding import Binding
+from rich.markup import escape
 
 from loop_agent_v2 import chat, messages as _agent_messages
 from loop_agent_v2 import CURRENT_MODEL
 import loop_agent_v2
+import loop_agent_core.config as _cfg
 
 
 class QuitDialog(Screen):
@@ -58,12 +62,99 @@ class QuitDialog(Screen):
     def action_discard_quit(self) -> None:
         self.dismiss("discard")
 
+
+class ConfirmDialog(Screen):
+    """Modal: allow/deny a sensitive tool action (image read / file write / file edit)."""
+
+    def __init__(self, kind: str, target: str, is_worker: bool = False) -> None:
+        super().__init__()
+        self._kind = kind
+        self._target = target
+        self._is_worker = is_worker
+
+    CSS = """
+    ConfirmDialog {
+        align: center middle;
+    }
+    #confirm-dialog {
+        padding: 1 2;
+        border: solid $primary;
+        background: $surface;
+        max-width: 90;
+        min-width: 40;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        title = "子任务请求" if self._is_worker else "确认操作"
+        with Vertical(id="confirm-dialog"):
+            yield Static(
+                f"[bold]{title}[/bold]\n\n{self._kind}: [cyan]{escape(self._target)}[/cyan]",
+                markup=True,
+            )
+            with Horizontal():
+                yield Button("允许", id="allow", variant="primary")
+                yield Button("拒绝", id="deny")
+                yield Button("本会话放行", id="allow_session")
+
+    def on_button_pressed(self, event) -> None:
+        self.dismiss(event.button.id)
+
     def action_cancel_quit(self) -> None:
+        self.dismiss("cancel")
+
+
+class RecoveryDialog(Screen):
+    """Modal: autosave found on startup — restore?"""
+
+    BINDINGS = [
+        Binding("y", "restore", "Restore"),
+        Binding("n", "discard", "Discard"),
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    CSS = """
+    RecoveryDialog {
+        align: center middle;
+    }
+    #recovery-dialog {
+        padding: 1 2;
+        border: solid $warning;
+        background: $surface;
+        max-width: 70;
+    }
+    """
+
+    def __init__(self, msg_count: int, first_msg: str) -> None:
+        super().__init__()
+        self._msg_count = msg_count
+        self._first_msg = first_msg
+
+    def compose(self) -> ComposeResult:
+        yield Static(
+            f"[bold yellow]Found autosaved conversation[/bold yellow]\n\n"
+            f"Messages: {self._msg_count}\n"
+            f"First: \"{escape(self._first_msg)}\"\n\n"
+            f"  [bold]y[/bold] — restore\n"
+            f"  [bold]n[/bold] — discard\n"
+            f"  [bold]Esc[/bold] — decide later",
+            id="recovery-dialog",
+        )
+
+    def action_restore(self) -> None:
+        self.dismiss("restore")
+
+    def action_discard(self) -> None:
+        self.dismiss("discard")
+
+    def action_cancel(self) -> None:
         self.dismiss("cancel")
 
 
 class PanelLog(RichLog):
     """RichLog with double-click detection for panel expansion + reflow on resize."""
+
+    _MAX_HISTORY = 1000  # reflow 重播上限：防止长对话下 _history 无界增长拖垮 resize
 
     class ExpandRequest(Message):
         """Posted when panel is double-clicked."""
@@ -78,9 +169,23 @@ class PanelLog(RichLog):
         self._history: list = []  # 写入过的原始行，用于展开后按新宽度重排
         self._last_width: int = 0
 
+    @staticmethod
+    def _safe_strip(text):
+        """尽力移除 Rich markup 标签，保留可见文本。"""
+        return re.sub(r"\[/?[a-zA-Z#][^\]]*\]", "", str(text))
+
     def write(self, content, *args, **kwargs):
         self._history.append(content)
-        return super().write(content, *args, **kwargs)
+        if len(self._history) > self._MAX_HISTORY:
+            del self._history[:-self._MAX_HISTORY]
+        try:
+            return super().write(content, *args, **kwargs)
+        except Exception:
+            # MarkupError 或任何渲染异常：剥离 markup 按纯文本写，绝不崩掉整个 TUI
+            try:
+                return super().write(self._safe_strip(content), *args, **kwargs)
+            except Exception:
+                return super().write("[dim](output omitted -- rendering error)[/dim]", *args, **kwargs)
 
     def clear(self):
         self._history.clear()
@@ -97,7 +202,13 @@ class PanelLog(RichLog):
         y = self.scroll_offset.y
         super().clear()
         for line in self._history:
-            super().write(line, scroll_end=False)
+            try:
+                super().write(line, scroll_end=False)
+            except Exception:
+                try:
+                    super().write(self._safe_strip(line), scroll_end=False)
+                except Exception:
+                    super().write("[dim]...[/dim]", scroll_end=False)
         self.scroll_to(y=min(y, self.max_scroll_y), animate=False, immediate=True)
 
     def on_click(self, event) -> None:
@@ -116,7 +227,7 @@ class AgentTUI(App):
         Binding("3", "focus_panel('tool')", "Tools"),
         Binding("i", "focus_input", "Input"),
         Binding("tab", "focus_next", "Next"),
-        Binding("ctrl+c", "noop", "", show=False),
+        Binding("ctrl+c", "quit", "Save & Quit", show=False),
         Binding("escape", "collapse_panel", "", show=False),
         Binding("ctrl+j", "submit_input", "Send"),
         Binding("`", "toggle_shell", "Shell"),
@@ -192,10 +303,15 @@ class AgentTUI(App):
     _PROGRESS_TARGET = {"thinking": 15, "calling_tool": 70, "generating": 100, "idle": 0}
     _PROGRESS_LABEL = {"thinking": "思考中…", "calling_tool": "调用工具…", "generating": "生成中…", "idle": ""}
 
+    _AUTOSAVE_INTERVAL = 5   # 每 N 次工具调用自动存一次
+    _AUTOSAVE_MAX = 3        # 轮转保留 .autosave.json / .1 / .2 共 3 份
+
     def __init__(self):
         super().__init__()
         self._event_queue: queue.Queue = queue.Queue()
         self._shell_queue: queue.Queue = queue.Queue()
+        self._confirm_queue: queue.Queue = queue.Queue()
+        loop_agent_v2.confirm_mod._ask = self._confirm_ask
         self._agent_busy: bool = False
         self._token_total: int = 0
         self._status: str = "idle"
@@ -206,6 +322,11 @@ class AgentTUI(App):
         self._expanded_panel: str = ""  # non-empty when a panel is expanded
         self._progress_current: float = 0.0
         self._progress_target: int = 0
+        self._tool_call_count: int = 0    # 自上次 autosave 以来的工具调用数
+        self._autosave_counter: int = 0   # autosave 轮转序号
+        self._did_save: bool = False      # 正常保存过 → atexit 应急保存跳过
+        self._discard_exit: bool = False  # 用户主动丢弃 → atexit 应急保存跳过
+        self._llm_reachable = None        # None=未检；P2 健康检查缓存
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -224,9 +345,13 @@ class AgentTUI(App):
         self.query_one("#chat-panel", RichLog).border_title = " Chat "
         self.query_one("#think-panel", RichLog).border_title = " Thinking "
         self.query_one("#tool-panel", RichLog).border_title = " Tools "
+        atexit.register(self._emergency_save)
         self._update_footer()
         self.set_interval(1 / 30, self._poll_queue)
         self.query_one("#input-area", TextArea).focus()
+        self._try_recover_autosave()
+        if _cfg._is_local_backend():
+            threading.Thread(target=self._check_llm_async, daemon=True).start()
 
     # -- key bindings --
 
@@ -260,10 +385,6 @@ class AgentTUI(App):
         else:
             self.exit()
 
-    def action_noop(self) -> None:
-        """Swallow Ctrl+C — use /quit to exit properly."""
-        pass
-
     # -- panel expand / collapse --
 
     def on_panel_log_expand_request(self, event: PanelLog.ExpandRequest) -> None:
@@ -287,6 +408,11 @@ class AgentTUI(App):
         self._expanded_panel = ""
 
     def action_collapse_panel(self) -> None:
+        if self._agent_busy:
+            # Esc 在 agent 运行时 = 请求中断（流式中断、长命令被杀）
+            loop_agent_v2.interrupt_event.set()
+            self.query_one("#chat-panel", RichLog).write("[bold red]🛑 已请求中断…[/bold red]")
+            return
         if self._expanded_panel:
             self._restore_panels()
 
@@ -300,6 +426,7 @@ class AgentTUI(App):
             self.notify(f"Saved → {path}", timeout=3)
             self.exit()
         elif result == "discard":
+            self._discard_exit = True
             self.exit()
         # "cancel": do nothing
 
@@ -321,7 +448,30 @@ class AgentTUI(App):
                 except Exception:
                     os.remove(os.path.join(save_dir, f))
 
+        self._did_save = True
         return filepath
+
+    def _autosave(self) -> None:
+        """每 N 次工具调用把当前对话存到 conversations/.autosave*.json（轮转）。失败静默。"""
+        save_dir = self._save_dir
+        os.makedirs(save_dir, exist_ok=True)
+        idx = self._autosave_counter % self._AUTOSAVE_MAX
+        filename = ".autosave.json" if idx == 0 else f".autosave.{idx}.json"
+        try:
+            with open(os.path.join(save_dir, filename), "w", encoding="utf-8") as f:
+                json.dump(_agent_messages, f, ensure_ascii=False, indent=2)
+            self._autosave_counter += 1
+        except Exception:
+            pass  # autosave 失败不崩 TUI
+
+    def _emergency_save(self) -> None:
+        """atexit 应急保存：意外退出兜底。已保存过或用户主动丢弃则跳过。"""
+        if self._did_save or self._discard_exit or not self._has_content():
+            return
+        try:
+            self._save_conversation()
+        except Exception:
+            pass
 
     @property
     def _save_dir(self) -> str:
@@ -329,6 +479,10 @@ class AgentTUI(App):
 
     def _cmd_load(self, question: str) -> None:
         chat_panel = self.query_one("#chat-panel", RichLog)
+        # 加载历史前自动保存当前会话，避免被覆盖丢失
+        if self._has_content():
+            path = self._save_conversation()
+            chat_panel.write(f"[dim]Auto-saved current → {escape(os.path.basename(path))}[/dim]")
         arg = question[5:].strip()
         os.makedirs(self._save_dir, exist_ok=True)
 
@@ -375,7 +529,7 @@ class AgentTUI(App):
             if os.path.exists(target):
                 self._load_file(target)
                 return
-            chat_panel.write(f"[bold red]Not found:[/bold red] {arg}")
+            chat_panel.write(f"[bold red]Not found:[/bold red] {escape(arg)}")
             return
 
         # No arg → list all with title preview
@@ -394,16 +548,16 @@ class AgentTUI(App):
                     title = msg.get("content", "")
                     break
             title = title[:60].replace("\n", " ") + ("..." if len(title) > 60 else "")
-            chat_panel.write(f"  [bold]{i}[/bold]  {label}")
+            chat_panel.write(f"  [bold]{i}[/bold]  {escape(label)}")
             if title:
-                chat_panel.write(f"       [dim]\"{title}\"[/dim]")
+                chat_panel.write(f"       [dim]\"{escape(title)}\"[/dim]")
             else:
                 chat_panel.write(f"       [dim](empty)[/dim]")
 
         if corrupted_files:
             chat_panel.write(f"\n[dim yellow]Corrupted files (will be skipped on save cleanup):[/dim yellow]")
             for f in corrupted_files:
-                chat_panel.write(f"  [dim]✗ {f}[/dim]")
+                chat_panel.write(f"  [dim]✗ {escape(f)}[/dim]")
 
         if valid_files:
             chat_panel.write(f"\n[dim]Usage: /load <number> (1-{len(valid_files)})[/dim]")
@@ -415,22 +569,24 @@ class AgentTUI(App):
             with open(filepath, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
         except Exception as e:
-            chat_panel.write(f"[bold red]Failed to load:[/bold red] {e}")
+            chat_panel.write(f"[bold red]Failed to load:[/bold red] {escape(str(e))}")
             return
 
         _agent_messages.clear()
         _agent_messages.extend(loaded)
 
         chat_panel.clear()
-        chat_panel.write(f"[dim]--- Loaded {os.path.basename(filepath)} ---[/dim]")
+        chat_panel.write(f"[dim]--- Loaded {escape(os.path.basename(filepath))} ---[/dim]")
         for msg in loaded:
             role = msg.get("role", "")
             content = msg.get("content", "")
             if role == "user":
-                chat_panel.write(f"[bold white]You:[/bold white] {content}")
+                chat_panel.write(f"[bold white]You:[/bold white] {escape(content)}")
             elif role == "assistant":
                 if len(content) > 500:
-                    content = content[:500] + f"\n[dim]... ({len(content)} chars)[/dim]"
+                    content = escape(content[:500]) + f"\n[dim]... ({len(content)} chars)[/dim]"
+                else:
+                    content = escape(content)
                 chat_panel.write(f"[bold]Assistant:[/bold]\n{content}")
             elif role == "tool":
                 chat_panel.write(f"[dim]  tool result ({len(content)} chars)[/dim]")
@@ -439,6 +595,58 @@ class AgentTUI(App):
         self.query_one("#tool-panel", RichLog).clear()
         self._token_total = 0
         self._update_footer()
+
+    def _try_recover_autosave(self) -> None:
+        """启动时检测 .autosave.json，有可恢复内容则弹恢复对话框。"""
+        autosave_path = os.path.join(self._save_dir, ".autosave.json")
+        if not os.path.exists(autosave_path):
+            return
+        try:
+            with open(autosave_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list) or len(data) <= 1:
+                return
+        except Exception:
+            return
+        self._recovery_data = data
+        self._recovery_path = autosave_path
+        self.call_later(self._show_recovery_dialog)
+
+    def _show_recovery_dialog(self) -> None:
+        first_user = ""
+        for m in self._recovery_data:
+            if m.get("role") == "user":
+                first_user = m.get("content", "")[:60]
+                break
+        self.push_screen(
+            RecoveryDialog(len(self._recovery_data), first_user),
+            self._on_recovery_dialog,
+        )
+
+    def _on_recovery_dialog(self, result: str) -> None:
+        chat_panel = self.query_one("#chat-panel", RichLog)
+        if result == "restore":
+            _agent_messages.clear()
+            _agent_messages.extend(self._recovery_data)
+            chat_panel.write(f"[dim]--- Recovered {len(self._recovery_data)} messages from autosave ---[/dim]")
+            for m in self._recovery_data:
+                role = m.get("role", "")
+                content = m.get("content", "")
+                if role == "user":
+                    chat_panel.write(f"[bold white]You:[/bold white] {escape(content)}")
+                elif role == "assistant" and content:
+                    chat_panel.write(f"[bold]Assistant:[/bold]\n{escape(content[:300])}")
+            try:
+                os.remove(self._recovery_path)
+            except Exception:
+                pass
+        elif result == "discard":
+            try:
+                os.remove(self._recovery_path)
+            except Exception:
+                pass
+        # "cancel": 保留 autosave 文件，下次启动再提示
+        self._recovery_data = None
 
     # -- input handling --
 
@@ -471,9 +679,25 @@ class AgentTUI(App):
             self.action_quit()
             return
 
+        # /save — save current conversation now
+        if question == "/save":
+            if self._has_content():
+                path = self._save_conversation()
+                self.query_one("#chat-panel", RichLog).write(
+                    f"[dim]Saved → {escape(os.path.basename(path))}[/dim]")
+            else:
+                self.query_one("#chat-panel", RichLog).write("[dim]Nothing to save.[/dim]")
+            return
+
         if question == "/help":
             chat_panel = self.query_one("#chat-panel",RichLog)
-            help_txt = """键盘快捷键
+            help_txt = """================================================================================
+                         Local Agent TUI 帮助文档
+================================================================================
+
+当前模型：[cyan]{CURRENT_MODEL}[/cyan]
+
+键盘快捷键
   1           聚焦聊天面板
   2           聚焦思考面板
   3           聚焦工具面板
@@ -486,21 +710,38 @@ class AgentTUI(App):
 
 命令
   /clear      清空对话历史，重置上下文
-  /load       列出所有可加载的对话
+  /load       列出所有可加载的对话（加载前自动保存当前会话）
   /load N     加载指定编号的对话
+  /save       立即保存当前对话到 conversations/
   /quit       安全退出（可保存对话）
-  /help       显示此帮助信息"""
-            chat_panel.write(help_txt)
+  /help       显示此帮助信息
+
+系统功能
+  - 后端：local-3.5 / local-3.6 (Qwen 9B/35B) 或 DeepSeek
+  - 跨会话记忆：recall/remember 工具
+  - 11 个工具：9 个基础工具 + recall + remember
+  - 纯实现位于 loop_agent_core/ 包，loop_agent_v2.py 为薄壳
+
+================================================================================"""
+            chat_panel.write(help_txt.format(CURRENT_MODEL=loop_agent_v2.CURRENT_MODEL))
             return
         textarea.disabled = True
         self._agent_busy = True
 
         chat_panel = self.query_one("#chat-panel", RichLog)
-        chat_panel.write(f"[bold white]You:[/bold white] {question}")
+        chat_panel.write(f"[bold white]You:[/bold white] {escape(question)}")
 
         self._set_status("thinking")
 
         threading.Thread(target=self._run_agent, args=(question,), daemon=True).start()
+
+    def _confirm_ask(self, kind, target, is_worker):
+        """Runs in agent thread. Emits a confirm_request event, blocks for the TUI answer."""
+        self._event_queue.put({"type": "confirm_request", "kind": kind, "target": target, "is_worker": is_worker})
+        try:
+            return self._confirm_queue.get()
+        except Exception:
+            return "deny"
 
     def _run_agent(self, question: str) -> None:
         """Runs in background thread. Pushes events to queue."""
@@ -536,11 +777,11 @@ class AgentTUI(App):
                     break
                 kind, data = item[0], item[1]
                 if kind == "shell_start":
-                    shell_log.write(f"[bold yellow]$ {data}[/bold yellow]")
+                    shell_log.write(f"[bold yellow]$ {escape(data)}[/bold yellow]")
                 elif kind == "shell_line":
-                    shell_log.write(data.rstrip("\n"))
+                    shell_log.write(escape(data.rstrip("\n")))
                 elif kind == "shell_done":
-                    shell_log.write(f"[dim]--- exit code: {data} ---[/dim]")
+                    shell_log.write(f"[dim]--- exit code: {escape(data)} ---[/dim]")
 
         # 推进进度条
         self._tick_progress()
@@ -551,7 +792,10 @@ class AgentTUI(App):
         if etype == "__agent_done__":
             self._flush_stream()
             self._flush_think()
+            self._autosave()  # 每轮结束都存：恢复点始终是最近一轮
+            self._tool_call_count = 0
             self._agent_busy = False
+            loop_agent_v2.interrupt_event.clear()  # 中断标记已消费，下轮不会误触发
             self._set_status("idle")
             self.query_one("#input-area", TextArea).disabled = False
             self.query_one("#input-area", TextArea).focus()
@@ -559,7 +803,7 @@ class AgentTUI(App):
 
         if etype == "error":
             self.query_one("#tool-panel", RichLog).write(
-                f"[bold red]ERROR:[/bold red] {event.get('message')}"
+                f"[bold red]ERROR:[/bold red] {escape(str(event.get('message')))}"
             )
             return
 
@@ -573,6 +817,7 @@ class AgentTUI(App):
             "self_check": self._h_self_check,
             "worker_start": self._h_worker_start,
             "worker_done": self._h_worker_done,
+            "confirm_request": self._h_confirm,
             "response_chunk": self._h_response_chunk,
             "response_done": self._h_response_done,
             "status": self._h_status,
@@ -601,10 +846,10 @@ class AgentTUI(App):
         panel = self.query_one("#think-panel", RichLog)
         if len(content) > 300:
             panel.write(f"\n[dim]── Round {r} (enter to expand) ──[/dim]")
-            panel.write(f"{content[:300]}\n[dim]... ({len(content)} chars)[/dim]")
+            panel.write(f"{escape(content[:300])}\n[dim]... ({len(content)} chars)[/dim]")
         else:
             panel.write(f"\n[dim]── Round {r} ──[/dim]")
-            panel.write(content)
+            panel.write(escape(content))
 
     def _h_thinking_chunk(self, e: dict) -> None:
         content = e.get("content", "")
@@ -620,7 +865,7 @@ class AgentTUI(App):
             if self._think_round is not None:
                 panel.write(f"\n[dim]── Round {rnd} ──[/dim]")
             self._think_round = rnd
-        self._think_buffer += content
+        self._think_buffer += escape(content)
         # 完整行立即上屏；半行在句末标点或接近面板宽度时才 commit（同 chat 面板）
         while "\n" in self._think_buffer:
             line, self._think_buffer = self._think_buffer.split("\n", 1)
@@ -637,11 +882,11 @@ class AgentTUI(App):
         tool_panel = self.query_one("#tool-panel", RichLog)
         for c in e.get("calls", []):
             name = c["name"]
-            chat_panel.write(f"[dim]  calling {name}...[/dim]")
-            tool_panel.write(f"\n[bold yellow]→ {name}[/bold yellow]")
+            chat_panel.write(f"[dim]  calling {escape(name)}...[/dim]")
+            tool_panel.write(f"\n[bold yellow]→ {escape(name)}[/bold yellow]")
             try:
                 args = json.loads(c.get("args", "{}"))
-                tool_panel.write(f"  [dim]{json.dumps(args, ensure_ascii=False)[:200]}[/dim]")
+                tool_panel.write(f"  [dim]{escape(json.dumps(args, ensure_ascii=False)[:200])}[/dim]")
             except Exception:
                 pass
 
@@ -649,31 +894,35 @@ class AgentTUI(App):
         name = e.get("tool_name", "?")
         result = str(e.get("result", ""))
         panel = self.query_one("#tool-panel", RichLog)
-        truncated = result[:400]
-        panel.write(f"  [bold green]<- {name}[/bold green] [dim]{truncated}[/dim]")
+        truncated = escape(result[:400])
+        panel.write(f"  [bold green]<- {escape(name)}[/bold green] [dim]{truncated}[/dim]")
         if len(result) > 400:
             panel.write(f"  [dim]... ({len(result)} chars total)[/dim]")
+        self._tool_call_count += 1
+        if self._tool_call_count >= self._AUTOSAVE_INTERVAL:
+            self._tool_call_count = 0
+            self._autosave()
 
     def _h_self_check(self, e: dict) -> None:
         self.query_one("#tool-panel", RichLog).write(
-            f"  [bold red]! {e.get('tool_name', '?')}:[/bold red] {e.get('critique', '')}"
+            f"  [bold red]! {escape(e.get('tool_name', '?'))}:[/bold red] {escape(e.get('critique', ''))}"
         )
 
     def _h_worker_start(self, e: dict) -> None:
         self.query_one("#tool-panel", RichLog).write(
-            f"\n[bold cyan]⏳ 子任务派发 → [/bold cyan][dim]{e.get('task', '')}[/dim]"
+            f"\n[bold cyan]⏳ 子任务派发 → [/bold cyan][dim]{escape(e.get('task', ''))}[/dim]"
         )
 
     def _h_worker_done(self, e: dict) -> None:
         self.query_one("#tool-panel", RichLog).write(
-            f"  [bold cyan]✅ 子任务完成:[/bold cyan] [dim]{e.get('result', '')}[/dim]"
+            f"  [bold cyan]✅ 子任务完成:[/bold cyan] [dim]{escape(e.get('result', ''))}[/dim]"
         )
 
     def _h_response_chunk(self, e: dict) -> None:
         if self._status != "generating":
             self._set_status("generating")
             self.query_one("#chat-panel", RichLog).write("\n[bold]Assistant:[/bold]")
-        self._stream_buffer += e.get("content", "")
+        self._stream_buffer += escape(e.get("content", ""))
         chat = self.query_one("#chat-panel", RichLog)
         # 完整行（含换行）立即上屏
         while "\n" in self._stream_buffer:
@@ -688,7 +937,16 @@ class AgentTUI(App):
 
     def _h_response_done(self, e: dict) -> None:
         content = e.get("content", "")
-        self.query_one("#chat-panel", RichLog).write(f"\n[bold]Assistant:[/bold]\n{content}")
+        self.query_one("#chat-panel", RichLog).write(f"\n[bold]Assistant:[/bold]\n{escape(content)}")
+
+    def _h_confirm(self, e: dict) -> None:
+        def done(result):
+            self._confirm_queue.put(result)
+
+        self.app.push_screen(
+            ConfirmDialog(e.get("kind", "?"), e.get("target", "?"), bool(e.get("is_worker"))),
+            done,
+        )
 
     def _h_status(self, e: dict) -> None:
         self._set_status(e.get("state", "idle"))
@@ -732,9 +990,23 @@ class AgentTUI(App):
         tok = f"{self._token_total / 1000:.1f}k" if self._token_total else "0k"
         get_help = "/help"
         model_show = CURRENT_MODEL
+        if _cfg._is_local_backend():
+            if self._llm_reachable is None:
+                model_show = f"{CURRENT_MODEL} (checking…)"
+            elif not self._llm_reachable:
+                model_show = f"{CURRENT_MODEL} (offline)"
         self.query_one("#footer-bar", Static).update(
-            f" {CURRENT_MODEL} | {status} | {tok} tokens | Get-help: {get_help}"
+            f" {model_show} | {status} | {tok} tokens | Get-help: {get_help}"
         )
+
+    def _check_llm_async(self) -> None:
+        """后台检测本地 llama 服务，结果缓存到 _llm_reachable 后刷新底部栏。"""
+        try:
+            reachable, _detail = _cfg.check_local_llm()
+        except Exception:
+            reachable = False
+        self._llm_reachable = reachable
+        self.call_from_thread(self._update_footer)
 
 
 if __name__ == "__main__":
