@@ -30,3 +30,20 @@ web_key.txt
 clipboard_history.json
 clipboard_history.py
 screenshots/
+# 浏览器登录态（含会话凭据）
+profiles/
+# QQ 临时图片 / scratch
+tmp/
+# 运行日志（botpy.log / error.log / api_error.log）
+*.log
+# 被过滤内容诊断落盘
+debug_filtered.txt
+# 测试用杂图
+compile.jpeg
+seitsuna.png
+# 空文件占位
+开发设置
+# 含真实 QQ_APPID/QQ_SECRET，不入库；模板见 run_qq_bot.bat.example
+run_qq_bot.bat
+# 启动 gitignored 的 clipboard_history.py
+run_clipboard.bat

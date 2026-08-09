@@ -13,10 +13,15 @@
 ├── setup.bat              # 一键安装 & 启动脚本（推荐）
 ├── requirements.txt       # Python 依赖清单
 ├── Get_State.py           # 登录 DeepSeek 网页版，保存浏览器状态
+├── start_local_llm.bat    # 启动本地 llama.cpp 后端（3.5 含视觉 mmproj）
+├── run_qq_bot.bat.example # QQ 机器人启动模板（复制为 run_qq_bot.bat 填入真实凭据）
+├── qq_bot.py              # QQ 私聊机器人：消息 → Claude Code / 本机 loop_agent
 ├── loop_agent_v2.py       # 主 Agent 入口（薄壳：持有可变全局并再导出公共 API）
 ├── loop_agent_core/       # 纯实现包（config/tokens/schemas/prompts/file_tools/shell_tools/
-│                          #   ds_web/browse/xmlutil/validation/context/events/runner）
+│                          #   ds_web/browse/xmlutil/validation/context/events/runner/
+│                          #   memory/tavily_tool/vision/confirm/control/debuglog）
 ├── tui.py                 # Textual TUI 界面（三面板图形交互）
+├── BUG_LEDGER.md          # 开发以来全部 bug 记录（现象/根因/修复/验证）
 ├── profile.json           # 浏览器登录状态（运行 Get_State.py 后生成）
 ├── conversations/         # 自动保存的对话历史（JSON 格式）
 └── README.md

@@ -1,0 +1,14 @@
+@echo off
+cd /d "%~dp0"
+rem Fill in credentials from q.qq.com -> 开发设置
+set QQ_APPID=YOUR_APPID
+set QQ_SECRET=YOUR_SECRET
+rem Optional: restrict who can trigger (comma separated user_openid). Empty = allow all.
+set QQ_ALLOW_USERS=YOUR_USER_OPENID
+rem Backend: claude (default) or local (loop_agent; REQUIRES QQ_ALLOW_USERS above)
+set QQ_BACKEND=local
+rem Only route the agent to the local llama.cpp server when backend is local.
+rem If you started the 3.6 (35B) model instead, change local-3.5 to local-3.6.
+if /i "%QQ_BACKEND%"=="local" set MODEL_BACKEND=local-3.5
+python qq_bot.py
+pause
