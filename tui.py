@@ -781,7 +781,7 @@ class AgentTUI(App):
                 elif kind == "shell_line":
                     shell_log.write(escape(data.rstrip("\n")))
                 elif kind == "shell_done":
-                    shell_log.write(f"[dim]--- exit code: {escape(data)} ---[/dim]")
+                    shell_log.write(f"[dim]--- exit code: {escape(str(data))} ---[/dim]")
 
         # 推进进度条
         self._tick_progress()
