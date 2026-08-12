@@ -77,7 +77,8 @@ def _prune_messages(cap, q_idx, conv):
     msgs[:] = [m for i, m in enumerate(msgs) if i in keep]
     new_q = q_idx - removed
     # 回收旧的 [Context trimmed] 提示，只留最新一条，避免多条提示堆叠干扰模型
-    old_notices = [i for i, m in enumerate(msgs) if _is_trim_notice(m)]
+    # 排除 new_q：当前问题可能已合并了上轮 notice，不能当旧提示删掉
+    old_notices = [i for i, m in enumerate(msgs) if _is_trim_notice(m) and i != new_q]
     if old_notices:
         conv["size"] -= sum(estimate_tokens(json.dumps(msgs[i], ensure_ascii=False)) for i in old_notices)
         msgs[:] = [m for i, m in enumerate(msgs) if i not in old_notices]

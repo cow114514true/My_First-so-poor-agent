@@ -1,5 +1,6 @@
 """后端配置：模型/base_url/client/WORK_DIR 锚点。"""
 import os
+import httpx
 from openai import OpenAI
 
 WORK_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # agent/（包上一层，即项目根）
@@ -64,4 +65,6 @@ cfg = _backend_config()
 _current_raw = os.environ.get("MODEL_BACKEND", "<unset>")
 print(f"[backend] MODEL_BACKEND={_current_raw!r} → model={cfg['model']} base_url={cfg['base_url']}", flush=True)
 CURRENT_MODEL = cfg["model"]
-client = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"])
+# 流式连接 read 超时：120s 内无 chunk 即判定断流，避免 TCP 层无限死等
+client = OpenAI(api_key=cfg["api_key"], base_url=cfg["base_url"],
+                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0))
