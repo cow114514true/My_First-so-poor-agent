@@ -1,8 +1,11 @@
 """基础工具：日期/天气/命令执行。实时输出队列经参数注入（薄壳包装传 _shell_output_queue）。"""
 import base64
 import json
+import queue
 import shutil
 import subprocess
+import threading
+import time
 from datetime import datetime
 
 # pwsh (PowerShell 7) 优先；没装则退回系统自带的 Windows PowerShell 5.1
@@ -26,7 +29,8 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
     if q:
         q.put(("shell_start", shell_cmd))
 
-    if shell == "powershell":
+    # 模型可能发 PowerShell/ps/pwsh（本地模型无视 schema enum），统一归一化，其余值走 cmd
+    if (shell or "cmd").strip().lower() in ("powershell", "ps", "pwsh"):
         # -EncodedCommand = base64(UTF-16LE)：整脚本做单参数传，绕开 PowerShell 引号解析。
         # 前置一行强制管道输出 UTF-8（pwsh 本就 UTF-8；仅 5.1 兜底分支必需）。
         script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + shell_cmd
@@ -41,29 +45,57 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
 
+    # 读输出放后台线程 → queue；主循环短轮询，同时检查 Esc 与 120s 截止时间。
+    # 原实现 for line in proc.stdout 阻塞 readline，静默挂死的命令绕开超时与中断。
+    lines_q = queue.Queue()
+
+    def _reader():
+        try:
+            for line in proc.stdout:
+                lines_q.put(line)
+        except Exception as e:
+            log_error("exec_shell reader", e)
+        finally:
+            lines_q.put(None)  # EOF 哨兵
+
+    threading.Thread(target=_reader, daemon=True).start()
+
     all_lines = []
     interrupted = False
-    try:
-        for line in proc.stdout:
-            if interrupt_event.is_set():  # 用户按 Esc：杀掉子进程
-                proc.kill()
-                interrupted = True
-                break
-            all_lines.append(line)
-            if q:
-                q.put(("shell_line", line))
-    except Exception as e:
-        log_error("exec_shell read stdout", e)
+    timed_out = False
+    deadline = time.monotonic() + 120
+    while True:
+        if interrupt_event.is_set():  # 用户按 Esc：杀掉子进程
+            proc.kill()
+            proc.wait()
+            interrupted = True
+            break
+        if time.monotonic() >= deadline:
+            proc.kill()
+            proc.wait()
+            timed_out = True
+            break
+        try:
+            line = lines_q.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if line is None:  # EOF，正常结束
+            break
+        all_lines.append(line)
+        if q:
+            q.put(("shell_line", line))
 
+    # EOF 后进程可能还没完全退（管道先关），wait 收尸拿回 returncode
     try:
         proc.wait(timeout=120)
     except subprocess.TimeoutExpired:
         proc.kill()
-        if q:
-            q.put(("shell_line", "\n--- TIMED OUT after 120s ---\n"))
+        proc.wait()
 
     stdout_text = "".join(all_lines)
 
+    if timed_out and q:
+        q.put(("shell_line", "\n--- TIMED OUT after 120s ---\n"))
     if interrupted and q:
         q.put(("shell_line", "\n--- [interrupted by user] ---\n"))
     if q:
@@ -75,4 +107,5 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
         "returncode": proc.returncode,
         "success": proc.returncode == 0,
         "interrupted": interrupted,
+        "timed_out": timed_out,
     }, ensure_ascii=False, indent=2)

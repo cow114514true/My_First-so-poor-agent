@@ -24,8 +24,24 @@ def test_powershell_utf8():
     _assert(exec_shell_win_mock("Write-Output '你好 PS'", shell="powershell"), "你好 PS")
 
 
+def test_shell_alias_powershell():
+    # 本地模型可能发 PowerShell/ps/pwsh，别名应仍走 PS 分支而非静默落 cmd
+    _assert(exec_shell_win_mock("Write-Output 'alias-ok'", shell="PowerShell"), "alias-ok")
+    _assert(exec_shell_win_mock("Write-Output 'ps-ok'", shell="ps"), "ps-ok")
+
+
+def test_nonzero_exit_not_pressure_retry():
+    # grep 无匹配 exit 1 是正常语义，自检应上屏信息而不逼"重试"
+    res = exec_shell_win_mock("cmd /c exit 1")
+    is_valid, critique = validate_tool_result("exec_shell_win", res)
+    assert not is_valid  # 仍上屏让模型注意
+    assert "retry" not in critique.lower()  # 但不逼重试
+
+
 if __name__ == "__main__":
     test_cmd_default()
     test_powershell_runs()
     test_powershell_utf8()
+    test_shell_alias_powershell()
+    test_nonzero_exit_not_pressure_retry()
     print("OK")
