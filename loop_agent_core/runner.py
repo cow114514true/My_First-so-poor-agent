@@ -159,6 +159,7 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
                         results[t.id] = f"[Error] Sub-agent execution failed: {e}"
 
     # ── 2) 结算阶段：按原调用顺序，逐分支与旧逻辑一致 ─────────
+    critiques = []
     for tool in use_tool_calls:
         if interrupt_event.is_set():
             _rollback_tool_round(conv)
@@ -194,8 +195,15 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
             is_valid, critique = True, ""  # 自检不该有权限中断整批工具执行
         if not is_valid:
             emit({"type": "self_check", "tool_name": tool_name, "critique": critique})
-            _append_msg({"role": "user",
-                         "content": f"[Self-check] Tool '{tool_name}' result is questionable:\n{critique}\n\nPlease critically evaluate this result and retry the tool if needed. If the result is actually usable, explain why and proceed."}, conv)
+            critiques.append((tool_name, critique))
+
+    # 合并所有自检为一条 user 消息，避免多 tool 失败时连续 user 消息触发 API 400
+    if critiques:
+        lines = ["[Self-check] The following tool results look questionable:"]
+        for tname, crit in critiques:
+            lines.append(f"\n- {tname}: {crit}")
+        lines.append("\n\nPlease critically evaluate these results and retry if needed. If usable, explain why and proceed.")
+        _append_msg({"role": "user", "content": "\n".join(lines)}, conv)
 
 
 def _stream_strip_xml(buf, emit_fn):
