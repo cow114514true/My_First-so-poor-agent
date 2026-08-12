@@ -5,17 +5,17 @@ import os
 from .config import _is_local_backend, cfg
 from .tokens import estimate_tokens
 
-_PRUNE_NOTICE = "[Context trimmed] 为控制上下文已删除 {n} 条较早消息（工具调用及结果等）。如需信息，请用 read_file 重新读取相关文件。"
+_PRUNE_NOTICE = "[Context trimmed] 为控制上下文已删除 {n} 条较早消息（工具调用及结果等）。继续完成任务；如需之前的信息，直接问用户或凭现有结果推断。"
 
 
 def _prune_cap():
-    """Per-backend prune threshold. Local: 50% of model ctx. DeepSeek: 8000. Both env-overridable."""
+    """Per-backend prune threshold. Local: 50% of model ctx. DeepSeek: 32k (~50% of 65536). Both env-overridable."""
     if _is_local_backend():
         env = os.environ.get("PRUNE_CAP_LOCAL")
         if env:
             return int(env)
         return max(1024, cfg["ctx"] // 2)
-    return int(os.environ.get("PRUNE_CAP_DS", "8000"))
+    return int(os.environ.get("PRUNE_CAP_DS", "32000"))
 
 
 def _append_msg(msg, conv):

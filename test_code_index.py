@@ -206,7 +206,7 @@ def _tc(tid):
     return [{"id": tid, "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]
 
 def test_prune_cap():
-    assert la._prune_cap() == 8000  # DeepSeek default
+    assert la._prune_cap() == 32000  # DeepSeek default
     os.environ["PRUNE_CAP_DS"] = "1234"
     assert la._prune_cap() == 1234
     os.environ.pop("PRUNE_CAP_DS", None)
