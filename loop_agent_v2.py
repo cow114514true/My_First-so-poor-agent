@@ -15,6 +15,8 @@ from loop_agent_core.schemas import tools
 from loop_agent_core.prompts import system_prompt, WORKER_SYSTEM_PROMPT
 from loop_agent_core.shell_tools import get_date_mock, get_weather_mock
 from loop_agent_core.shell_tools import exec_shell_win_mock as _core_exec_shell_win
+from loop_agent_core.shell_tools import search_code_mock
+from loop_agent_core.shell_tools import code_index_mock
 from loop_agent_core.file_tools import (read_file_mock, count_tokens_mock, write_file_mock,
                                         edit_file_mock, _resolve_path, build_outline, extract_function)
 from loop_agent_core.xmlutil import (_DSML_RE, _strip_dsml, _is_garbage_content,
@@ -58,6 +60,8 @@ TOOL_CALL_MAP = {
     "analyze_image": analyze_image_mock,
     "browser_act": browser_act_mock,
     "visual_locate": visual_locate_mock,
+    "search_code": search_code_mock,
+    "code_index": code_index_mock,
     "search_web": search_web_mock,
     "fetch_url": fetch_url_mock,
     "read_file": read_file_mock,

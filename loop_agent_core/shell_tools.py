@@ -109,3 +109,133 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
         "interrupted": interrupted,
         "timed_out": timed_out,
     }, ensure_ascii=False, indent=2)
+
+
+def search_code_mock(pattern, path=".", glob="*.py", output_mode="content"):
+    """Regex code search (Python-native, no ripgrep dependency).
+    pattern:   Python regex to match against each line.
+    path:      Directory or file to search. Relative paths resolve against WORK_DIR.
+    glob:      File pattern filter (e.g. "*.py", "*.{py,js}", "*.md").
+    output_mode: "content" (lines with line numbers), "files_with_matches" (paths only), "count" (match counts)."""
+    import re
+    from pathlib import Path as _Path
+
+    from .config import WORK_DIR as _WD
+    file_path = _Path(path)
+    if not file_path.is_absolute():
+        file_path = _Path(_WD) / file_path
+    file_path = file_path.resolve()
+    if not file_path.exists():
+        return f"[Error] search_code: path not found: {path}"
+
+    if file_path.is_file():
+        files = [file_path]
+        root = file_path.parent
+    else:
+        files = sorted(file_path.rglob(glob))
+        root = file_path
+
+    if not files:
+        return f"[search_code] No files matching {glob!r} in {path}"
+
+    try:
+        compiled = re.compile(pattern)
+    except re.error as e:
+        return f"[Error] search_code: invalid regex: {e}"
+
+    max_files = 80
+    skip_dirs = {"__pycache__", ".git", ".claude", "headroom", "node_modules", "vendor", "tmp"}
+    lines_out = []
+    file_count = 0
+
+    for fp in files:
+        if any(d in fp.parts for d in skip_dirs):
+            continue
+        file_count += 1
+        if file_count > max_files:
+            break
+        try:
+            text_lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
+        except Exception:
+            continue
+
+        rel = str(fp.relative_to(root))
+        file_hits = [(i + 1, line) for i, line in enumerate(text_lines) if compiled.search(line)]
+
+        if output_mode == "files_with_matches":
+            if file_hits:
+                lines_out.append(rel)
+        elif output_mode == "count":
+            if file_hits:
+                lines_out.append(f"{rel}: {len(file_hits)} matches")
+        else:  # content
+            for lineno, line in file_hits:
+                lines_out.append(f"{rel}:{lineno}: {line.strip()}")
+
+    prefix = f"[search_code] pattern={pattern!r}  path={path}  glob={glob}\n"
+    if file_count > max_files:
+        prefix += f"(truncated to first {max_files} matching files)\n"
+    body = "\n".join(lines_out[:250]) if lines_out else "(no matches)"
+    return prefix + body
+
+
+def code_index_mock(path=".", glob="*.py"):
+    """Return a project-level structural index: for each file, list its imports/functions/classes
+    with line numbers. Use BEFORE reading individual files — get the lay of the land in one call.
+    Then use search_code for cross-file references and read_file(function=...) for implementation."""
+    import os as _os
+    from pathlib import Path as _Path
+
+    from .config import WORK_DIR as _WD
+    from .file_tools import build_outline
+
+    file_path = _Path(path)
+    if not file_path.is_absolute():
+        file_path = _Path(_WD) / file_path
+    file_path = file_path.resolve()
+    if not file_path.exists():
+        return f"[Error] code_index: path not found: {path}"
+
+    skip_dirs = {"__pycache__", ".git", ".claude", "headroom", "node_modules", "vendor", "tmp"}
+
+    if file_path.is_file():
+        files = [file_path]
+        root = file_path.parent
+        skip_dirs = set()  # 显式指定文件时不跳过（包括 tmp 下的测试文件等）
+    else:
+        files = sorted(file_path.rglob(glob))
+        root = file_path
+
+    if not files:
+        return f"[code_index] No files matching {glob!r} in {path}"
+
+    max_files = 60
+    lines_out = []
+    file_count, total_funcs = 0, 0
+
+    for fp in files:
+        if any(d in fp.parts for d in skip_dirs):
+            continue
+        file_count += 1
+        if file_count > max_files:
+            rest = sum(1 for f in files if not any(d in f.parts for d in skip_dirs)) - max_files + 1
+            lines_out.append(f"\n... (truncated, ~{rest} more files — narrow path or glob)")
+            break
+        try:
+            content = fp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+
+        total_lines = len(content.splitlines())
+        outline = build_outline(content)
+        rel = str(fp.relative_to(root))
+        lines_out.append(f"\n{rel} ({total_lines} lines)")
+        if outline:
+            for kind, name, ln in outline:
+                lines_out.append(f"  {ln:>5}  {kind} {name}")
+                total_funcs += 1
+        else:
+            lines_out.append("  (no functions/classes/imports detected)")
+
+    header = f"[code_index] path={path}  glob={glob}  files={file_count}  symbols={total_funcs}\n"
+    return header + "\n".join(lines_out)

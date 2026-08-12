@@ -265,3 +265,43 @@ tools = [
         }
     }
 ]
+
+# ponytail: append-only — append new schemas here rather than inserting mid-list
+# (avoids merge-conflict churn on every addition).
+
+# search_code
+tools.append({
+    "type": "function",
+    "function": {
+        "name": "search_code",
+        "description": "Search code with a regex pattern. Returns matching lines with line numbers, file paths, or match counts. Much faster than running cmd/findstr and avoids encoding issues. Use whenever you need to find where a function/variable/pattern is used.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Python regex pattern to match against each line"},
+                "path": {"type": "string", "description": "Directory or file to search. Default: '.' (project root). Relative paths resolve against the project root."},
+                "glob": {"type": "string", "description": "File pattern filter, e.g. '*.py' (default), '*.{py,js}', '*.md'"},
+                "output_mode": {"type": "string", "enum": ["content", "files_with_matches", "count"],
+                                "description": "'content' = matching lines with line numbers; 'files_with_matches' = file paths only; 'count' = match counts per file. Default: 'content'."},
+            },
+            "required": ["pattern"]
+        }
+    }
+})
+
+# code_index
+tools.append({
+    "type": "function",
+    "function": {
+        "name": "code_index",
+        "description": "Get a project-level structural index of all code files under a directory. Shows each file's functions, classes, and imports with line numbers. Use this FIRST when exploring an unfamiliar project or directory — gives you the full map in one call, then use search_code for cross-file references and read_file(function=...) to pull specific implementations.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Directory to index. Default: '.' (project root)."},
+                "glob": {"type": "string", "description": "File pattern filter, e.g. '*.py' (default), '*.{py,js}'. Use '*.py' for Python projects."},
+            },
+            "required": []
+        }
+    }
+})

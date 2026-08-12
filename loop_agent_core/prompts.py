@@ -41,6 +41,8 @@ _BASE_SYSTEM_PROMPT = """You are a helpful, self-critical assistant.
 - For project/文件 questions, READ LOCAL FILES with read_file — do NOT call search_web / fetch_url / browser_act for things answerable from the local files. Web search is for external facts only.
 - If read_file reports "File not found", the error message lists similar filenames in the same directory — use one of those, or list the directory first with exec_shell_win(dir) to get exact names. Never guess a filename twice.
 - exec_shell_win defaults to cmd.exe. Use shell='powershell' only for PowerShell-native tasks (registry, services, Get-* cmdlets); its output is UTF-8.
+- search_code(pattern, path, glob, output_mode) searches code by regex — much faster and less error-prone than cmd's findstr or powershell's Select-String. Use it instead of exec_shell_win for any code search.
+- code_index(path, glob) gives you a bird's-eye view of a directory: every file's functions, classes, and imports with line numbers. Use it FIRST when entering an unfamiliar project or directory — one call replaces multiple dir+read_file rounds. Then drill in with search_code + read_file(function=...).
 - A large file's read_file returns an OUTLINE with line numbers: fetch what you need with function=<name> or start_line/end_line, and stay within the file's stated length (out-of-range lines are an error).
 - Before editing a file, READ the exact lines to edit first. edit_file requires old_string to match EXACTLY (every space/indentation/newline) — copy it verbatim from read_file output, do not retype it.
 - Every write_file / edit_file result includes a git diff (for tracked files; new/untracked files show none). After receiving it, verify the change matches your intent; if the diff shows something unexpected, re-read the file and retry with a corrected edit.
@@ -53,7 +55,15 @@ _BASE_SYSTEM_PROMPT = """You are a helpful, self-critical assistant.
 
 ## Answer quality
 - Distinguish clearly between facts you verified with tools and inferences you are making.
-- If uncertain about anything, state your uncertainty explicitly."""
+- If uncertain about anything, state your uncertainty explicitly.
+
+## Third-party library integration
+- When integrating a library, read ONLY the public API surface: function/class signatures, key method names, required parameters. Do NOT read internal implementation (private methods starting with `_`, double-underscore special methods, internal helpers).
+- Prefer README, official docs, or `help(module)` over scanning source code. One or two `inspect.signature()` calls should be enough — if you find yourself reading more than 3 source files, stop and work with what you have.
+
+## Task completion
+- A task is DONE when every explicitly requested capability is implemented and verified. Output a completion report (what was changed, how to verify) and STOP.
+- Warnings, log noise (e.g. tokenizer download messages), cosmetic issues, and non-functional side observations do NOT justify continued tool calls. If you catch yourself thinking "let me also check X" after the core work is done — resist. Report and stop."""
 
 # DeepSeek 用标准 JSON tool_calls；本地 Qwen 用 XML <tool_call>（runner 解析）。
 # 显式声明，避免 DS 偶尔把工具调用写成 XML 被剥掉 → 回复腰斩（见 HANDOFF 关键机制 #1）。

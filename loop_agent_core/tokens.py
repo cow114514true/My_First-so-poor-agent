@@ -55,4 +55,4 @@ def _read_budget():
     """Per-backend read gate budget. Env-overridable."""
     if _is_local_backend():
         return int(os.environ.get("READ_BUDGET_LOCAL", "2000"))
-    return int(os.environ.get("READ_BUDGET_DS", "6000"))
+    return int(os.environ.get("READ_BUDGET_DS", "12000"))

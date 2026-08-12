@@ -22,10 +22,9 @@ def validate_tool_result(tool_name, result):
             return True, ""  # 非标准输出不过度质疑
         # stderr 恒为空（shell_tools 已并入 stdout），唯一信号是 returncode。
         # 非零退出 ≠ 命令失败：grep 无匹配 / diff 有差异 / find 空结果都返回 1。
-        # 只上屏信息，不逼重试——让模型看 stdout 自己判断是否真失败。
+        # 不触发 Self-check 打断模型——stdout 已在工具结果里，模型自己能判断。
         if data.get("returncode", 0) != 0:
-            return False, (f"Shell exited with returncode={data['returncode']}. Non-zero is often expected "
-                           "(grep no match, diff differs, find empty). Inspect stdout and judge whether it's a real failure.")
+            return True, ""
         return True, ""
 
     elif tool_name == "use_ds_from_web":
@@ -83,6 +82,16 @@ def validate_tool_result(tool_name, result):
         if ts.startswith("已记住") or ts.startswith("已更新"):
             return True, ""
         return False, f"remember 结果异常: {ts[:100]}"
+    elif tool_name == "search_code":
+        if text.startswith("[Error]"):
+            return False, f"search_code failed: {text[:200]}. Check pattern syntax or path."
+        return True, ""
+
+    elif tool_name == "code_index":
+        if text.startswith("[Error]"):
+            return False, f"code_index failed: {text[:200]}"
+        return True, ""
+
     # get_date: 基本不可能出错，跳过
 
     return True, ""

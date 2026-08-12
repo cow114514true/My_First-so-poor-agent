@@ -31,11 +31,11 @@ def test_shell_alias_powershell():
 
 
 def test_nonzero_exit_not_pressure_retry():
-    # grep 无匹配 exit 1 是正常语义，自检应上屏信息而不逼"重试"
+    # grep 无匹配 exit 1 是正常语义——不触发 Self-check，模型自己看 stdout 判断
     res = exec_shell_win_mock("cmd /c exit 1")
     is_valid, critique = validate_tool_result("exec_shell_win", res)
-    assert not is_valid  # 仍上屏让模型注意
-    assert "retry" not in critique.lower()  # 但不逼重试
+    assert is_valid  # 非零退出不再触发 Self-check 打断模型
+    assert critique == ""
 
 
 if __name__ == "__main__":

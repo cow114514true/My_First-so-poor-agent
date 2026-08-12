@@ -59,6 +59,21 @@ _EMPTY_NUDGE = ("[Self-check] 你刚才只输出了思考过程，没有调用�
 _STUCK_MSG = ("[模型陷入思考循环：连续多轮只输出思考、没有工具调用或回答。"
               "任务未能完成，请重试，或换用 DeepSeek 后端处理复杂任务。]")
 
+# 工具轮次接近上限时注入收尾提示，不依赖模型自觉
+_WRAPUP_NUDGE = ("[System] 已使用 {used}/{max} 轮工具调用。"
+                 "如果核心需求已经实现，请现在输出完成报告（做了什么、改了什么、如何验证），"
+                 "不要再继续探索或调用工具。仅当确有未完成的关键步骤时才继续。")
+
+
+def _inject_user_nudge(text, conv):
+    """注入一条 user 消息：若末条已是 user 则合并（避免连续 user 违反 API 交替协议），否则追加。"""
+    msgs = conv["messages"]
+    if msgs and msgs[-1].get("role") == "user":
+        msgs[-1]["content"] = text + "\n\n" + str(msgs[-1].get("content", ""))
+        conv["size"] = conv.get("size", 0) + estimate_tokens(text)
+    else:
+        _append_msg({"role": "user", "content": text}, conv)
+
 
 def _xml_to_tool_calls(xml_calls):
     """把 _parse_xml_tool_calls 的结果转成 SimpleNamespace 工具对象列表（与主循环共用）。"""
@@ -357,7 +372,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                     # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
                     conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
                     if conv["_empty_retries"] <= 3:
-                        _append_msg({"role": "user", "content": _EMPTY_NUDGE}, conv)
+                        _inject_user_nudge(_EMPTY_NUDGE, conv)
                         continue
                     msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
                 else:
@@ -392,6 +407,9 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
 
         run_tools(use_tool_calls, _emit, conv, tool_call_map, delegate_fn)
         conv["_empty_retries"] = 0  # 有产出（工具调用）→ 重置 thinking-only 计数
+        # 工具轮次逼近上限时注入收尾提示（合并到末条 user 或追加，不破坏交替协议）
+        if tool_round == MAX_TOOL_ROUNDS - 4:
+            _inject_user_nudge(_WRAPUP_NUDGE.format(used=tool_round, max=MAX_TOOL_ROUNDS), conv)
         # 继续循环，让助手处理工具结果
 
     # 主循环已实时输出正文；若工具轮次耗尽仍无正文，交给下面的最终流式阶段
@@ -399,7 +417,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # ponytail: 本地模型每轮只调 1-2 个工具，读+写多文件常远超 max_tool_rounds。
     # 最终流式阶段循环直到给出正文答案；期间遇到工具调用（content 或 reasoning 里的 <tool_call>）
     # 就执行并重试。上限固定 12，够写完多文件又不至于死循环拖太久。
-    for _ in range(12):
+    for final_round in range(12):
         if interrupt_event.is_set():  # 用户已按 Esc 中断
             return "[Interrupted by user]"
         q_idx, pruned = _prune_messages(_prune_cap(), q_idx, conv)
@@ -469,6 +487,9 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                     }, conv)
                     run_tools(use_tool_calls, _emit, conv, tool_call_map, delegate_fn,is_worker=not is_main_session)
                     conv["_empty_retries"] = 0  # 有产出（工具调用）→ 重置 thinking-only 计数
+                    # 同样在逼近上限时注入收尾提示
+                    if final_round == 8:  # 12 轮中的第 9 轮（0-indexed）
+                        _inject_user_nudge(_WRAPUP_NUDGE.format(used=final_round + 1, max=12), conv)
                 continue  # 模型还会再请求，直到给出正文
 
         # 正常答案：剥 XML + 垃圾检测后保存
@@ -478,7 +499,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
                 conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
                 if conv["_empty_retries"] <= 3:
-                    _append_msg({"role": "user", "content": _EMPTY_NUDGE}, conv)
+                    _inject_user_nudge(_EMPTY_NUDGE, conv)
                     continue
                 msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
             else:

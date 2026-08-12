@@ -62,6 +62,9 @@ class QuitDialog(Screen):
     def action_discard_quit(self) -> None:
         self.dismiss("discard")
 
+    def action_cancel_quit(self) -> None:
+        self.dismiss("cancel")
+
 
 class ConfirmDialog(Screen):
     """Modal: allow/deny a sensitive tool action (image read / file write / file edit)."""
