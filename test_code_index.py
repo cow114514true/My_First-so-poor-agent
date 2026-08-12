@@ -233,17 +233,15 @@ def test_prune():
     new_q, removed = la._prune_messages(100, q_idx, conv)  # small cap forces pruning
     la._msg_size = conv["size"]
     assert removed > 0, "expected pruning to trigger"
-    # current question preserved at its new position
-    assert la.messages[new_q]["content"] == "CURRENT QUESTION"
+    # current question preserved at its new position; notice prepended (not separate msg)
+    assert "CURRENT QUESTION" in la.messages[new_q]["content"]
+    assert "Context trimmed" in la.messages[new_q]["content"]
     # system prompt kept first
     assert la.messages[0]["role"] == "system"
     # all tool chains gone before the question
     for m in la.messages[:new_q]:
         assert m.get("role") != "tool"
         assert not (m.get("role") == "assistant" and "tool_calls" in m)
-    # notice injected right before the question
-    assert la.messages[new_q - 1]["role"] == "user"
-    assert "Context trimmed" in la.messages[new_q - 1]["content"]
     assert la._msg_size is not None and la._msg_size > 0
 
     la.messages[:] = [{"role": "system", "content": "sys"}]
@@ -269,9 +267,11 @@ def test_prune_notice_recycle():
     new_q, removed = la._prune_messages(cap, q_idx, conv)
     la._msg_size = conv["size"]
     assert removed == 2, removed  # assistant(tool_calls) + tool
-    assert la.messages[new_q]["content"] == "CURRENT"
-    notices = [m for m in la.messages if la._is_trim_notice(m)]
-    assert len(notices) == 1, f"提示堆叠 {len(notices)} 条: {[n['content'][:30] for n in notices]}"
+    assert "CURRENT" in la.messages[new_q]["content"]
+    assert "Context trimmed" in la.messages[new_q]["content"]
+    # 旧提示回收后无独立 notice 消息（仅合并到问题文本的那条）
+    stale = [m for m in la.messages[:new_q] if la._is_trim_notice(m)]
+    assert len(stale) == 0, f"stale notices before question: {[n['content'][:30] for n in stale]}"
     la.messages[:] = [{"role": "system", "content": "sys"}]
     la._msg_size = None
 

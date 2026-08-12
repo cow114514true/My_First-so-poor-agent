@@ -82,10 +82,11 @@ def _prune_messages(cap, q_idx, conv):
         conv["size"] -= sum(estimate_tokens(json.dumps(msgs[i], ensure_ascii=False)) for i in old_notices)
         msgs[:] = [m for i, m in enumerate(msgs) if i not in old_notices]
         new_q -= sum(1 for i in old_notices if i < new_q)
-    note = {"role": "user", "content": _PRUNE_NOTICE.format(n=removed)}
-    msgs.insert(new_q, note)
-    conv["size"] += estimate_tokens(json.dumps(note, ensure_ascii=False))
-    return new_q + 1, removed
+    # 合并提示到问题文本，避免独立 user 消息破坏 user/assistant 交替协议
+    note_text = _PRUNE_NOTICE.format(n=removed)
+    msgs[new_q]["content"] = note_text + "\n\n" + str(msgs[new_q]["content"])
+    conv["size"] += estimate_tokens(note_text)
+    return new_q, removed
 
 
 def _rollback_tool_round(conv):

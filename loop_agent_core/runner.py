@@ -245,15 +245,15 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     conv["_empty_retries"] = 0  # thinking-only 回合的重试计数（有界，防死循环）
     if conv["size"] is None:
         conv["size"] = estimate_tokens(json.dumps(conv["messages"], ensure_ascii=False))
+    # 添加用户问题（记忆注入合并进问题文本，避免额外 user 消息破坏 user/assistant 交替协议）
     if is_main_session and not any(
-        m.get("role") == "user" and str(m.get("content", "")).startswith("[长期记忆")
+        m.get("role") == "user" and "[长期记忆" in str(m.get("content", ""))
         for m in conv["messages"]
     ):
         from .memory import build_memory_injection
         injection = build_memory_injection()
         if injection is not None:
-            _append_msg({"role": "user", "content": injection}, conv)
-    # 添加用户问题
+            question = injection + "\n\n" + question
     _append_msg({"role": "user", "content": question}, conv)
     q_idx = len(conv["messages"]) - 1  # 当前问题所在索引，其之前都是可裁剪的旧内容
 
