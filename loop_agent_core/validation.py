@@ -20,15 +20,13 @@ def validate_tool_result(tool_name, result):
             data = json.loads(text)
         except (json.JSONDecodeError, TypeError):
             return True, ""  # 非标准输出不过度质疑
-        stderr = data.get("stderr", "")
-        returncode = data.get("returncode", 0)
-        issues = []
-        if returncode != 0:
-            issues.append(f"returncode={returncode} (command failed)")
-        if stderr and stderr.strip():
-            issues.append(f"stderr is non-empty: {stderr[:200]}")
-        if issues:
-            return False, f"Shell result suspicious: {'; '.join(issues)}. Retry with corrected command or handle the error."
+        # stderr 恒为空（shell_tools 已并入 stdout），唯一信号是 returncode。
+        # 非零退出 ≠ 命令失败：grep 无匹配 / diff 有差异 / find 空结果都返回 1。
+        # 只上屏信息，不逼重试——让模型看 stdout 自己判断是否真失败。
+        if data.get("returncode", 0) != 0:
+            return False, (f"Shell exited with returncode={data['returncode']}. Non-zero is often expected "
+                           "(grep no match, diff differs, find empty). Inspect stdout and judge whether it's a real failure.")
+        return True, ""
 
     elif tool_name == "use_ds_from_web":
         if "[get_response timeout]" in text or "[Error]" in text:

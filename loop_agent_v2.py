@@ -43,9 +43,9 @@ from loop_agent_core.control import interrupt_event
 _shell_output_queue = None
 
 
-def exec_shell_win_mock(shell_cmd):
-    """薄壳包装：把 TUI 注入的 _shell_output_queue 传给 core 实现（保持 1 参数签名）。"""
-    return _core_exec_shell_win(shell_cmd, _shell_output_queue)
+def exec_shell_win_mock(shell_cmd, shell="cmd"):
+    """薄壳包装：把 TUI 注入的 _shell_output_queue 传给 core 实现。"""
+    return _core_exec_shell_win(shell_cmd, shell, _shell_output_queue)
 
 
 _msg_size = None  # running token estimate of messages; synced to exact API usage when available

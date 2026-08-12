@@ -9,6 +9,7 @@ SUITES = [
     "test_multi_agent.py",
     "test_interrupt.py",
     "test_vision_tool.py",
+    "test_shell_tools.py",
 ]
 
 

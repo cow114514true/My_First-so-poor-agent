@@ -27,12 +27,14 @@ tools = [
         "type": "function",
         "function": {
             "name": "exec_shell_win",
-            "description": "Execute the shell(cmd[default] or powershell) command in windows_os",
+            "description": "Execute a command in Windows. shell='cmd' (default) runs cmd.exe; shell='powershell' runs PowerShell with UTF-8 output.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "shell_cmd": {"type": "string",
-                                "description":"Commands you want to execute in cmd or powershell"}
+                                "description": "The command to execute; syntax must match the chosen shell"},
+                    "shell": {"type": "string", "enum": ["cmd", "powershell"],
+                              "description": "Which shell to run in. Use 'powershell' for PowerShell-native tasks (registry, services, Get-* cmdlets); leave 'cmd' (default) otherwise."}
                 },
                 "required":["shell_cmd"]
             }

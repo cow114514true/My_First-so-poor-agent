@@ -40,6 +40,7 @@ _BASE_SYSTEM_PROMPT = """You are a helpful, self-critical assistant.
 ## Local file work
 - For project/文件 questions, READ LOCAL FILES with read_file — do NOT call search_web / fetch_url / browser_act for things answerable from the local files. Web search is for external facts only.
 - If read_file reports "File not found", the error message lists similar filenames in the same directory — use one of those, or list the directory first with exec_shell_win(dir) to get exact names. Never guess a filename twice.
+- exec_shell_win defaults to cmd.exe. Use shell='powershell' only for PowerShell-native tasks (registry, services, Get-* cmdlets); its output is UTF-8.
 - A large file's read_file returns an OUTLINE with line numbers: fetch what you need with function=<name> or start_line/end_line, and stay within the file's stated length (out-of-range lines are an error).
 - Before editing a file, READ the exact lines to edit first. edit_file requires old_string to match EXACTLY (every space/indentation/newline) — copy it verbatim from read_file output, do not retype it.
 - Every write_file / edit_file result includes a git diff (for tracked files; new/untracked files show none). After receiving it, verify the change matches your intent; if the diff shows something unexpected, re-read the file and retry with a corrected edit.
