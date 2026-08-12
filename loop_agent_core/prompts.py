@@ -74,6 +74,20 @@ _DS_TOOL_FORMAT_NOTE = """
 - NEVER write tool calls as XML (<tool_call>...</tool_call>) — on this backend XML tool calls are ignored and stripped, never executed. Only native JSON tool_calls are run.
 """
 
+# 本地 Qwen 默认不知道工具格式，必须显式写出 XML 模板 + 强约束文件操作必须走工具。
+_LOCAL_TOOL_FORMAT_NOTE = """
+
+## Tool call format
+- To call a tool, write an XML block:<tool_call>{"name": "tool_name", "arguments": {"arg1": "value1"}}</tool_call>
+- Multiple tool calls in the same message: write one <tool_call> block per tool, no separator needed.
+- After receiving tool results, continue with more tool calls or give your final answer.
+
+### File creation MUST use write_file
+- If the user asks you to CREATE, WRITE, or SAVE a file → call write_file. Never paste file content as text in your reply — the content will be lost.
+- If the user asks you to EDIT a file → call edit_file.
+- The only exception is a purely conversational question. For any request that produces a concrete file (code, config, data, SVG, HTML), use the tool or the work is wasted.
+"""
+
 # 环境事实注入：给模型真实路径，杜绝它猜 C:\Users\Public 或写死 %USERNAME%
 _ENV_FACTS = f"""
 ## Environment
@@ -83,7 +97,7 @@ _ENV_FACTS = f"""
 - The user's personal files live under the home directory above (Windows screenshots default to <home>\\Pictures\\Screenshots). NEVER use 'C:\\Users\\Public' or a literal '%USERNAME%' in a path; if the exact path is unclear, list the home directory with exec_shell_win (dir) to discover it.
 """
 
-system_prompt = _BASE_SYSTEM_PROMPT + _ENV_FACTS + (_DS_TOOL_FORMAT_NOTE if not _is_local_backend() else "")
+system_prompt = _BASE_SYSTEM_PROMPT + _ENV_FACTS + (_DS_TOOL_FORMAT_NOTE if not _is_local_backend() else _LOCAL_TOOL_FORMAT_NOTE)
 
 # 子 agent（worker）的 system prompt：复用主提示的工具使用指引，追加子任务模式约束
 WORKER_SYSTEM_PROMPT = system_prompt + """
