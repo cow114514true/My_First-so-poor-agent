@@ -35,7 +35,7 @@
 - **通用网页浏览**：`browser_act` 工具可访问任意网站——单步操作（打开/点击/填表/回车/悬停/下拉/滚动/截图），目标支持元素编号、`css=` 选择器、`xpath=` 表达式；返回页面状态 + 带 CSS 选择器的可交互元素清单；profile 持久化登录状态 + SPA 会话（URL/sessionStorage）恢复；`search_web`/`fetch_url`（Tavily）提供快速搜索与读页
 - **思考链（CoT）**：通过 `extra_body` 启用 DeepSeek 的思考链能力，提升复杂推理质量
 - **工具结果验证**：内置 `validate_tool_result()` 函数，自动检测工具返回结果是否有效，无效时触发 Agent 重试
-- **循环保护**：最大工具调用轮次限制（默认 6 轮），防止无限循环
+- **循环保护**：最大工具调用轮次限制（默认 12 轮）+ 接近上限时注入收尾提示，防止无限循环；所有工具/子 agent 执行有超时兜底（`f.result(timeout)`），杜绝单工具卡死拖垮整轮
 - **多 agent 委派**：`delegate_task` 工具将独立子任务委派给隔离上下文窗口的 sub-agent（共享工作目录与全部工具），防止单条对话上下文被长任务撑爆；内置递归守卫，sub-agent 内禁止再次委派
 - **本地视觉能力**：`analyze_image` 工具调用本地 llama.cpp 视觉模型（Qwen3.5-9B VLM）识别图片；**确认门**——读图/写文件/改文件在 TUI 弹窗征求同意（Allow/Deny/本会话放行），worker 子任务的敏感操作也经主会话 UI 弹窗
 - **流式输出**：最终回答以流式方式逐字输出，体验更流畅
@@ -56,14 +56,18 @@
 - `exec_shell_win`：在 Windows 上执行 CMD 或 PowerShell 命令，支持实时输出
 - `use_ds_from_web`：通过 Playwright 控制 DeepSeek 网页版，实现图片识别和联网搜索
 - `analyze_image`：**本地视觉模型**识别本地图片（截图/图表/照片）——base64 送 llama.cpp VLM，返回文字分析；图片路径不限 WORK_DIR，由确认门把关
-- `browser_act`：通用浏览器工具——单步操作（open/click/type/press_enter/hover/select_option/scroll/wait/back/screenshot/close），目标支持编号 / `css=` / `xpath=`，每次返回页面状态 + 带 CSS 选择器的元素清单，profile 持久化登录 + SPA 会话恢复；元素捕获泛化——列表去重、`cursor:pointer` 裸元素扫描（登录/投币这类无 role 的 span/div）、祖先 title 命名、链接类别上限、iframe 内元素跨帧捕获、open shadow DOM 自动穿透；打开页面默认暂停视频
+- `browser_act`：通用浏览器工具——单步操作（open/click/type/press_enter/hover/select_option/scroll/wait/back/screenshot/close），目标支持编号 / `css=` / `xpath=`，每次返回页面状态 + 带 CSS 选择器的元素清单，profile 持久化登录 + SPA 会话恢复；`locate=<关键词>` 参数把命中元素 ★ 置顶（找目标控件不用翻完整清单）；元素清单批量 `evaluate_all` 求值（一次往返算完全部元素的描述/路径/坐标，根治大页 120s+ 卡顿）；投币/点赞/收藏等 className 语义化（bilibili 操作栏是 div 无文本）；`cursor:pointer` 裸元素扫描补充；iframe 跨帧捕获；打开页面默认暂停视频
 - `visual_locate`：元素清单描述不清（图标/图片按钮）时的视觉兜底——截图让本地视觉模型给出目标元素粗包围框，吸附最近 DOM 元素返回编号，供 `browser_act` 点击
 - `search_web`：Tavily 网页搜索，返回标题/URL/内容片段（1 credit/次，快速查资料）
 - `fetch_url`：Tavily 读指定网页正文（extract，每 5 URL 1 credit）
 - `read_file`：安全读取文件——小文件全文返回；大文件自动返回**结构大纲**（函数/类/import + 行号），可用 `function=`（按函数名拉取函数体）或 `start_line`/`end_line`（行号区间）精准读取，所有读取受 token 预算上限约束
 - `count_tokens`：估算文件（`path=`）或任意文本（`text=`）的 token 数，用于判断是否启用索引阅读
-- `write_file`：安全写入文件（自动创建目录，覆盖已有文件）
+- `write_file`：安全写入文件（自动创建目录，覆盖已有文件，返回 git diff 供自检）
+- `edit_file`：精确替换指定字符串（默认要求唯一，找不到/不唯一报错并给出相近行候补；返回 git diff 供自检）
 - `delegate_task`：将独立子任务委派给隔离上下文的 sub-agent（共享工作目录与所有工具），返回其最终答案
+- `search_code`：Python 原生 regex 跨文件代码搜索（三种输出：匹配行+行号 / 文件列表 / 计数），替代 cmd 的 findstr，自动跳过依赖目录
+- `code_index`：目录级符号索引——一次调用返回整个目录所有文件的函数/类/import 结构地图，配合 `search_code` + `read_file(function=)` 三件套快速理解项目结构
+- `recall` / `remember`：跨会话记忆——`recall` 查询已保存的项目/系统记忆，`remember` 写入新记忆，实现 agent 的长期记忆能力
 
 ## 前置要求
 
@@ -316,7 +320,7 @@ def _resolve_path(path):
    - 先删**已完成的 tool 链**（`assistant(tool_calls)` + 对应 `tool` 结果 + `[Self-check]`）；
    - 仍超限则删**主干单条消息**（旧用户提问 / 旧回答）。
    - system 提示词与当前回合永不删除。
-4. **注入提示**：裁剪后在当前问题前插入一条 `[Context trimmed]` 用户消息，告知模型旧内容已删、需要信息可用 `read_file` 重读（该提示在后续裁剪中也会被回收）。
+4. **注入提示**：裁剪后把 `[Context trimmed]` 提示合并进当前问题文本（而非独立 user 消息），告知模型旧内容已删、继续任务或问用户（该提示在后续裁剪中会被回收，避免堆叠）。
 
 ### 网页桥接机制
 
@@ -330,11 +334,11 @@ def _resolve_path(path):
 
 **browser_act** — 单步浏览器操作工具（替换 browse_web）：
 
-1. 导航到指定 URL，等待页面加载完成（networkidle + 60s 兜底）
-2. 解析自然语言指令：`click`（点击按钮/链接）、`search`（搜索框输入）、`type`（表单填写）、`scroll`（滚动页面）
-3. 提取页面文本（去 script/style/nav，最大 8000 字符）或截图（`.png` 保存到 `screenshots/`）
-4. 截图可喂给 `use_ds_from_web` 做 OCR/分析（Agent 自动组合调用）
-5. 支持 `profile` 参数加载 `profiles/<name>.json` 持久化登录状态
+1. 导航到指定 URL（domcontentloaded + networkidle 兜底，重复 open 同 URL 跳过避免 SPA 卡死）
+2. 单步动作：`open`/`click`/`type`/`press_enter`/`press_key`/`hover`/`select_option`/`scroll`/`wait`/`back`/`screenshot`/`close`，目标支持元素编号 / `css=` / `xpath=`；`locate=<关键词>` 命中元素 ★ 置顶
+3. 元素清单批量求值（`evaluate_all` 一次往返拿全部元素的描述/路径/坐标，避免逐元素往返大页卡死）
+4. 每次返回页面状态 + 带 CSS 选择器的元素清单 + 页面文本（截断 4000）；`scroll` 用 JS `scrollBy` 而非 PageDown（bilibili 播放器劫持 PageDown 切视频）
+5. 支持 `profile` 参数加载 `profiles/<name>.json` 持久化登录状态；打开页面默认暂停视频
 
 安全限制：禁止访问 localhost、内网 IP、`file://` 协议。
 
@@ -374,19 +378,21 @@ system_prompt = """You are a helpful, self-critical assistant.
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `timeout`（get_response） | 300 秒 | 网页版响应超时时间（支持联网搜索场景） |
-| `MAX_TOOL_ROUNDS` | 6 | 最大工具调用轮次 |
+| `MAX_TOOL_ROUNDS` | 12 | 最大工具调用轮次（主循环） |
 | `model` | deepseek-v4-flash | DeepSeek API 模型 |
-| `reasoning_effort` | high | 推理努力程度 |
+| `reasoning_effort` | medium | 推理努力程度（探索/试错任务用 medium 省 token） |
 | `thinking` | enabled | 是否启用思考链 |
 | `WORK_DIR` | 项目根目录 | 文件读写的安全根目录 |
 | `MODEL_BACKEND` | 空 | 后端切换：`local-3.5` / `local-3.6` 走本地 llama.cpp，空则 DeepSeek API |
 | `READ_BUDGET_LOCAL` | 2000 | 本地后端 `read_file` 单次读取 token 上限 |
-| `READ_BUDGET_DS` | 6000 | DeepSeek 后端 `read_file` 单次读取 token 上限 |
+| `READ_BUDGET_DS` | 12000 | DeepSeek 后端 `read_file` 单次读取 token 上限（大部分文件一次读完不拆 outline） |
 | `VISION_BASE_URL` | `http://127.0.0.1:8080/v1` | `analyze_image` 连接的本地视觉 server |
 | `VISION_MODEL` | `Qwen3.5-9B` | 视觉模型名 |
 | `VISION_MAX_TOKENS` | 1024 | 视觉返回文字上限（防淹没上下文） |
-| `PRUNE_CAP_LOCAL` | 上下文 50% | 本地后端对话裁剪阈值（3.5→8192，3.6→4096） |
-| `PRUNE_CAP_DS` | 8000 | DeepSeek 后端对话裁剪阈值 |
+| `PRUNE_CAP_LOCAL` | 上下文 50% | 本地后端对话裁剪阈值 |
+| `PRUNE_CAP_DS` | 32000 | DeepSeek 后端对话裁剪阈值（65536 窗口的一半） |
+| `HEADROOM_ENABLED` | 1 | headroom-ai 上下文优化开关（1=启用，0=关闭） |
+| `HEADROOM_MODE` | audit | headroom 模式：`audit` 只记录分析不改请求，`optimize` 才真正压缩上下文 |
 
 ## 注意事项
 
@@ -424,6 +430,8 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.12**：代码导航三件套 + 浏览器批量求值根治卡顿 + 稳定性修复——新增 `search_code`（跨文件 regex 搜索）与 `code_index`（目录符号索引）工具；`browser_act` 元素清单重写为 `evaluate_all` 批量求值（一次往返拿全部元素，根治 bilibili 大页 122s 卡顿 → 0.3s）；投币/点赞/收藏 className 语义化 + `.video-toolbar-left-item` 选择器（bilibili 操作栏是 div 无文本）；`scroll` 改 JS `scrollBy`（播放器劫持 PageDown 切视频）；重复 open 同 URL 跳过 goto（SPA 卡死）；`_extract_page_text` `innerText`→`textContent`；`locate` 参数命中元素 ★ 置顶；本地模型工具结果 cap 2500→6000（14→66 元素）；`_page_state` 分段计时写 `tmp/browse_timing.log`；工具/子 agent 结果超时兜底（`f.result(timeout)` + `shutdown(wait=False)`）；headroom-ai 接入（audit/optimize 模式，JSONL 存储避开 SQLite 跨线程）；禁 HF tokenizer 下载（`HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS=0`）；协议加固（`_inject_user_nudge` 合并连续 user 消息防 API 400、第 8/12 轮注入收尾提示）；本地模型 XML 工具调用解析兼容 JSON 格式；系统提示新增第三方库接入原则 + 任务完成判定；`reasoning_effort` high→medium；`READ_BUDGET_DS` 6000→12000；QuitDialog ESC 修复
+- **v2.11**：协议加固 + 连接可靠性——多工具自检合并为单条 user 消息（根除连续 user 触发 API 400）；记忆注入/`[Context trimmed]` 合并进问题文本；流式连接 httpx read 120s 超时防断流挂死；shell 非零退出不再触发 Self-check 打断；QuitDialog ESC 取消修复
 - **v2.10**：元素捕获泛化 + 性能修复——`browser_act` 元素清单去重（bilibili 158→64）、`cursor:pointer` 裸元素扫描（登录/投币等无 role 的 span/div）、祖先 title 命名（计数 span → "投币（W） 410"）、链接类别上限 + 列表上限 120、iframe 跨帧捕获 + Frame-detached 容错、open shadow DOM 自动穿透；性能——打开页面默认暂停视频、`_describe` 批量 evaluate、`innerText`→`textContent`（视频页 40s+ → 7s）；新增 `visual_locate` 工具（VLM 粗包围框 + 吸附最近 DOM 元素，视觉兜底）
 - **v2.9**：任务可中断——Esc（agent 忙碌时）设共享中断事件，流式每 chunk / 每工具前 / 每轮 API 前检查，中断时部分正文落库不丢；长 shell 命令被杀；浏览器 `browser_act` 升级——目标支持 `css=`/`xpath=`、元素清单附 CSS 选择器、新增 hover/select_option、profile 恢复 URL+sessionStorage 解决 SPA 会话丢失
 - **v2.8**：网络能力升级——`browse_web` 替换为单步 `browser_act`（专用浏览器线程根治 thread-switch 崩溃、goto 不再死等 networkidle、按元素清单编号操作）；新增 Tavily `search_web`/`fetch_url`（stdlib urllib 实现，零新依赖，`TAVILY_API_KEY` 环境变量）
