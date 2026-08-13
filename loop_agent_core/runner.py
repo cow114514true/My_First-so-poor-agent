@@ -216,7 +216,9 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
         emit({"type": "tool_result", "tool_name": tool_name, "result": str(tool_result), "call_id": tool.id})
         # 落库进上下文的结果按预算截断（本地窗口小）；显示仍走上面的完整事件
         stored = str(tool_result)
-        cap = 2500 if _is_local_backend() else 10000
+        # 本地 2500 只能装 ~14 个元素清单，投币按钮排第 43 位看不到 → 提到 6000
+        # （16K 窗口 ≈ 3000 token 元素清单，18% 预算，可接受；能覆盖完整操作栏）
+        cap = 6000 if _is_local_backend() else 10000
         if len(stored) > cap:
             total = len(stored)
             stored = stored[:cap] + f"\n...(stored truncated, {total} chars total; re-read via read_file if needed)"

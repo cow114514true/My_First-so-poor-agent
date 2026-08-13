@@ -18,6 +18,7 @@ _BASE_SYSTEM_PROMPT = """You are a helpful, self-critical assistant.
 ### visual_locate
 - If the browser_act element list describes an element poorly (icons, image buttons, '<el> ?'), call visual_locate(target='描述') — it screenshots the page, draws numbered boxes over the interactive elements, and asks the vision model which number is your target. It returns a number you can act on.
 - visual_locate only LOCATES — it does not click. After it returns a number, perform the action with browser_act(click, target=编号).
+- IMPORTANT: If the element list already contains a matching element with clear text (e.g. "投币 投币（W）", "点赞 点赞（Q）"), use that element number DIRECTLY with browser_act — do NOT call visual_locate. visual_locate is ONLY for elements the list describes poorly or not at all.
 
 ### search_web / fetch_url
 - search_web(query) returns result titles/URLs/snippets — use for any fact lookup, latest info, docs, news.

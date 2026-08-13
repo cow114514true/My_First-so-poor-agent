@@ -21,9 +21,11 @@ from .ds_web import _executor, _get_playwright
 _EVALUATE_TIMEOUT = 15000  # JS 求值超时：页面 JS 卡死时抛 TimeoutError 而非永久挂
 
 
-def _evaluate(page, js, **kw):
-    """page.evaluate 带超时兜底：JS 死循环/超重 DOM 时不阻塞整个工具线程。"""
-    return page.evaluate(js, timeout=_EVALUATE_TIMEOUT, **kw)
+def _evaluate(page, js, arg=None):
+    """page.evaluate 带超时兜底：JS 死循环/超重 DOM 时不阻塞整个工具线程。
+    统一用位置参数 arg（page/element/frame 的 evaluate 都支持 expression, arg），
+    不传 timeout 关键字——element/frame 的 evaluate 没有该参数会 TypeError。"""
+    return page.evaluate(js, arg)
 
 # input 类选择器排前，避免被 button/a 淹没导致搜索框排在 30 之后（bilibili 搜索框曾排第 75）。
 # _visible_elements 用 _css_path 去重，所以跨类别重叠（button 带 role=button 等）不会产生重复项。
@@ -35,6 +37,7 @@ _ELEMENT_SELECTORS = (
     "[role='checkbox']", "[role='radio']", "[role='switch']", "[role='tab']", "[role='menuitem']",
     "video", "audio", "[onclick]",
     "[tabindex]:not([tabindex='-1'])",
+    ".video-toolbar-left-item",  # bilibili 视频操作栏（点赞/投币/收藏）是 div 不是 button，无文本
 )
 
 # 会话缓存：key=profile（headless 只在首次创建生效）。全程只在 executor 线程内访问。
@@ -140,7 +143,7 @@ def _extract_page_text(page) -> str:
         body_text = _evaluate(page, """() => {
             const clone = document.body.cloneNode(true);
             clone.querySelectorAll('script, style, noscript, nav, footer, [role="navigation"]').forEach(el => el.remove());
-            return clone.innerText || '';
+            return clone.textContent || '';
         }""")
         body_text = re.sub(r'\n{3,}', '\n\n', body_text).strip()
         return f"Title: {title}\n\n{body_text}"
@@ -208,51 +211,100 @@ def _pointer_leaves(page):
 _LINK_CAP = 40  # 链接类（a[href]/role=link）每页上限：防相关视频等被动链接洪水把交互控件挤出列表
 
 
+# 批量求值 JS：一次 evaluate_all 返回所有匹配元素的描述/CSS路径/可见性。
+# 逐元素 _visible_elements 在页面 JS 主线程繁忙时偶发 122s（实测 browse_timing.log），
+# evaluate_all 每个选择器一次往返，全部选择器仅 0.08s——根治卡顿。
+_BATCH_EL_JS = r"""(els) => els.map(e => {
+    const tag = e.tagName.toLowerCase();
+    const role = e.getAttribute('role');
+    let label = (e.getAttribute('placeholder') || e.getAttribute('aria-label')
+        || e.getAttribute('title')
+        || (e.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100)
+        || e.getAttribute('name') || '');
+    if (!label && (tag === 'video' || tag === 'audio')) label = tag + ' player';
+    const cls = typeof e.className === 'string' ? e.className : '';
+    if (!role) {
+        if (/\bvideo-coin\b/.test(cls)) label = '投币 ' + label;
+        else if (/\bvideo-like\b/.test(cls)) label = '点赞 ' + label;
+        else if (/\bvideo-fav\b/.test(cls)) label = '收藏 ' + label;
+        else if (/\bvideo-share\b/.test(cls)) label = '分享 ' + label;
+    }
+    if (!label || (label.length < 8 && /^[\d.,万kK%+ ]+$/.test(label))) {
+        let p = e.parentElement;
+        for (let i = 0; p && i < 3; i++, p = p.parentElement) {
+            const t = p.getAttribute && (p.getAttribute('title') || p.getAttribute('aria-label'));
+            if (t) { label = label ? t + ' ' + label : t; break; }
+        }
+    }
+    const r = e.getBoundingClientRect();
+    const cs = getComputedStyle(e);
+    const visible = r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+    const box = { x: r.x, y: r.y, width: r.width, height: r.height };
+    const parts = [];
+    let cur = e;
+    while (cur && cur.nodeType === 1 && cur.tagName.toLowerCase() !== 'html' && parts.length < 6) {
+        const t2 = cur.tagName.toLowerCase();
+        let sel = t2;
+        if (cur.id) { sel = t2 + '#' + cur.id; parts.unshift(sel); break; }
+        if (cur.classList && cur.classList.length) sel += '.' + cur.classList[0];
+        const parent = cur.parentElement;
+        if (parent) {
+            const sameTag = [...parent.children].filter(c => c.tagName === cur.tagName);
+            if (sameTag.length > 1) sel += ':nth-of-type(' + (sameTag.indexOf(cur) + 1) + ')';
+        }
+        parts.unshift(sel);
+        cur = parent;
+    }
+    return { tag, role, label, css: parts.join(' > '), visible, box,
+             is_link: tag === 'a' || role === 'link' };
+})"""
+
+
 def _visible_elements(page):
     """按固定选择器顺序收集可见元素——列表展示和编号点击必须用同一顺序。
-    遍历 page.frames() 主框架 + 所有 iframe（嵌入式播放器/登录框常在 iframe 里）。
-    用 "帧序:css_path" 去重：一个元素可能命中多个选择器（button 带 role=button 等），
-    且不同帧可能产生相同 css_path，帧序保证去重不误杀。_find_element 用编号拿到的
-    frame 元素句柄可直接点击（Playwright 跨帧操作）。"""
+    用 evaluate_all 批量求值（每个选择器一次往返），返回元素描述 dict 列表，
+    由 _find_element 按编号重建 locator。跨 frame + 帧序去重 + 链接上限。"""
     els = []
     seen = set()
     link_count = 0
     for fi, frame in enumerate(page.frames):
         try:
             for sel in _ELEMENT_SELECTORS:
-                for el in frame.locator(sel).all():
-                    if sel in ("a[href]", "[role='link']") and link_count >= _LINK_CAP:
+                try:
+                    batch = frame.locator(sel).evaluate_all(_BATCH_EL_JS)
+                except Exception:
+                    continue  # 帧被移除/选择器无效：跳过
+                for d in batch:
+                    if not d or not d.get("visible"):
                         continue
-                    try:
-                        if not el.is_visible():
-                            continue
-                    except Exception:
+                    if d.get("is_link") and link_count >= _LINK_CAP:
                         continue
-                    p = _css_path(el)
-                    if p == "?":  # 路径计算失败：不去重，全保留
-                        p = f"?{len(els)}"
+                    p = d.get("css") or "?"
                     key = f"{fi}:{p}"
                     if key in seen:
                         continue
                     seen.add(key)
-                    if sel in ("a[href]", "[role='link']"):
+                    if d.get("is_link"):
                         link_count += 1
-                    els.append(el)
-            for item in _pointer_leaves(frame):
-                try:
-                    el = frame.locator(item["path"]).first
-                    if not el.is_visible():
+                    els.append({"fi": fi, "css": p, **d})
+            # pointer_leaves 补充：cursor:pointer 的裸元素（登录 span 等），批量 evaluate_all 一次算
+            try:
+                for item in _pointer_leaves(frame):
+                    try:
+                        batch = frame.locator(item["path"]).evaluate_all(_BATCH_EL_JS)
+                    except Exception:
                         continue
-                    p = _css_path(el)
-                except Exception:
-                    continue
-                if p == "?":
-                    p = f"?{len(els)}"
-                key = f"{fi}:{p}"
-                if key in seen:
-                    continue
-                seen.add(key)
-                els.append(el)
+                    for d in batch:
+                        if not d or not d.get("visible"):
+                            continue
+                        p = d.get("css") or "?"
+                        key = f"{fi}:{p}"
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        els.append({"fi": fi, "css": p, **d})
+            except Exception:
+                continue
         except Exception:
             continue  # 帧被移除（Frame detached）/加载中：跳过整帧不崩
     return els
@@ -269,6 +321,14 @@ _DESCRIBE_JS = r"""(e) => {
         || (e.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 100)
         || e.getAttribute('name') || '');
     if (!label && (tag === 'video' || tag === 'audio')) label = tag + ' player';
+    // bilibili 视频操作栏：className 语义化（投币/点赞/收藏是 div，无 title/aria-label）
+    const cls = typeof e.className === 'string' ? e.className : '';
+    if (!role) {
+        if (/\bvideo-coin\b/.test(cls)) label = '投币 ' + label;
+        else if (/\bvideo-like\b/.test(cls)) label = '点赞 ' + label;
+        else if (/\bvideo-fav\b/.test(cls)) label = '收藏 ' + label;
+        else if (/\bvideo-share\b/.test(cls)) label = '分享 ' + label;
+    }
     if (!label || (label.length < 8 && /^[\d.,万kK%+ ]+$/.test(label))) {
         let p = e.parentElement;
         for (let i = 0; p && i < 3; i++, p = p.parentElement) {
@@ -282,7 +342,7 @@ _DESCRIBE_JS = r"""(e) => {
 
 def _describe(el):
     try:
-        d = el.evaluate(_DESCRIBE_JS, timeout=_EVALUATE_TIMEOUT)
+        d = el.evaluate(_DESCRIBE_JS)
         kind = d["role"] or {"a": "link", "input": "input", "textarea": "input",
                              "select": "select", "video": "video", "audio": "audio"}.get(d["tag"], d["tag"])
         return f"<{kind}> {(d['label'] or '').strip()[:60]}"
@@ -293,36 +353,49 @@ def _describe(el):
 def _css_path(el):
     """稳定的 CSS 路径：优先 #id，否则 tag:first-class:nth-of-type，逐级上溯（截断防超长）。"""
     try:
-        return el.evaluate("""(e) => {
-            const parts = [];
-            let cur = e;
-            while (cur && cur.nodeType === 1 && cur.tagName.toLowerCase() !== 'html' && parts.length < 6) {
-                const tag = cur.tagName.toLowerCase();
-                let sel = tag;
-                if (cur.id) { sel = tag + '#' + cur.id; parts.unshift(sel); break; }
-                if (cur.classList && cur.classList.length) sel += '.' + cur.classList[0];
-                const parent = cur.parentElement;
-                if (parent) {
-                    const sameTag = [...parent.children].filter(c => c.tagName === cur.tagName);
-                    if (sameTag.length > 1) sel += ':nth-of-type(' + (sameTag.indexOf(cur) + 1) + ')';
-                }
-                parts.unshift(sel);
-                cur = parent;
-            }
-            return parts.join(' > ');
-        }""", timeout=_EVALUATE_TIMEOUT)
+        return el.evaluate(_CSS_PATH_JS)
     except Exception:
         return "?"
+
+
+# 与 _css_path 内联 JS 等价，独立出来供 _list_interactive_elements 批量复用
+_CSS_PATH_JS = r"""(e) => {
+    const parts = [];
+    let cur = e;
+    while (cur && cur.nodeType === 1 && cur.tagName.toLowerCase() !== 'html' && parts.length < 6) {
+        const tag = cur.tagName.toLowerCase();
+        let sel = tag;
+        if (cur.id) { sel = tag + '#' + cur.id; parts.unshift(sel); break; }
+        if (cur.classList && cur.classList.length) sel += '.' + cur.classList[0];
+        const parent = cur.parentElement;
+        if (parent) {
+            const sameTag = [...parent.children].filter(c => c.tagName === cur.tagName);
+            if (sameTag.length > 1) sel += ':nth-of-type(' + (sameTag.indexOf(cur) + 1) + ')';
+        }
+        parts.unshift(sel);
+        cur = parent;
+    }
+    return parts.join(' > ');
+}"""
 
 
 _LIST_LIMIT = 120  # 列表上限：视频页可达 119 元素，80 会把互动栏（投币按钮 #110）截掉
 
 def _list_interactive_elements(page, limit=_LIST_LIMIT):
-    return [f"[{i+1}] {_describe(el)} — css={_css_path(el)}" for i, el in enumerate(_visible_elements(page)) if i < limit]
+    """基于 _visible_elements 的 dict 直接格式化（含可见性过滤、投币/点赞语义、CSS路径）。"""
+    out = []
+    for i, d in enumerate(_visible_elements(page)):
+        if i >= limit:
+            break
+        kind = d.get("role") or {"a": "link", "input": "input", "textarea": "input",
+                                 "select": "select", "video": "video", "audio": "audio"}.get(d.get("tag"), d.get("tag"))
+        out.append(f"[{i+1}] <{kind}> {(d.get('label') or '').strip()[:60]} — css={d.get('css') or '?'}")
+    return out
 
 
 def _find_element(page, target):
-    """target 支持：元素清单编号、css=<选择器>、xpath=<表达式>。返回 Playwright locator。"""
+    """target 支持：元素清单编号、css=<选择器>、xpath=<表达式>。返回 Playwright locator。
+    编号按 _visible_elements 的顺序映射到 (frame, css_path)，重建 locator（跨帧可用）。"""
     if isinstance(target, str):
         low = target.strip()
         if low.startswith("css="):
@@ -335,7 +408,9 @@ def _find_element(page, target):
         raise ValueError(f"target 必须是元素清单编号、css=<选择器> 或 xpath=<表达式>，拿到: {target!r}")
     els = _visible_elements(page)
     if 1 <= idx <= len(els):
-        return els[idx - 1]
+        d = els[idx - 1]
+        frame = page.frames[d["fi"]] if d.get("fi") is not None and d["fi"] < len(page.frames) else page
+        return frame.locator(d["css"]).first
     raise ValueError(f"元素编号 {idx} 超出范围 (1-{len(els)})。用最新返回的元素清单。")
 
 
@@ -344,27 +419,56 @@ def _pause_videos(page):
     每次 Playwright 往返从 5ms 飙到 50-100ms，元素列表构建从 4s 拖到 40s+。"""
     try:
         for f in page.frames:
-            f.evaluate("() => { for (const v of document.querySelectorAll('video')) { v.pause(); } }", timeout=_EVALUATE_TIMEOUT)
+            _evaluate(f, "() => { for (const v of document.querySelectorAll('video')) { v.pause(); } }")
     except Exception:
         pass  # 暂停失败不阻塞页面状态
 
 
-def _page_state(page):
-    """返回 URL + Title + 元素清单 + 页面文本（截断 4000）。"""
+def _page_state(page, locate=None):
+    """返回 URL + Title + 元素清单 + 页面文本（截断 4000）。
+    locate 非空时，把匹配的元素用 ★ 标注并置顶，模型不用翻完整清单找目标。
+    分段计时每步实时写 tmp/browse_timing.log——卡在哪一步日志就停在哪步（先写后跑，不留死角）。"""
+    import time as _t
+    import os as _os
+    _LOG_PATH = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))), "tmp", "browse_timing.log")
+
+    def _log(line):
+        try:
+            with open(_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+    _mark = _t.monotonic()
+    _log("== _page_state start ==")
+
     _pause_videos(page)  # 先停视频，让后续往返恢复低延迟
+    _log(f"  [_pause_videos] {_t.monotonic()-_mark:.1f}s")
+    _mark = _t.monotonic()
+
     out = [f"URL: {page.url}", f"Title: {page.title() or ''}"]
     elements = _list_interactive_elements(page)
+    _log(f"  [_list_interactive_elements] {_t.monotonic()-_mark:.1f}s ({len(elements)} els)")
+    _mark = _t.monotonic()
     if elements:
+        if locate:
+            kw = locate.strip().lower()
+            hits = [e for e in elements if kw in e.lower()]
+            if hits:
+                out.append(f"★ 命中『{locate}』({len(hits)}):")
+                out.extend("★ " + e for e in hits)
         out.append("Elements:")
         out.extend(elements)
     body = _extract_page_text(page)
+    _log(f"  [_extract_page_text] {_t.monotonic()-_mark:.1f}s")
     if len(body) > 4000:
         body = body[:4000] + f"\n... (truncated, {len(body)} chars total)"
     out.append(f"--- Page Content ---\n{body}")
+    _log(f"== _page_state total {_t.monotonic()-_mark:.1f}s ==")
     return "\n".join(out)
 
 
-def _do_browser(action, url, target, text, profile, headless):
+def _do_browser(action, url, target, text, profile, headless, locate=None):
     """执行单个浏览器动作；失败抛异常，由 browser_act_mock 统一格式化 / 死会话重试。"""
     global _last_active
     page, ctx, browser = _get_browser_page(profile, headless)
@@ -372,13 +476,33 @@ def _do_browser(action, url, target, text, profile, headless):
     if action not in ("open", "close") and page.url.strip().rstrip("/") in ("about:blank", ""):
         return "[Error] Browser page is still blank (about:blank). Call action='open' with a URL first."
     if action == "open":
-        page.goto(_validate_url(url), wait_until="domcontentloaded", timeout=30000)
-        try:
-            page.wait_for_load_state("networkidle", timeout=5000)
-        except Exception:
-            pass  # networkidle 对长轮询页面是常态超时，不算错误，继续
-        page.wait_for_timeout(500)
-        out.append("OK: navigated")
+        target_url = _validate_url(url)
+        # 归一化比较 scheme://netloc/path?query：bilibili 会把 /video/X 重定向成 /video/X/（尾部斜杠）
+        def _norm(u):
+            p = urlparse(u)
+            return f"{p.scheme}://{p.netloc}{p.path.rstrip('/')}?{p.query}"
+        if page.url.strip() and _norm(page.url) == _norm(target_url):
+            # 已在此 URL：跳过重复 goto（bilibili SPA 重复导航同一视频会卡 networkidle + 元素遍历 60s+）
+            # 但残留会话的页面可能停在操作栏未渲染的状态，等它出现（同 goto 分支）
+            try:
+                page.wait_for_selector(".video-toolbar-left-item", timeout=8000)
+            except Exception:
+                pass
+            page.wait_for_timeout(300)
+            out.append("OK: already on this URL")
+        else:
+            page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_load_state("networkidle", timeout=5000)
+            except Exception:
+                pass  # networkidle 对长轮询页面是常态超时，不算错误，继续
+            # 等视频操作栏（点赞/投币）渲染——bilibili 异步加载，过早返回只看到 2 个元素
+            try:
+                page.wait_for_selector(".video-toolbar-left-item", timeout=8000)
+            except Exception:
+                pass  # 某些页面无操作栏，不阻塞
+            page.wait_for_timeout(300)
+            out.append("OK: navigated")
     elif action == "click":
         _find_element(page, target).click()
         page.wait_for_timeout(800)
@@ -408,7 +532,11 @@ def _do_browser(action, url, target, text, profile, headless):
         page.wait_for_timeout(400)
         out.append(f"OK: selected option '{text}' in {target}")
     elif action == "scroll":
-        page.keyboard.press("PageDown" if str(text).lower() in ("", "down") else "PageUp")
+        # 用 JS 滚轮而非 PageDown：键盘焦点落在播放器时 PageDown 会触发视频切换快捷键
+        # （bilibili 实测两次 scroll 就跳到下一视频），window.scrollBy 只滚动页面不受劫持。
+        delta = -1 * 900 if str(text).lower() in ("up",) else 900
+        _evaluate(page, f"window.scrollBy(0, {delta});")
+        page.wait_for_timeout(300)
         out.append("OK: scrolled")
     elif action == "wait":
         secs = min(int(text or 1), 10)
@@ -431,22 +559,23 @@ def _do_browser(action, url, target, text, profile, headless):
 
     if action != "close":
         _save_profile(profile or _last_active or "__default__", ctx, page)
-        out.append(_page_state(page))
+        out.append(_page_state(page, locate=locate))
     return "\n".join(out)
 
 
-def browser_act_mock(action, url="", target=None, text="", profile="", headless=True):
+def browser_act_mock(action, url="", target=None, text="", profile="", headless=True, locate=None):
     """单步浏览器操作：每次只做一个动作，返回页面状态 + 可交互元素清单。
     headless=False 会显示浏览器窗口（登录/验证码等需要人工操作时用）。
+    locate=<关键词> 时返回清单把匹配元素 ★ 置顶（找目标控件时用，省去翻完整清单）。
     死会话（用户关了窗口）自动丢弃并重建重试一次。"""
     def work():
         try:
-            return _do_browser(action, url, target, text, profile, headless)
+            return _do_browser(action, url, target, text, profile, headless, locate=locate)
         except Exception as e:
             if "has been closed" in str(e):
                 _browser_sessions.pop(profile or _last_active or "__default__", None)
                 try:
-                    return _do_browser(action, url, target, text, profile, headless)
+                    return _do_browser(action, url, target, text, profile, headless, locate=locate)
                 except Exception as e2:
                     return f"[Error] browser_act failed: {e2}"
             return f"[Error] browser_act failed: {e}"

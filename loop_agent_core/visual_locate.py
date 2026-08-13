@@ -14,8 +14,15 @@ import re
 from PIL import Image
 from openai import OpenAI
 
-from .browse import _executor, _get_browser_page, _visible_elements, _take_screenshot, _describe
+from .browse import _executor, _get_browser_page, _visible_elements, _take_screenshot
 from .vision import _vision_cfg
+
+
+def _dict_desc(d):
+    """从 _visible_elements 的 dict 生成 '<kind> label' 描述（browser_act 元素清单同格式）。"""
+    kind = d.get("role") or {"a": "link", "input": "input", "textarea": "input",
+                             "select": "select", "video": "video", "audio": "audio"}.get(d.get("tag"), d.get("tag"))
+    return f"<{kind}> {(d.get('label') or '').strip()[:60]}"
 
 
 _NUM = r"-?\d+(?:\.\d+)?"  # 浮点正则，避免 "520.0" 被 \d+ 拆成 [520, 0] → 退化框
@@ -66,18 +73,16 @@ def _ask_vlm_bbox(b64, target, size, max_tokens=600, attempts=4):
 
 def _pick_element(els, box):
     """按 VLM 包围框吸附最近真实元素。
+    els 是 _visible_elements 返回的 dict 列表（每项含 box={x,y,width,height}）。
     返回 (best, shortlist)；best=(inter, dist, i)，shortlist 是同结构的候选前 5。
     纯逻辑，不触浏览器——用 stub 元素即可回归。
     """
     x1, y1, x2, y2 = box
     cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
     cands = []
-    for i, el in enumerate(els):
-        try:
-            b = el.bounding_box()
-        except Exception:
-            continue
-        if not b:
+    for i, d in enumerate(els):
+        b = d.get("box")
+        if not b or not (b.get("width") and b.get("height")):
             continue
         ex1, ey1 = b["x"], b["y"]
         ex2, ey2 = ex1 + b["width"], ey1 + b["height"]
@@ -121,8 +126,8 @@ def visual_locate_mock(target, profile="", headless=True):
         if best is None:
             return f"[Error] visual_locate: 没有元素可吸附。截图: {shot}"
         idx = best[2]
-        desc = _describe(els[idx])
-        sl = ", ".join(f"[{c[2]+1}] {_describe(els[c[2]])}" for c in shortlist)
+        desc = _dict_desc(els[idx])
+        sl = ", ".join(f"[{c[2]+1}] {_dict_desc(els[c[2]])}" for c in shortlist)
         return (f"[visual_locate] 『{target}』 → 编号 [{idx+1}] ({desc})。"
                 f"最近候选: {sl}。用 browser_act(click, target={idx+1})；若候选里另有更合适的，用它的编号。")
     return _executor.call(work)
