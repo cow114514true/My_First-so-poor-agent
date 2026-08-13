@@ -99,6 +99,8 @@ def _store_tool_args(name, arguments):
 
 _WORKER_FORBIDDEN = ("delegate_task", "recall", "remember")  # worker 内禁用的工具
 _SYNC_MAX = 8  # 同步工具并发上限（工具多为 I/O 密集，线程池并发即够）
+_TOOL_TIMEOUT = 150  # 单工具结果超时（秒）：browser/ds_web 内部无兜底会卡死线程，这里兜底
+_WORKER_TIMEOUT = 600  # 子 agent 超时（秒）：长任务给足 10 分钟，防误杀合法委托
 
 
 def _worker_pool_size():
@@ -142,21 +144,33 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
 
     # ── 1) 并发执行阶段（只收集结果）────────────────────────
     # 同步工具：线程池并发。worker 内禁用的工具不执行，结算阶段给错误。
+    # 每个工具设结果超时（browser/ds_web 无内部兜底时会卡死线程），超时不阻塞主循环；
+    # executor 用 shutdown(wait=False) 防 with 退出 join 死等（后台线程自然结束）。
     sync = [t for t in use_tool_calls
             if t.function.name != "delegate_task"
             and not (is_worker and t.function.name in _WORKER_FORBIDDEN)]
     if sync:
-        with ThreadPoolExecutor(max_workers=_SYNC_MAX) as ex:
+        ex = ThreadPoolExecutor(max_workers=_SYNC_MAX)
+        try:
             fut = {ex.submit(_call_tool, t, tool_call_map): t for t in sync}
             for f in as_completed(fut):
-                cid, res = f.result()
+                t = fut[f]
+                try:
+                    cid, res = f.result(timeout=_TOOL_TIMEOUT)
+                except TimeoutError:
+                    cid, res = t.id, f"[Error] Tool '{t.function.name}' timed out after {_TOOL_TIMEOUT}s"
+                except Exception as e:
+                    cid, res = t.id, f"[Error] Tool execution failed: {e}"
                 results[cid] = res
+        finally:
+            ex.shutdown(wait=False)
 
     # delegate_task：子 agent 异步队列（仅主 agent 可委托，受控并发）。
     if not is_worker:
         delegated = [t for t in use_tool_calls if t.function.name == "delegate_task"]
         if delegated:
-            with ThreadPoolExecutor(max_workers=_worker_pool_size()) as ex:
+            ex = ThreadPoolExecutor(max_workers=_worker_pool_size())
+            try:
                 futs = []
                 for t in delegated:
                     try:
@@ -169,9 +183,13 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
                     futs.append((t, ex.submit(_run_worker, task, delegate_fn)))
                 for t, f in futs:
                     try:
-                        results[t.id] = f.result()
+                        results[t.id] = f.result(timeout=_WORKER_TIMEOUT)
+                    except TimeoutError:
+                        results[t.id] = f"[Error] Sub-agent timed out after {_WORKER_TIMEOUT}s"
                     except Exception as e:
                         results[t.id] = f"[Error] Sub-agent execution failed: {e}"
+            finally:
+                ex.shutdown(wait=False)
 
     # ── 2) 结算阶段：按原调用顺序，逐分支与旧逻辑一致 ─────────
     critiques = []

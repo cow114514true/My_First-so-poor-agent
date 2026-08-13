@@ -63,7 +63,11 @@ def _normalize_toolcall_xml(text):
 def _parse_xml_tool_calls(text):
     """Parse llama.cpp/Qwen `<tool_call>` XML blocks into OpenAI-style [{"name", "arguments"}].
     Qwen-family local models sometimes emit tool calls as XML (often inside reasoning_content)
-    instead of JSON tool_calls; llama-server does not parse those out of the thinking block."""
+    instead of JSON tool_calls; llama-server does not parse those out of the thinking block.
+    Accepts two inner formats:
+      - tagged:  <function=name><parameter=arg>value</parameter></function>
+      - json:    {"name": "tool", "arguments": {"arg": "value"}}   (prompt-taught format)
+    """
     if not text:
         return []
     text = _strip_dsml(text)
@@ -71,18 +75,33 @@ def _parse_xml_tool_calls(text):
     calls = []
     for block in _XML_TOOLCALL_RE.findall(text):
         m = _XML_FN_RE.search(block)
-        if not m:
+        if m:
+            name = m.group(1).strip()
+            args = {}
+            for k, v in _XML_PARAM_RE.findall(block):
+                k = k.strip()
+                v = v.strip()
+                try:
+                    args[k] = json.loads(v)
+                except (json.JSONDecodeError, ValueError):
+                    args[k] = v
+            calls.append({"name": name, "arguments": json.dumps(args, ensure_ascii=False)})
             continue
-        args = {}
-        for k, v in _XML_PARAM_RE.findall(block):
-            k = k.strip()
-            v = v.strip()
-            try:
-                args[k] = json.loads(v)
-            except (json.JSONDecodeError, ValueError):
-                args[k] = v
-        calls.append({"name": m.group(1).strip(),
-                      "arguments": json.dumps(args, ensure_ascii=False)})
+        # JSON form: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+        try:
+            d = json.loads(block.strip())
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(d, dict) or not isinstance(d.get("name"), str):
+            continue
+        args = d.get("arguments", {})
+        if isinstance(args, dict):
+            args = json.dumps(args, ensure_ascii=False)
+        elif isinstance(args, str):
+            args = args  # already a JSON string
+        else:
+            args = json.dumps({})
+        calls.append({"name": d["name"], "arguments": args})
     return calls
 
 

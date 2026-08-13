@@ -18,6 +18,13 @@ from .debuglog import log_error
 from .config import _PROFILES_DIR, WORK_DIR
 from .ds_web import _executor, _get_playwright
 
+_EVALUATE_TIMEOUT = 15000  # JS 求值超时：页面 JS 卡死时抛 TimeoutError 而非永久挂
+
+
+def _evaluate(page, js, **kw):
+    """page.evaluate 带超时兜底：JS 死循环/超重 DOM 时不阻塞整个工具线程。"""
+    return page.evaluate(js, timeout=_EVALUATE_TIMEOUT, **kw)
+
 # input 类选择器排前，避免被 button/a 淹没导致搜索框排在 30 之后（bilibili 搜索框曾排第 75）。
 # _visible_elements 用 _css_path 去重，所以跨类别重叠（button 带 role=button 等）不会产生重复项。
 _ELEMENT_SELECTORS = (
@@ -109,7 +116,7 @@ def _save_profile(profile: str, ctx, page=None) -> None:
     ctx.storage_state(path=storage_path)
     try:
         url = page.url if page is not None else ""
-        ss = (page.evaluate("() => { const o = {}; for (const k of sessionStorage) o[k] = sessionStorage.getItem(k); return o; }")
+        ss = (_evaluate(page, "() => { const o = {}; for (const k of sessionStorage) o[k] = sessionStorage.getItem(k); return o; }")
               if page is not None else {})
         with open(os.path.join(_PROFILES_DIR, f"{profile}_session.json"), "w", encoding="utf-8") as f:
             json.dump({"url": url, "session_storage": ss}, f, ensure_ascii=False)
@@ -130,7 +137,7 @@ def _extract_page_text(page) -> str:
     try:
         title = page.title() or ""
         # Remove script/style content for cleaner text
-        body_text = page.evaluate("""() => {
+        body_text = _evaluate(page, """() => {
             const clone = document.body.cloneNode(true);
             clone.querySelectorAll('script, style, noscript, nav, footer, [role="navigation"]').forEach(el => el.remove());
             return clone.innerText || '';
@@ -193,7 +200,7 @@ _POINTER_SCAN_JS = r"""() => {
 def _pointer_leaves(page):
     """返回 cursor:pointer 且未被标准选择器覆盖的可点击元素（路径列表）。"""
     try:
-        return page.evaluate(_POINTER_SCAN_JS)
+        return _evaluate(page, _POINTER_SCAN_JS)
     except Exception:
         return []
 
@@ -275,7 +282,7 @@ _DESCRIBE_JS = r"""(e) => {
 
 def _describe(el):
     try:
-        d = el.evaluate(_DESCRIBE_JS)
+        d = el.evaluate(_DESCRIBE_JS, timeout=_EVALUATE_TIMEOUT)
         kind = d["role"] or {"a": "link", "input": "input", "textarea": "input",
                              "select": "select", "video": "video", "audio": "audio"}.get(d["tag"], d["tag"])
         return f"<{kind}> {(d['label'] or '').strip()[:60]}"
@@ -303,7 +310,7 @@ def _css_path(el):
                 cur = parent;
             }
             return parts.join(' > ');
-        }""")
+        }""", timeout=_EVALUATE_TIMEOUT)
     except Exception:
         return "?"
 
@@ -337,7 +344,7 @@ def _pause_videos(page):
     每次 Playwright 往返从 5ms 飙到 50-100ms，元素列表构建从 4s 拖到 40s+。"""
     try:
         for f in page.frames:
-            f.evaluate("() => { for (const v of document.querySelectorAll('video')) { v.pause(); } }")
+            f.evaluate("() => { for (const v of document.querySelectorAll('video')) { v.pause(); } }", timeout=_EVALUATE_TIMEOUT)
     except Exception:
         pass  # 暂停失败不阻塞页面状态
 

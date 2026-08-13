@@ -26,11 +26,12 @@ class BrowserExecutor:
             except Exception as e:
                 result_q.put(("error", e))
 
-    def call(self, fn):
-        """在浏览器线程执行 fn，返回其结果；异常上抛给调用方。"""
+    def call(self, fn, timeout=150):
+        """在浏览器线程执行 fn，返回其结果；异常上抛给调用方。
+        timeout 秒内无结果则上抛 TimeoutError（浏览器线程卡死时防主线程永久阻塞）。"""
         result_q = queue.Queue()
         self._jobs.put((fn, result_q))
-        status, value = result_q.get()
+        status, value = result_q.get(timeout=timeout)
         if status == "error":
             raise value
         return value
