@@ -10,6 +10,7 @@ SUITES = [
     "test_interrupt.py",
     "test_vision_tool.py",
     "test_shell_tools.py",
+    "test_tui_markdown.py",
 ]
 
 
