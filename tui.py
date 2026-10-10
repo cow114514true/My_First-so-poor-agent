@@ -18,10 +18,13 @@ from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import RichLog, TextArea, Static, ProgressBar, Button
 from textual.widget import Widget
+from textual.geometry import Size
+from textual.strip import Strip
 from textual.binding import Binding
 from rich.cells import cell_len
 from rich.markup import escape
 from rich.markdown import Markdown as RichMarkdown
+from rich.segment import Segment
 
 from loop_agent_v2 import chat, messages as _agent_messages
 from loop_agent_v2 import CURRENT_MODEL
@@ -85,11 +88,12 @@ class ConfirmDialog(Screen):
         "use_ds_from_web(upload)": "上传文件到 DeepSeek 网页版",
     }
 
-    def __init__(self, kind: str, target: str, is_worker: bool = False) -> None:
+    def __init__(self, kind: str, target: str, is_worker: bool = False, purpose: str = "") -> None:
         super().__init__()
         self._kind = kind
         self._target = target
         self._is_worker = is_worker
+        self._purpose = (purpose or "").strip()
 
     CSS = """
     ConfirmDialog {
@@ -107,9 +111,16 @@ class ConfirmDialog(Screen):
     def compose(self) -> ComposeResult:
         title = "⚠ 子任务请求" if self._is_worker else "⚠ 确认操作"
         label = self._KIND_LABEL.get(self._kind, self._kind)
+        # 目的必须显示：审批的意义就在于"知道要干什么"，只有命令原文等于盲批。
+        # 模型没给目的不当成可省略——显式标红"未说明"，本身就是给审批人的一个信号。
+        purpose_line = (
+            f"[bold]目的[/bold] {escape(self._purpose)}"
+            if self._purpose
+            else "[bold red]目的：未说明[/bold red] [dim]（模型未提供操作目的，请据命令自行判断风险）[/dim]"
+        )
         with Vertical(id="confirm-dialog"):
             yield Static(
-                f"[bold]{title}[/bold]\n\n[bold yellow]{escape(label)}[/bold yellow]\n{escape(self._target)}",
+                f"[bold]{title}[/bold]\n\n[bold yellow]{escape(label)}[/bold yellow] · {purpose_line}\n{escape(self._target)}",
                 markup=True,
             )
             with Horizontal():
@@ -290,6 +301,8 @@ class PanelLog(RichLog):
 
     _MAX_HISTORY = 1000  # reflow 重播上限：防止长对话下 _history 无界增长拖垮 resize
     _REFLOW_DEBOUNCE = 0.12  # resize 防抖秒数：合并拖拽窗口时的连续 resize
+    _MIN_RENDER_WIDTH = 4  # 窄于这个宽度就当作不可见：不折行、不上屏，等变宽再重排
+    _STASH_CHARS = 4096  # 不可见时攒够这么多字就并进重播记录（str += 是 O(n)，不能无限攒）
 
     class ExpandRequest(Message):
         """Posted when panel is double-clicked."""
@@ -337,16 +350,24 @@ class PanelLog(RichLog):
         return self._block_emitted
 
     def _text_width(self) -> int:
+        """当前可用于折行的宽度；面板被挤到 0 宽（不可渲染）时返回 0。
+
+        展开别的面板时本面板宽度会被设成 "0"，content_region.width 也随之变成 0。
+        旧实现此时回落到 max(2, size.width) = 2，于是按 2 cell 折行：2 万字直接
+        折成 5000 行、重排耗时从 45ms 涨到 800ms，而且一行都看不见。0 宽就是没有
+        可渲染宽度，调用方必须按"不可见"处理（见 _append_text / write / reflow）。
+        """
         try:
             w = self.content_region.width
         except Exception:
             w = 0
-        if w and w >= 2:
+        if w >= self._MIN_RENDER_WIDTH:
             return w
         try:
-            return max(2, self.size.width)
+            w = self.size.width
         except Exception:
-            return max(2, self.min_width)
+            w = 0
+        return w if w >= self._MIN_RENDER_WIDTH else 0
 
     def stream_text(self, chunk: str) -> None:
         """流式写入纯文本（调用方需自行 escape）。
@@ -370,15 +391,41 @@ class PanelLog(RichLog):
         if not self._pending_text:
             self._pending_since = time.monotonic()
         self._pending_text += part
-        lines = wrap_cjk(self._pending_text, self._text_width())
+        width = self._text_width()
+        if not width:
+            # 不可见：折了也没人看，等重新变宽时整体重排。攒到一定长度就并进重播
+            # 记录，避免 _pending_text 随隐藏时长无限增长（str += 是 O(n)）。
+            if len(self._pending_text) >= self._STASH_CHARS:
+                self._stash_pending()
+            return
+        lines = wrap_cjk(self._pending_text, width)
         if len(lines) < 2:
             return
         self._pending_text = lines[-1]
         self._emit_lines(lines[:-1])
 
+    def _stash_pending(self) -> None:
+        """把残尾并进重播记录但不上屏（面板不可见时用，重排后内容会回来）。"""
+        text, self._pending_text = self._pending_text, ""
+        self._pending_since = time.monotonic()
+        self._record_text(text)
+
+    def _record_text(self, raw: str) -> None:
+        """把一段原文续进当前文本块的重播记录（存连续原文，重排时才能跨断点合并）。"""
+        if not raw:
+            return
+        if self._history and self._history[-1][0] == "t":
+            self._history[-1][1].append(raw)
+        else:
+            self._history.append(("t", [raw]))
+            self._trim_history()
+
     def flush_text(self) -> None:
         """把残尾也上屏（句末 / 硬换行 / 超时兜底 / 轮次收尾时调用）。"""
         if not self._pending_text:
+            return
+        if not self._text_width():
+            self._stash_pending()
             return
         tail, self._pending_text = self._pending_text, ""
         self._pending_since = time.monotonic()
@@ -392,13 +439,12 @@ class PanelLog(RichLog):
         if not lines:
             return
         width = self._text_width()
+        if not width:
+            self._stash_lines(lines)
+            return
         body = "\n".join(lines)
         raw = "".join(lines)
-        if self._history and self._history[-1][0] == "t":
-            self._history[-1][1].append(raw)
-        else:
-            self._history.append(("t", [raw]))
-            self._trim_history()
+        self._record_text(raw)
         self._block_emitted = True
         self._pending_since = time.monotonic()
         try:
@@ -409,12 +455,20 @@ class PanelLog(RichLog):
             except Exception:
                 super().write("[dim](output omitted -- rendering error)[/dim]", width=width)
 
+    def _stash_lines(self, lines: list) -> None:
+        """本来要上屏的整行，因为面板不可见改为只记历史。"""
+        self._record_text("".join(lines))
+        self._block_emitted = True
+        self._pending_since = time.monotonic()
+
     # -- 其他写入 --
 
     def write(self, content, *args, **kwargs):
         self.flush_text()  # 保证顺序：残尾先上屏，再写这一条
         self._history.append(("r", content))
         self._trim_history()
+        if not self._text_width():
+            return self  # 不可见：只记历史，重新可见时由 reflow 一次性补上
         try:
             return super().write(content, *args, **kwargs)
         except Exception:
@@ -434,14 +488,11 @@ class PanelLog(RichLog):
         直接 write() 时 RichLog 会把渲染宽度抬到 min_width（默认 78），于是文字
         永远按 78 列折行——面板只有 45 列时会溢出、展开变宽也不会重排。
         """
-        try:
-            width = max(2, self.content_region.width)
-        except Exception:
-            width = None
+        width = self._text_width()
         if width:
             self.write(content, width=width)
         else:
-            self.write(content)
+            self.write(content)  # 不可见：write 内部只记历史，不上屏
 
     def clear(self):
         self._history.clear()
@@ -452,12 +503,17 @@ class PanelLog(RichLog):
 
     def on_resize(self, event) -> None:
         w = event.size.width
-        if w != self._last_width and w >= 2:
-            self._last_width = w
-            # 防抖：拖拽窗口会连续触发 resize，每次都重播 _history（1000 条约 132ms）。
-            # 合并成一次重排，避免拖拽时卡成幻灯片。
-            self._cancel_reflow()
-            self._reflow_timer = self.set_timer(self._REFLOW_DEBOUNCE, self._run_reflow)
+        if w == self._last_width:
+            return
+        self._last_width = w
+        self._cancel_reflow()
+        if w < self._MIN_RENDER_WIDTH:
+            # 被别的面板挤成 0 宽：这时候重排纯属白干（还把内容按 2 cell 折成几千行）。
+            # 重新变宽时还会有一次 resize，那次再排。
+            return
+        # 防抖：拖拽窗口会连续触发 resize，每次都重播 _history（1000 条约 132ms）。
+        # 合并成一次重排，避免拖拽时卡成幻灯片。
+        self._reflow_timer = self.set_timer(self._REFLOW_DEBOUNCE, self._run_reflow)
 
     def _cancel_reflow(self) -> None:
         timer = getattr(self, "_reflow_timer", None)
@@ -472,45 +528,104 @@ class PanelLog(RichLog):
         self._reflow_timer = None
         self.reflow()
 
+    def _tail_history(self, width: int) -> list:
+        """只取"还能上屏"的那段历史（面板最多显示 max_lines 行）。
+
+        _history 是会长到很大的：一个长会话几百轮思考能攒到上百万字，而 max_lines
+        只有 5000 行，更早的内容折出来立刻就被裁掉。实测 150 万字历史收起面板时
+        重排要 4035ms，只折尾部后与历史长度无关（57ms）。留 1.25 倍余量：折行只会
+        让每行更短，所以 cells/width 就是行数的下界，1.25 倍保证裁到 max_lines 之前
+        不会缺行。只有文本块（"t"）参与这个预算——"r" 条目各占一行，截掉它们反而
+        会把本该看得见的行删掉。
+        """
+        max_lines = self.max_lines
+        if not max_lines:
+            return list(self._history)
+        target = int(max_lines * width * 1.25)
+        tail: list = []
+        cells = 0
+        for kind, payload in reversed(self._history):
+            if kind == "t":
+                keep: list = []
+                for chunk in reversed(payload):
+                    keep.append(chunk)
+                    cells += cell_len(chunk)
+                    if cells >= target:
+                        break
+                keep.reverse()
+                tail.append((kind, keep))
+            else:
+                tail.append((kind, payload))
+            if cells >= target:
+                break
+        tail.reverse()
+        return tail
+
     def reflow(self) -> None:
         """按当前面板宽度重排所有已上屏的内容（RichLog 的行宽一旦渲染就固定，只能整体重建）。
 
         必须显式传 width：RichLog.write 会把渲染宽度钳制到 min_width（默认 78），
         不传的话文字永远按 78 列折行，面板变宽也不会重排。
         文本块会先接回一整段再折行，这样展开变宽后可以跨旧断点合并成长行。
+
+        性能：旧实现是"每个折行结果各调一次 RichLog.write"。write 每次都要跑一遍
+        Rich 渲染、建 Strip、写 virtual_size（reactive），2251 行要 42ms；同样这些行
+        自己建 Strip 只要 6ms。所以折行结果在这里直接铺成 Strip，只有真正的 markup
+        条目（轮次分隔线等）才走 RichLog.write。
         """
         self._cancel_reflow()
         self.flush_text()  # 残尾先并进文本块，否则重排后会短暂消失
-        y = self.scroll_offset.y
         width = self._text_width()
+        if not width:
+            return  # 不可见：等重新变宽时再排
+        y = self.scroll_offset.y
         super().clear()
         chunks: list = []
+        pending: list = []
 
-        def write_line(line) -> None:
-            try:
-                super(PanelLog, self).write(line, width=width, scroll_end=False)
-            except Exception:
-                try:
-                    super(PanelLog, self).write(self._safe_strip(line), width=width,
-                                                scroll_end=False)
-                except Exception:
-                    super(PanelLog, self).write("[dim]...[/dim]", width=width, scroll_end=False)
+        def flush_pending() -> None:
+            """把攒下的文本行直接铺成 Strip（等价于 RichLog.write 的结果）。"""
+            if not pending:
+                return
+            self.lines.extend([Strip([Segment(line)]) if line else Strip([])
+                               for line in pending])
+            pending.clear()
+            if self.max_lines is not None and len(self.lines) > self.max_lines:
+                self._start_line += len(self.lines) - self.max_lines
+                self.lines = self.lines[-self.max_lines:]
 
         def flush_block() -> None:
             if not chunks:
                 return
             raw = "".join(chunks)
             chunks.clear()
-            for line in wrap_cjk(raw, width):
-                write_line(line)
+            pending.extend(wrap_cjk(raw, width))
 
-        for kind, payload in self._history:
+        def write_rich(content) -> None:
+            try:
+                super(PanelLog, self).write(content, width=width, scroll_end=False)
+            except Exception:
+                try:
+                    super(PanelLog, self).write(self._safe_strip(content), width=width,
+                                                scroll_end=False)
+                except Exception:
+                    super(PanelLog, self).write("[dim]...[/dim]", width=width, scroll_end=False)
+
+        for kind, payload in self._tail_history(width):
             if kind == "t":
                 chunks.extend(payload)
                 continue
             flush_block()
-            write_line(payload)
+            flush_pending()
+            write_rich(payload)
         flush_block()
+        flush_pending()
+        # 文本行不经过 RichLog.write，自己做收尾（wrap=True 下内容不会超过面板宽度，
+        # 所以用面板宽度当上界即可，省掉一次逐字的 cell_len 扫描）。
+        if self.lines:
+            self._widest_line_width = max(self._widest_line_width, width)
+        self.virtual_size = Size(self._widest_line_width, len(self.lines))
+        self.refresh()
         self.scroll_to(y=min(y, self.max_scroll_y), animate=False, immediate=True)
 
     def on_click(self, event) -> None:
@@ -683,8 +798,12 @@ class AgentTUI(App):
         Binding("ctrl+c", "quit", "Save & Quit", show=False),
         Binding("escape", "collapse_panel", "", show=False),
         Binding("ctrl+j", "submit_input", "Send"),
+        Binding("ctrl+t", "toggle_think_panel", "Fold Think", show=False),
         Binding("`", "toggle_shell", "Shell"),
     ]
+
+    # 新问题的"上一轮次"哨兵：不等于任何 round 值，也不是 None（None = 面板里还没轮次）
+    _NEW_QUESTION = object()
 
     CSS = """
     Vertical {
@@ -811,6 +930,8 @@ class AgentTUI(App):
         self._think_round = None
         self._shell_visible: bool = False
         self._expanded_panel: str = ""  # non-empty when a panel is expanded
+        self._collapsed: set = set()       # 被折叠（宽度置 0）的面板裸 id，Ctrl+T 切换
+        self._think_round_count: int = 0   # 累计思考轮次（面板边框与底栏徽标共用）
         self._progress_current: float = 0.0
         self._progress_target: int = 0
         self._tool_call_count: int = 0    # 自上次 autosave 以来的工具调用数
@@ -852,8 +973,22 @@ class AgentTUI(App):
             "think": "#think-panel",
             "tool": "#tool-panel",
         }
-        if panel_id := panel_map.get(name):
-            self.query_one(panel_id, Widget).focus()
+        panel_id = panel_map.get(name)
+        if not panel_id:
+            return
+        key = panel_id.lstrip("#")
+        # 聚焦前必须保证这个面板不是 0 宽，否则焦点落在 0 宽控件上、按键如同消失。
+        # 两种会被挡住的情况都要处理：自己处于折叠态；或者别的面板正占满整个宽度。
+        changed = False
+        if key in self._collapsed:
+            self._collapsed.discard(key)
+            changed = True
+        if self._expanded_panel and self._expanded_panel.lstrip("#") != key:
+            self._expanded_panel = ""
+            changed = True
+        if changed:
+            self._apply_layout()
+        self.query_one(panel_id, Widget).focus()
 
     def action_focus_input(self) -> None:
         self.query_one("#input-area", TextArea).focus()
@@ -893,16 +1028,30 @@ class AgentTUI(App):
         else:
             self._expand_panel(normalized)
 
-    def _expand_panel(self, panel_id: str) -> None:
+    def _apply_layout(self) -> None:
+        """按展开/折叠状态统一设置三个面板的宽度（唯一改宽度的地方）。
+
+        展开态优先：有面板处于双击展开态时它独占 1fr，其余一律 0；没有展开态时，
+        未折叠的面板等分 1fr，折叠的置 0。
+        折叠只改宽度、不丢内容：折叠期间思考照常写进 PanelLog，重新展开时由
+        PanelLog.reflow 原样铺回来（0 宽时 PanelLog 不折行不上屏，只记历史）。
+        """
+        expanded = self._expanded_panel.lstrip("#")
         for pid in ("#chat-panel", "#think-panel", "#tool-panel"):
-            p = self.query_one(pid, Widget)
-            p.styles.width = "1fr" if pid == f"#{panel_id}" else "0"
+            key = pid.lstrip("#")
+            if expanded:
+                width = "1fr" if key == expanded else "0"
+            else:
+                width = "0" if key in self._collapsed else "1fr"
+            self.query_one(pid, Widget).styles.width = width
+
+    def _expand_panel(self, panel_id: str) -> None:
         self._expanded_panel = panel_id
+        self._apply_layout()
 
     def _restore_panels(self) -> None:
-        for pid in ("#chat-panel", "#think-panel", "#tool-panel"):
-            self.query_one(pid, Widget).styles.width = "1fr"
         self._expanded_panel = ""
+        self._apply_layout()
 
     def action_collapse_panel(self) -> None:
         if self._agent_busy:
@@ -912,6 +1061,33 @@ class AgentTUI(App):
             return
         if self._expanded_panel:
             self._restore_panels()
+
+    def action_toggle_think_panel(self) -> None:
+        """Ctrl+T：折叠/展开思考面板（同一按键来回切换，再按一次即恢复）。
+
+        只改布局、不动内容：折叠期间思考照常写入 PanelLog，展开时由 reflow 原样回来。
+        折叠态与展开态互斥，两个方向都要收：折叠时若思考面板正占满宽度，要连同展开
+        一起收起；展开时若有别的面板占满宽度，也要先收起它——否则"展开"之后思考面板
+        仍然是 0 宽，按键看起来毫无反应。
+        """
+        if "think-panel" in self._collapsed:
+            self._collapsed.discard("think-panel")
+            if self._expanded_panel:
+                self._expanded_panel = ""
+        else:
+            self._collapsed.add("think-panel")
+            if self._expanded_panel.lstrip("#") == "think-panel":
+                self._expanded_panel = ""
+        try:
+            focused = self.focused
+        except Exception:
+            focused = None
+        if "think-panel" in self._collapsed and focused is self.query_one("#think-panel", Widget):
+            self.query_one("#input-area", TextArea).focus()
+        self._apply_layout()
+        # 折叠状态变了就得重刷徽标：底栏那个 🧠 只在折叠时显示，不刷新的话
+        # 展开之后会一直挂着旧计数。
+        self._update_think_badge()
 
     def _has_content(self) -> bool:
         """Any real conversation beyond the system prompt?"""
@@ -1075,6 +1251,7 @@ class AgentTUI(App):
 
         self.query_one("#think-panel", RichLog).clear()
         self.query_one("#tool-panel", RichLog).clear()
+        self._reset_think_rounds()  # 面板已清空 → 轮次徽标一并归零
         self._token_total = 0
         self._update_footer()
 
@@ -1146,6 +1323,7 @@ class AgentTUI(App):
             self.query_one("#chat-panel", ChatTranscript).note(
                 "--- Conversation cleared（会话放行已一并撤销）---")
             self._token_total = 0
+            self._reset_think_rounds()  # 思考面板已清空 → 轮次徽标一并归零
             self._update_footer()
             return
 
@@ -1203,6 +1381,7 @@ class AgentTUI(App):
   i           聚焦输入框
   Tab         切换焦点到下一个组件
   Ctrl+J      发送消息（Enter 换行）
+  Ctrl+T      折叠/展开思考面板（再按一次即恢复）
   `           展开/收起 Shell 终端面板
   Esc         折叠展开的面板
   双击面板     展开/恢复该面板
@@ -1228,6 +1407,7 @@ class AgentTUI(App):
             return
         textarea.disabled = True
         self._agent_busy = True
+        self._begin_question()  # 轮次号从 1 重新数（见 _begin_question）
 
         chat_panel = self.query_one("#chat-panel", ChatTranscript)
         chat_panel.add_user(question)
@@ -1236,9 +1416,24 @@ class AgentTUI(App):
 
         threading.Thread(target=self._run_agent, args=(question,), daemon=True).start()
 
-    def _confirm_ask(self, kind, target, is_worker):
-        """Runs in agent thread. Emits a confirm_request event, blocks for the TUI answer."""
-        self._event_queue.put({"type": "confirm_request", "kind": kind, "target": target, "is_worker": is_worker})
+    def _confirm_ask(self, kind, target, is_worker, purpose=""):
+        """Runs in agent thread. Shows the confirm modal, then blocks for the TUI answer.
+
+        延迟优化：原先把事件塞进 _event_queue，要等下一帧 30fps 轮询，且排在整批流式
+        token 事件之后——实测 backlog 300 事件时弹窗出现要 118ms、1000 事件要 546ms。
+        这里用 call_from_thread 直接在主线程调度 _handle_event，绕开队列与 tick，弹窗
+        立即出现；本线程随后阻塞等用户答案。call_from_thread 在 app 未运行/同线程调用
+        时抛 RuntimeError，此时回落原队列路径（_poll_queue 会优先处理 confirm_request）。
+
+        purpose 由模型在敏感工具参数里给出，透传给确认框显示——只有命令原文、没有目的时，
+        审批人无从判断意图，确认框就退化成形式。
+        """
+        event = {"type": "confirm_request", "kind": kind, "target": target,
+                 "is_worker": is_worker, "purpose": purpose}
+        try:
+            self.call_from_thread(self._handle_event, event)
+        except Exception:
+            self._event_queue.put(event)
         try:
             return self._confirm_queue.get()
         except Exception:
@@ -1260,13 +1455,22 @@ class AgentTUI(App):
     # -- event polling (main thread, ~30fps) --
 
     def _poll_queue(self) -> None:
-        # Drain agent event queue
+        # Drain agent event queue（先整批取出，再分优先级处理）
+        pending = []
         while True:
             try:
-                event = self._event_queue.get_nowait()
+                pending.append(self._event_queue.get_nowait())
             except queue.Empty:
                 break
-            self._handle_event(event)
+        # 确认弹窗必须最先处理：实测排在流式 token 事件之后时，弹窗出现延迟随 backlog
+        # 线性放大（300 事件→118ms，1000 事件→546ms，见 confirm 实测）。其余事件保持
+        # 原顺序，避免影响流式渲染与状态机的既有行为。
+        for event in pending:
+            if event.get("type") == "confirm_request":
+                self._handle_event(event)
+        for event in pending:
+            if event.get("type") != "confirm_request":
+                self._handle_event(event)
 
         # Drain shell output queue (only if panel is visible)
         if self._shell_visible:
@@ -1342,11 +1546,37 @@ class AgentTUI(App):
             pass
         self._update_footer()
 
+    def _note_think_round(self) -> None:
+        """记一轮思考并刷新徽标（面板边框的 (n) 与折叠时的底栏 🧠 n）。
+
+        轮次由 runner 给出（每轮工具调用一个 round，且每个问题从 1 重新开始），
+        所以只认"轮次号变了"这件事，计数在整个会话里累加。
+        """
+        self._think_round_count += 1
+        self._update_think_badge()
+
+    def _begin_question(self) -> None:
+        """新问题开始：把"当前轮次"置成一个不可能等于任何 round 的哨兵。
+
+        runner 的 tool_round 每个问题都从 0 重新计（loop_agent_core/runner.py:304），
+        所以每个问题的第 1 轮都是 round=1。若沿用上一问的轮次号，第二问的第 1 轮会被
+        判成"还是上一轮"：既不打破折线，两问的思考也会连成一片，轮次计数还少一次。
+        哨兵不能是 None——None 表示"面板里还没有过轮次"，那时不该打分隔线。
+        """
+        self._think_round = self._NEW_QUESTION
+
+    def _reset_think_rounds(self) -> None:
+        """思考面板被清空（/clear、/load）后把轮次计数一起归零，避免徽标留着旧计数。"""
+        self._think_round = None
+        self._think_round_count = 0
+        self._update_think_badge()
+
     def _h_thinking(self, e: dict) -> None:
         content = e.get("content", "")
         if not content:
             return
         r = e.get("round", "?")
+        self._note_think_round()
         panel = self.query_one("#think-panel", PanelLog)
         if len(content) > 300:
             panel.write_wrapped(f"\n[dim]── Round {r} (enter to expand) ──[/dim]")
@@ -1371,6 +1601,7 @@ class AgentTUI(App):
             if self._think_round is not None:
                 panel.write(f"\n[dim]── Round {rnd} ──[/dim]")
             self._think_round = rnd
+            self._note_think_round()
         # 折行、禁则、残尾缓冲都在 PanelLog 里做：只把折满的整行上屏，
         # 不在半行处硬断（硬断出来的短行既填不满面板，展开后也合不回去）。
         panel.stream_text(escape(content))
@@ -1448,7 +1679,11 @@ class AgentTUI(App):
         # 半行只在句末标点或接近面板宽度时 commit，避免逐 token 重渲染把文字切碎。
         # 面板宽度在一次流式期间不变，缓存以避免每个 token 都做布局查询（270 tok/s 下有意义）。
         if self._stream_width < 2:
-            self._stream_width = max(2, transcript.content_region.width)
+            # 面板被别的面板挤成 0 宽时不能拿 2 cell 当阈值：那会退化成每个字符都
+            # commit 一次、每次重渲染整段 Markdown（O(n²)），长回复直接把 UI 卡住。
+            # 隐藏时用一个大的固定批量，重新可见后 Textual 会自己按新宽度重排。
+            w = transcript.content_region.width
+            self._stream_width = w if w >= 4 else 512
         if (len(self._stream_buffer) >= max(1, self._stream_width * 2 // 3)
                 or self._stream_buffer.rstrip().endswith(("。", "！", "？", "!", "?", "；", ";"))):
             transcript.append_chunk(self._stream_buffer)
@@ -1467,7 +1702,8 @@ class AgentTUI(App):
             self._confirm_queue.put(result)
 
         self.app.push_screen(
-            ConfirmDialog(e.get("kind", "?"), e.get("target", "?"), bool(e.get("is_worker"))),
+            ConfirmDialog(e.get("kind", "?"), e.get("target", "?"), bool(e.get("is_worker")),
+                          e.get("purpose", "")),
             done,
         )
 
@@ -1523,9 +1759,31 @@ class AgentTUI(App):
                 model_show = f"{CURRENT_MODEL} (checking…)"
             elif not self._llm_reachable:
                 model_show = f"{CURRENT_MODEL} (offline)"
+        # 思考面板折叠后其边框不可见，徽标改在常驻底栏显示
+        badge = ""
+        if "think-panel" in self._collapsed and self._think_round_count:
+            badge = f" | 🧠 {self._think_round_count}"
         self.query_one("#footer-bar", Static).update(
-            f" {model_show} | {status} | {tok} tokens | Get-help: {get_help}"
+            f" {model_show} | {status} | {tok} tokens{badge} | Get-help: {get_help}"
         )
+
+    def _update_think_badge(self) -> None:
+        """刷新思考面板边框的计数徽标（累计思考轮次），并同步常驻底栏。
+
+        面板边框在折叠时不可见，所以底栏另给一个紧凑指示；这里改完边框标题顺带刷
+        一次底栏，保证两处计数始终一致。
+        """
+        n = self._think_round_count
+        try:
+            self.query_one("#think-panel", RichLog).border_title = (
+                f" Thinking ({n}) " if n else " Thinking "
+            )
+        except Exception:
+            pass
+        try:
+            self._update_footer()
+        except Exception:
+            pass
 
     def _check_llm_async(self) -> None:
         """后台检测本地 llama 服务，结果缓存到 _llm_reachable 后刷新底部栏。"""

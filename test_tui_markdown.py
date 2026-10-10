@@ -13,6 +13,10 @@ harness 驱动真实的 AgentTUI，喂入 runner.py 实际发出的事件序列�
   7. 思考面板首次输出延迟（慢速模型下不被阈值压住）
   8. 面板折行宽度与展开重排
   9. 中文禁则（标点不落行首）与整行折行、跨旧断点合并
+  10. 思考面板 270 tok/s 压力（不积压、不丢字）
+  11. 大文本量下的展开/收回：不可见的面板不重排、整段批量铺行
+  12. 思考面板折叠（Ctrl+T）：折叠只改宽度不动内容、轮次徽标、展开态互斥
+  13. 折叠的边角：焦点让位（0 宽控件）、跨问题轮次重数、/clear 归零
 退出码非 0 = 失败。
 """
 import asyncio
@@ -35,7 +39,8 @@ for _f in glob.glob(os.path.join(_SAVE_DIR, ".autosave*.json")):
     except OSError:
         pass
 
-from tui import AgentTUI, ChatTranscript, ChatMessage, PanelLog  # noqa: E402
+from textual.widgets import RichLog, Static, TextArea  # noqa: E402
+from tui import AgentTUI, ChatTranscript, ChatMessage, PanelLog, wrap_cjk  # noqa: E402
 
 FAILURES = []
 
@@ -421,6 +426,313 @@ async def run() -> None:
               f"最宽行 {max(hcells, default=0)} vs 当前可见宽 {now_w}（折行时 {w_before}）")
         hfill = (sum(hcells[:-1]) / len(hcells[:-1]) / w_before * 100) if len(hcells) > 1 else 0
         check("高压下填充率 >= 90%", hfill >= 90, f"{hfill:.1f}%")
+
+        print("11. 大文本量下的展开/收回（不重排看不见的面板 + 整段批量铺行）")
+        app._restore_panels()
+        await pilot.pause(0.4)
+        think.clear()
+        await pilot.pause()
+        app._think_round = None
+        big = "大文本量下的思考内容需要能整段重排" * 1200   # 约 2 万字
+        for ch in big:
+            app._handle_event({"type": "thinking_chunk", "content": ch, "round": 1})
+        app._flush_think()
+        await pilot.pause(0.3)
+
+        def joined_rows():
+            return "".join("".join(s.text for s in ln) for ln in think.lines).replace(" ", "")
+
+        narrow_lines = len(think.lines)
+        check("万字级内容已折行上屏", narrow_lines > 100, f"{narrow_lines} 行")
+
+        # (a) 展开别的面板把本面板挤成 0 宽时，绝不能按回落宽度折行
+        #     旧实现回落到 max(2, size.width)=2，1 万字会折成 2500 行（实测 20k 字
+        #     要 750ms、60k 字要 2.4s、150k 字要 5.7s，UI 全程冻住）。
+        reflows = {"n": 0}
+        orig_reflow = think.reflow
+
+        def counted_reflow():
+            reflows["n"] += 1
+            orig_reflow()
+
+        think.reflow = counted_reflow
+        try:
+            app._expand_panel("chat-panel")
+            await pilot.pause(0.5)
+            check("不可见的面板不重排", reflows["n"] == 0, f"重排了 {reflows['n']} 次")
+            check("不可见时不按 2 cell 折行", len(think.lines) == narrow_lines,
+                  f"{narrow_lines} -> {len(think.lines)} 行")
+            check("不可见时面板宽度确实是 0", think.content_region.width == 0,
+                  f"width={think.content_region.width}")
+
+            # (b) 隐藏期间继续流式写入：不上屏但必须记账
+            hidden = "隐藏期间继续输出的思考内容也不会丢" * 20
+            app._think_round = None
+            for ch in hidden:
+                app._handle_event({"type": "thinking_chunk", "content": ch, "round": 1})
+            app._flush_think()
+            await pilot.pause(0.2)
+            check("隐藏期间不上屏", len(think.lines) == narrow_lines,
+                  f"{narrow_lines} -> {len(think.lines)} 行")
+
+            # (c) 重新可见：一次性重排，隐藏期间的文字全部回来
+            app._restore_panels()
+            await pilot.pause(0.6)
+            check("重新可见时重排一次", reflows["n"] == 1, f"{reflows['n']} 次")
+            rows = joined_rows()
+            check("隐藏期间的内容没有丢", rows == (big + hidden).replace(" ", ""),
+                  f"{len(rows)} vs {len(big + hidden)} 字")
+            # 重排结果必须与纯折行函数逐行一致：直接铺 Strip 绕开了 RichLog.write，
+            # 少一行、多一行、或哪一行被截断了都要在这里暴露。
+            expect = wrap_cjk(big + hidden, think.content_region.width)
+            got = ["".join(s.text for s in ln) for ln in think.lines]
+            check("重排逐行等于 wrap_cjk 的结果", got == expect,
+                  f"{len(got)} 行 vs 期望 {len(expect)} 行")
+            bad = [r for r in ("".join(s.text for s in ln).rstrip() for ln in think.lines)
+                   if r and r[0] in _LEAD_PUNCT]
+            check("重排后没有行首标点", not bad, f"{bad[:6]}")
+        finally:
+            think.reflow = orig_reflow
+
+        # (d) 整段重排不能逐行调 RichLog.write：RichLog.write 每次都要跑一遍 Rich
+        #     渲染 + 建 Strip + 写 virtual_size（reactive），2251 行要 42ms，而同样
+        #     这些行自己建 Strip 只要 6ms。
+        writes = {"n": 0}
+        orig_write = RichLog.write
+
+        def counted_write(self, *a, **kw):
+            writes["n"] += 1
+            return orig_write(self, *a, **kw)
+
+        RichLog.write = counted_write
+        try:
+            t0 = time.perf_counter()
+            think.reflow()
+            dur = (time.perf_counter() - t0) * 1000
+        finally:
+            RichLog.write = orig_write
+        check("整段重排不再逐行 write", writes["n"] <= 2 and len(think.lines) > 100,
+              f"{len(think.lines)} 行只调了 {writes['n']} 次 RichLog.write")
+        check("整段重排耗时 < 120ms（旧实现同量级要 45~110ms）", dur < 120,
+              f"{dur:.0f} ms / {len(think.lines)} 行")
+
+        # (e) 聊天面板被挤成 0 宽时，不能退化成逐字重渲染整段 Markdown（O(n²)）
+        app._restore_panels()
+        await pilot.pause(0.3)
+        tr.clear_messages()
+        app._expand_panel("think-panel")     # chat 面板宽度归 0
+        await pilot.pause(0.4)
+        check("chat 面板被挤成 0 宽", tr.content_region.width == 0,
+              f"width={tr.content_region.width}")
+        updates = {"n": 0}
+        orig_update = ChatMessage.set_text
+
+        def counted_update(self, *a, **kw):
+            updates["n"] += 1
+            return orig_update(self, *a, **kw)
+
+        ChatMessage.set_text = counted_update
+        try:
+            app._status = "generating"
+            tr.start_assistant()
+            app._stream_buffer = ""
+            app._stream_width = 0
+            for _ in range(3000):
+                app._handle_event({"type": "response_chunk", "content": "思"})
+            app._flush_stream()
+            await pilot.pause(0.2)
+        finally:
+            ChatMessage.set_text = orig_update
+        check("隐藏的 chat 面板不逐字重渲染", updates["n"] <= 20,
+              f"3000 字只重渲染了 {updates['n']} 次")
+        check("隐藏期间回复内容不丢",
+              tr.children[-1].raw == "思" * 3000,
+              f"{len(tr.children[-1].raw)} 字")
+        app._restore_panels()
+        await pilot.pause(0.3)
+
+        # (f) 长会话：重播历史可以远超面板容量（5000 行），只该重排还能上屏的尾部。
+        #     实测 150 万字历史整段重排要 499ms，只折尾部后与历史长度无关。
+        think.clear()
+        think._history.clear()
+        for r in range(240):                 # 约 120 万字，远超 5000 行
+            think._history.append(("t", [f"第{r:03d}轮" + "中" * 4990]))
+        import tui as _tui
+        wrapped = {"chars": 0}
+        orig_wrap = _tui.wrap_cjk
+
+        def counting_wrap(text, width):
+            wrapped["chars"] += len(text)
+            return orig_wrap(text, width)
+
+        _tui.wrap_cjk = counting_wrap
+        try:
+            t0 = time.perf_counter()
+            think.reflow()
+            dur = (time.perf_counter() - t0) * 1000
+        finally:
+            _tui.wrap_cjk = orig_wrap
+        rows = ["".join(s.text for s in ln) for ln in think.lines]
+        joined = "".join(rows)
+        check("超长历史只保留面板容量内的行", len(think.lines) == think.max_lines,
+              f"{len(think.lines)} 行（max_lines={think.max_lines}）")
+        check("只折尾部，不折整段历史", wrapped["chars"] < 250000,
+              f"120 万字历史只折了 {wrapped['chars']} 字")
+        check("保留的是最新的尾部内容",
+              "第239轮" in joined and "第000轮" not in joined and "第200轮" not in joined,
+              f"首个可见轮次 {rows[0][:12] if rows else ''!r}")
+        check("超长历史的重排耗时 < 200ms", dur < 200, f"{dur:.0f} ms / {len(rows)} 行")
+
+        print("12. 思考面板折叠（Ctrl+T）与轮次徽标")
+        # 折叠只改宽度、不动内容：折叠期间思考照常写入 PanelLog，展开时由 reflow
+        # 原样铺回来。这条依赖"0 宽不折行、只记历史"（见第 11 节），所以在这里
+        # 端到端验一遍。
+        app._restore_panels()
+        await pilot.pause(0.3)
+        think.clear()
+        await pilot.pause(0.1)
+        app._think_round = None
+        app._think_round_count = 0
+        tool = app.query_one("#tool-panel", PanelLog)
+        footer = app.query_one("#footer-bar", Static)
+
+        await pilot.press("ctrl+t")
+        await pilot.pause(0.3)
+        check("Ctrl+T 折叠思考面板（宽度 0，其它等分）",
+              str(think.styles.width) == "0" and str(tr.styles.width) == "1fr"
+              and str(tool.styles.width) == "1fr",
+              f"think={think.styles.width} chat={tr.styles.width} tool={tool.styles.width}")
+
+        folded = "折叠期间思考照常写入但不上屏" * 40
+        for ch in folded:
+            app._handle_event({"type": "thinking_chunk", "content": ch, "round": 1})
+        app._flush_think()
+        await pilot.pause(0.2)
+        check("折叠期间不上屏（内容只在重播历史里）", len(think.lines) == 0,
+              f"{len(think.lines)} 行")
+        check("轮次计数 +1", app._think_round_count == 1, f"count={app._think_round_count}")
+        check("面板边框标题带轮次", "(1)" in (think.border_title or ""),
+              f"{think.border_title!r}")
+        check("折叠时底栏出现 🧠 徽标", "🧠 1" in str(footer.content),
+              f"{str(footer.content)[:60]!r}")
+
+        # 同一轮内继续出字不该重复计数
+        app._handle_event({"type": "thinking_chunk", "content": "同一轮续写", "round": 1})
+        app._flush_think()
+        await pilot.pause(0.1)
+        check("同一轮内不重复计数", app._think_round_count == 1,
+              f"count={app._think_round_count}")
+        app._handle_event({"type": "thinking_chunk", "content": "第二轮", "round": 2})
+        app._flush_think()
+        await pilot.pause(0.1)
+        check("换轮次才计数", app._think_round_count == 2, f"count={app._think_round_count}")
+
+        await pilot.press("ctrl+t")
+        await pilot.pause(0.6)
+        check("再按一次 Ctrl+T 恢复等分", str(think.styles.width) == "1fr",
+              f"think={think.styles.width}")
+        rows = "".join("".join(s.text for s in ln) for ln in think.lines).replace(" ", "")
+        check("折叠期间的思考内容原样回来",
+              rows.startswith(folded + "同一轮续写") and rows.endswith("第二轮"),
+              f"{len(rows)} 字，开头 {rows[:12]!r}，结尾 {rows[-10:]!r}")
+        check("展开后底栏不再显示徽标", "🧠" not in str(footer.content),
+              f"{str(footer.content)[:60]!r}")
+
+        # 聚焦折叠的面板要先把它放出来，否则焦点落在 0 宽控件上、按键如同消失
+        await pilot.press("ctrl+t")
+        await pilot.pause(0.3)
+        app.action_focus_panel("think")
+        await pilot.pause(0.3)
+        check("聚焦折叠的面板会把它放出来", str(think.styles.width) == "1fr",
+              f"think={think.styles.width}")
+
+        # 展开态与折叠态互斥：折叠要连同双击展开一起收起
+        app._expand_panel("think-panel")
+        await pilot.pause(0.2)
+        check("双击展开时独占 1fr", str(think.styles.width) == "1fr"
+              and str(tr.styles.width) == "0",
+              f"think={think.styles.width} chat={tr.styles.width}")
+        await pilot.press("ctrl+t")
+        await pilot.pause(0.3)
+        check("折叠会连同展开态一起收起",
+              app._expanded_panel == "" and str(think.styles.width) == "0",
+              f"expanded={app._expanded_panel!r} think={think.styles.width}")
+        await pilot.press("ctrl+t")
+        await pilot.pause(0.3)
+        check("再次恢复为三栏等分",
+              str(think.styles.width) == "1fr" and str(tr.styles.width) == "1fr",
+              f"think={think.styles.width} chat={tr.styles.width}")
+
+        print("13. 折叠功能的边角：焦点让位、跨问题轮次、/clear 归零")
+        # 聚焦某个面板时，它可能被 0 宽挡住：自己处于折叠态，或别的面板正占满宽度。
+        # 不处理的话焦点落在 0 宽控件上，按键如同消失。
+        app._restore_panels()
+        await pilot.pause(0.2)
+        app._expand_panel("chat-panel")
+        await pilot.pause(0.2)
+        # 直接调 action（焦点在输入框时按 "2" 会被 TextArea 吃掉，那是既有行为）
+        app.action_focus_panel("think")
+        await pilot.pause(0.3)
+        check("聚焦被展开态挡住的面板会先收起展开态",
+              app._expanded_panel == "" and str(think.styles.width) == "1fr"
+              and app.focused is think,
+              f"expanded={app._expanded_panel!r} think={think.styles.width} "
+              f"focus={type(app.focused).__name__}")
+
+        # 折叠/展开互斥是双向的：展开思考面板时也要把挡着它的展开态收起来，
+        # 否则"展开了"但仍是 0 宽，按键看起来毫无反应。
+        app._expand_panel("chat-panel")
+        await pilot.pause(0.2)
+        await pilot.press("ctrl+t")
+        await pilot.pause(0.3)
+        check("折叠不影响别的面板的展开态",
+              app._expanded_panel == "chat-panel" and str(think.styles.width) == "0",
+              f"expanded={app._expanded_panel!r} think={think.styles.width}")
+        await pilot.press("ctrl+t")
+        await pilot.pause(0.3)
+        check("展开思考面板会收起挡着它的展开态",
+              app._expanded_panel == "" and str(think.styles.width) == "1fr",
+              f"expanded={app._expanded_panel!r} think={think.styles.width}")
+
+        # runner 每个问题都从 round=1 重新数，所以"新问题"必须被认成新轮次：
+        # 否则第二问的第 1 轮不出分隔线（两问思考连成一片）且计数少一次。
+        app._restore_panels()
+        await pilot.pause(0.2)
+        think.clear()
+        app._think_round = 1
+        app._think_round_count = 1
+        launched = []
+        orig_run_agent = app._run_agent
+        app._run_agent = lambda q: launched.append(q)   # 别真起 agent 线程
+        textarea = app.query_one("#input-area", TextArea)
+        try:
+            textarea.text = "第二个问题"
+            app.action_submit_input()
+            await pilot.pause(0.2)
+        finally:
+            app._run_agent = orig_run_agent
+            app._agent_busy = False
+            textarea.disabled = False
+        check("提交新问题会重置轮次",
+              launched == ["第二个问题"] and app._think_round is app._NEW_QUESTION,
+              f"launched={launched} think_round={app._think_round!r}")
+        app._handle_event({"type": "thinking_chunk", "content": "第二问的第一轮", "round": 1})
+        app._flush_think()
+        await pilot.pause(0.2)
+        sep = "".join("".join(s.text for s in ln) for ln in think.lines).replace(" ", "")
+        check("第二问的第 1 轮被当成新轮次（打分隔线 + 计数 +1）",
+              app._think_round_count == 2 and "Round1" in sep,
+              f"count={app._think_round_count} 分隔线={'Round1' in sep}")
+
+        # /clear 清空思考面板后，轮次徽标不能留着旧计数
+        textarea.text = "/clear"
+        app.action_submit_input()
+        await pilot.pause(0.3)
+        check("/clear 后轮次与徽标一起归零",
+              app._think_round_count == 0 and app._think_round is None
+              and len(think.lines) == 0 and "(1)" not in (think.border_title or ""),
+              f"count={app._think_round_count} 行={len(think.lines)} "
+              f"title={think.border_title!r}")
 
 
 def main() -> None:
