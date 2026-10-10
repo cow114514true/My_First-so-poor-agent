@@ -425,7 +425,8 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             ]
         }, conv)
 
-        run_tools(use_tool_calls, _emit, conv, tool_call_map, delegate_fn)
+        run_tools(use_tool_calls, _emit, conv, tool_call_map, delegate_fn,
+                  is_worker=not is_main_session)
         conv["_empty_retries"] = 0  # 有产出（工具调用）→ 重置 thinking-only 计数
         # 工具轮次逼近上限时注入收尾提示（合并到末条 user 或追加，不破坏交替协议）
         if tool_round == MAX_TOOL_ROUNDS - 4:

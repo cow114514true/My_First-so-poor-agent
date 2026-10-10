@@ -202,17 +202,19 @@ tools = [
         "type": "function",
         "function": {
             "name": "browser_act",
-            "description": "Operate a real browser, ONE step per call. The session persists between calls (and across agent restarts for a named profile: cookies, localStorage, sessionStorage and last URL are restored). Each call performs a single action, then returns the page URL, title, a numbered list of interactive elements (each with a css= selector), and page text. Study the element list and drive the next step by number, or target any element with css=<selector> / xpath=<expression>. Actions: open(url=), click(target=), type(target=, text=), press_enter(), press_key(text='Space'/'Escape'/...), hover(target=), select_option(target=, text=), scroll(text='down'/'up'), wait(text=seconds), back(), screenshot(), close(). Pass locate=<keyword> to highlight matching elements at the top of the returned list — use it when you know what you're looking for (e.g. locate='投币' for a coin button). For video pause use press_key(text='Space'). For quick web searches or just reading a page, prefer search_web or use_ds_from_web; reserve browser_act for sites needing real interaction (login, forms, JS).",
+            "description": "Operate a real browser, ONE step per call. The session persists between calls (and across agent restarts for a named profile: cookies, localStorage, sessionStorage and last URL are restored). Each call performs a single action, then returns the page URL, title, a numbered list of interactive elements (each with a css= selector), and page text. Study the element list and drive the next step by number, or target any element with css=<selector> / xpath=<expression>. Actions: open(url=), click(target=), type(target=, text=), press_enter(), press_key(text='Space'/'Escape'/...), hover(target=), select_option(target=, text=), scroll(text='down'/'up'), wait(text=seconds), back(), screenshot(), tabs(), switch_tab(target=tabIndex), close(). A link opened in a new tab (target=_blank) is auto-focused; use tabs() to list open tabs and switch_tab(target=index) to move between them. Pass locate=<keyword> to highlight matching elements at the top of the returned list — use it when you know what you're looking for (e.g. locate='投币' for a coin button). For video pause use press_key(text='Space'). For quick web searches or just reading a page, prefer search_web or use_ds_from_web; reserve browser_act for sites needing real interaction (login, forms, JS). State-changing actions (click/type/press_enter/select_option) return a `[verify]` line (success/uncertain) — read it and re-observe instead of blindly repeating the same action when it says uncertain.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["open", "click", "type", "press_enter", "press_key", "hover", "select_option", "scroll", "wait", "back", "screenshot", "close"]},
+                    "action": {"type": "string", "enum": ["open", "click", "type", "press_enter", "press_key", "hover", "select_option", "scroll", "wait", "back", "screenshot", "tabs", "switch_tab", "close"]},
                     "url": {"type": "string", "description": "For open: the http(s) URL."},
-                    "target": {"type": ["integer", "string"], "description": "For click/type/hover/select_option: element number from the last element list (1-based), or css=<selector> / xpath=<expression> to target any element."},
+                    "target": {"type": ["integer", "string"], "description": "For click/type/hover/select_option: element number from the last element list (1-based), or css=<selector> / xpath=<expression> / element=<id> to target any element. element=<id> is a stable id (survives re-renders, but invalidates after navigation). For switch_tab: the tab index (1-based) from the tabs() list."},
                     "text": {"type": "string", "description": "For type: text to fill. For select_option: the option value/label. For press_key: key name e.g. 'Space'/'Escape'/'Enter'. For scroll: 'down' or 'up'. For wait: seconds (max 10)."},
                     "locate": {"type": "string", "description": "Optional. Keyword to highlight in the returned element list. Matching elements are listed at the top marked with '★'. Use to find a specific control (e.g. locate='投币') without scanning the whole list."},
                     "profile": {"type": "string", "description": "Optional profile name for saved logins + session restore (e.g. 'github'). Omit for a clean session."},
-                    "headless": {"type": "boolean", "description": "true = no window (default). false = show the browser window — use false when you need the user to log in or solve a captcha."}
+                    "headless": {"type": "boolean", "description": "true = no window (default). false = show the browser window — use false when you need the user to log in or solve a captcha."},
+                    "verify": {"type": "string", "enum": ["none", "url", "dom", "screenshot", "vision", "auto"], "description": "Post-action verification for click/type/press_enter/select_option. none=skip; url=check URL change; dom=check element-list change; screenshot/vision=reserved (higher cost, not yet implemented); auto=default (URL/title/DOM/expected)."},
+                    "expected": {"type": "string", "description": "Optional text/title you expect to appear after the action (counts as success when found)."}
                 },
                 "required": ["action"]
             }
@@ -301,6 +303,27 @@ tools.append({
             "properties": {
                 "path": {"type": "string", "description": "Directory to index. Default: '.' (project root)."},
                 "glob": {"type": "string", "description": "File pattern filter, e.g. '*.py' (default), '*.{py,js}'. Use '*.py' for Python projects."},
+            },
+            "required": []
+        }
+    }
+})
+
+# observe_browser
+tools.append({
+    "type": "function",
+    "function": {
+        "name": "observe_browser",
+        "description": "Observe the current browser page WITHOUT acting: one call returns a unified snapshot of URL, title, viewport, scroll position, optional screenshot (with sha256), the numbered interactive-element list, and page text — all captured in the same observation cycle. Use it to get a consistent state before a complex task, before visual_locate (which reuses the same screenshot+DOM), or to debug page state. Do NOT use browser_act(action='screenshot') as a substitute — that returns no DOM/text.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "profile": {"type": "string", "description": "Optional browser profile name (same as browser_act's profile)."},
+                "include_screenshot": {"type": "boolean", "description": "Include a full-viewport screenshot with sha256 (default true). Set false to skip for speed."},
+                "include_dom": {"type": "boolean", "description": "Include the numbered interactive-element list (default true)."},
+                "include_text": {"type": "boolean", "description": "Include page text (default true)."},
+                "focus": {"type": "string", "description": "Optional keyword to highlight matching elements at the top of the list, marked with '★'."},
+                "headless": {"type": "boolean", "description": "true = no window (default). false = show the browser window."}
             },
             "required": []
         }

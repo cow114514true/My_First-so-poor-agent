@@ -12,6 +12,19 @@ DEFAULT_Q = "描述这张图片的内容。"
 
 
 def _vision_cfg():
+    """视觉后端配置。切换：VISION_BACKEND=local|luna（默认 local）。
+    luna 模式默认走 ofox 网关，key 由 VISION_API_KEY 提供（setx 设一次即持久）。"""
+    if os.environ.get("VISION_BACKEND") == "luna":
+        key = os.environ.get("VISION_API_KEY", "")
+        if not key:
+            raise RuntimeError("VISION_BACKEND=luna 但 VISION_API_KEY 未设置。"
+                               "先执行一次: setx VISION_API_KEY sk-of-...")
+        return {
+            "base_url": os.environ.get("VISION_BASE_URL", "https://api.ofox.io/v1"),
+            "model": os.environ.get("VISION_MODEL", "openai/gpt-5.6-luna"),
+            "api_key": key,
+            "max_tokens": int(os.environ.get("VISION_MAX_TOKENS", "1024")),
+        }
     return {
         "base_url": os.environ.get("VISION_BASE_URL", "http://127.0.0.1:8080/v1"),
         "model": os.environ.get("VISION_MODEL", "Qwen3.5-9B"),
@@ -47,7 +60,7 @@ def analyze_image_mock(path, question=None):
         return f"[Error] Cannot read image: {e}"
     cfg = _vision_cfg()
     try:
-        resp = OpenAI(api_key="sk_local", base_url=cfg["base_url"]).chat.completions.create(
+        resp = OpenAI(api_key=cfg.get("api_key", "sk_local"), base_url=cfg["base_url"]).chat.completions.create(
             model=cfg["model"],
             messages=[{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}},

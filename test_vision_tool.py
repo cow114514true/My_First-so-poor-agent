@@ -12,7 +12,18 @@ import loop_agent_core.vision as vision
 def _reset_confirm():
     confirm._ask = None
     confirm._worker_check = None
-    confirm._session_approved = False
+    confirm.reset()
+    # 测试环境：显式声明"无人值守自动放行"。
+    # 修复前这里依赖 confirm 的隐式默认放行（_ask=None => 放行）；现在确认门是
+    # fail-closed，放行必须是显式决定（SECURITY_AUDIT_REPORT V1）。
+    # 需要验证"无人可问 => 拒绝"的用例在 test_security_hardening.py 中单独覆盖。
+    confirm.set_policy("allow_all")
+
+
+def _reset_confirm_ask():
+    """把确认门重置为安全策略（ask），供门控相关用例使用，避免共用默认值。"""
+    _reset_confirm()
+    confirm.set_policy("ask")
 
 
 class _FakeResp:
@@ -56,7 +67,7 @@ def test_analyze_image_not_found():
 
 
 def test_analyze_image_denied():
-    _reset_confirm()
+    _reset_confirm_ask()  # 必须用安全策略：allow_all 会直接放行，测不出拒绝路径
     tmp = os.path.join(la.WORK_DIR, "_selftest_img.png")
     with open(tmp, "wb") as f:
         f.write(b"x")
@@ -112,30 +123,82 @@ def test_analyze_image_absolute_path():
 
 # -- confirm gate --
 
-def test_confirm_headless_auto():
+def test_confirm_headless_fail_closed():
+    """无人可问（_ask=None）时必须拒绝 —— 这是 V1 的核心回归测试。"""
     _reset_confirm()
-    assert confirm.request("write_file", "/x") is True
+    confirm.set_policy("ask")
+    assert confirm.request("write_file", "/x") is False
+
+
+def test_confirm_policy_allow_all_is_explicit():
+    """非交互场景要放行必须显式声明策略，而不是因为'没人可问'被默认放行。"""
+    _reset_confirm()
+    confirm.set_policy("allow_all")
+    try:
+        assert confirm.request("write_file", "/x") is True
+    finally:
+        confirm.set_policy("ask")
+
+
+def test_confirm_policy_deny_all():
+    _reset_confirm()
+    confirm.set_policy("deny_all")
+    try:
+        confirm._ask = lambda k, t, w: "allow"
+        assert confirm.request("write_file", "/x") is False
+    finally:
+        confirm.set_policy("ask")
 
 
 def test_confirm_deny_allow():
     _reset_confirm()
+    confirm.set_policy("ask")
     confirm._ask = lambda k, t, w: "deny"
     assert confirm.request("analyze_image", "/x") is False
     confirm._ask = lambda k, t, w: "allow"
     assert confirm.request("analyze_image", "/x") is True
 
 
-def test_confirm_session():
+def test_confirm_session_is_kind_scoped():
+    """'本会话放行'只对当前类别生效，不得顺带放行其它类别 —— V8 回归测试。"""
     _reset_confirm()
+    confirm.set_policy("ask")
     calls = []
     confirm._ask = lambda k, t, w: (calls.append(k) or "allow_session")
-    assert confirm.request("analyze_image", "/x") is True
-    assert confirm.request("write_file", "/y") is True  # 已放行，不再问
-    assert calls == ["analyze_image"]
+    assert confirm.request("write_file", "/x") is True
+    assert confirm.request("write_file", "/y") is True   # 同类别：已放行，不再问
+    assert calls == ["write_file"]
+    # 不同类别（命令执行）必须重新询问，而不是继承 write 的放行
+    confirm._ask = lambda k, t, w: "deny"
+    assert confirm.request("exec_shell_win", "whoami") is False
+    assert calls == ["write_file"]
+
+
+def test_confirm_session_revocable():
+    """会话放行必须可撤销 —— V8 回归测试。"""
+    _reset_confirm()
+    confirm.set_policy("ask")
+    confirm._ask = lambda k, t, w: "allow_session"
+    assert confirm.request("write_file", "/x") is True
+    confirm.revoke()
+    confirm._ask = lambda k, t, w: "deny"
+    assert confirm.request("write_file", "/y") is False
+
+
+def test_confirm_worker_scope_isolated():
+    """主会话的放行不得外溢到 worker 子 agent —— V8 回归测试。"""
+    _reset_confirm()
+    confirm.set_policy("ask")
+    confirm._ask = lambda k, t, w: "allow_session"
+    assert confirm.request("write_file", "/main") is True   # main scope 放行
+    confirm._ask = lambda k, t, w: "deny"
+    confirm._worker_check = lambda: True                    # 切到 worker scope
+    assert confirm.request("write_file", "/worker") is False
 
 
 def test_confirm_worker_label():
     _reset_confirm()
+    confirm.set_policy("ask")
     seen = {}
     confirm._worker_check = lambda: True
     confirm._ask = lambda k, t, w: (seen.update(w=w) or "allow")
@@ -146,7 +209,7 @@ def test_confirm_worker_label():
 # -- write_file / edit_file gating --
 
 def test_write_file_gated():
-    _reset_confirm()
+    _reset_confirm_ask()  # 必须用安全策略，否则 allow_all 会绕过门控
     tmp = os.path.join(la.WORK_DIR, "_selftest_write.txt")
     if os.path.exists(tmp):
         os.remove(tmp)
@@ -162,7 +225,7 @@ def test_write_file_gated():
 
 
 def test_edit_file_gated():
-    _reset_confirm()
+    _reset_confirm_ask()  # 必须用安全策略，否则 allow_all 会绕过门控
     tmp = os.path.join(la.WORK_DIR, "_selftest_edit.txt")
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("abc")

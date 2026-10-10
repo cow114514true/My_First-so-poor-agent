@@ -38,12 +38,21 @@ def validate_tool_result(tool_name, result):
             return False, f"URL blocked: {text[:200]}. Use a different URL."
         if text.startswith("[Error]"):
             return False, f"browser_act failed: {text[:300]}. Retry with a different action or element index."
+        # [verify] uncertain 是"软信号"而非工具报错：动作可能已成功、只是廉价信号未变化
+        # （如复制到剪贴板/点赞只改数字），强制注入 [Self-check] 会让模型误判空转重试、白耗轮次。
+        # 工具结果里的 [verify] 行 + prompts 规则已足够让模型自行决定是否重新观察，故不 return False。
     elif tool_name == "visual_locate":
         if text.startswith("[Error]"):
             return False, f"visual_locate failed: {text[:200]}. Retry with a clearer target description or verify the page is open."
         if text.startswith("[visual_locate]") and "编号 [" in text:
             return True, ""
         return False, f"visual_locate 结果异常: {text[:100]}"
+    elif tool_name == "observe_browser":
+        if text.startswith("[Error]"):
+            return False, f"observe_browser failed: {text[:200]}. 先 browser_act(open) 打开页面再观察。"
+        if text.startswith("URL: "):
+            return True, ""
+        return False, f"observe_browser 结果异常: {text[:100]}"
     elif tool_name in ("search_web", "fetch_url"):
         if text.startswith("[Error]"):
             return False, f"{tool_name} failed: {text[:200]}. Retry or handle it directly."

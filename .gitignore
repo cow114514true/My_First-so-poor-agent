@@ -47,3 +47,7 @@ seitsuna.png
 run_qq_bot.bat
 # 启动 gitignored 的 clipboard_history.py
 run_clipboard.bat
+
+# 第三方克隆（自带 .git，非本产品线；见 SECURITY_AUDIT_REPORT.md 的"明确排除"）
+headroom/
+test_claude/

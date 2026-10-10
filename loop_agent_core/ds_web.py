@@ -174,6 +174,13 @@ def get_response(session):
 
 
 def use_ds_from_web_mock(file_path, ask_prompt):
+    # 上传文件 = 把本地任意文件送出本机（已实测可上传 .ssh 私钥等沙箱外文件）。
+    # 此前无路径校验也无确认门（见 SECURITY_AUDIT_REPORT V3）——上传前必须确认。
+    if file_path and file_path.strip():
+        from . import confirm
+        if not confirm.request("use_ds_from_web(upload)", file_path):
+            return "[Denied by user] 文件未上传。如需上传请重新发起并在确认框中允许。"
+
     def work():
         global _ds_session
         if _ds_session is None:

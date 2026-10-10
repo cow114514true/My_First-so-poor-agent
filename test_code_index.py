@@ -5,6 +5,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import loop_agent_v2 as la
+import loop_agent_core.confirm as confirm
+
+# 测试环境：显式声明"无人值守自动放行"。
+# 修复前这里依赖 confirm 的隐式默认放行（_ask=None => 放行）；现在确认门是 fail-closed，
+# 放行必须是一个有意识的决定，故显式声明（SECURITY_AUDIT_REPORT V1）。
+confirm.set_policy("allow_all")
 
 SAMPLE = (
     "import os\n"

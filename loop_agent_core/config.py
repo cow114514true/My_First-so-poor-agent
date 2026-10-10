@@ -60,7 +60,7 @@ def _backend_config():
                 "reasoning_effort": "medium",
                 "extra_body": {"thinking": {"type": "enabled"}},
             },
-            "max_tool_rounds": 12,
+            "max_tool_rounds": 16,
             "ctx": 65536
         }
 

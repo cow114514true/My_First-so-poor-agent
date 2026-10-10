@@ -2,6 +2,7 @@
 import base64
 import json
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -13,6 +14,24 @@ PS_EXE = shutil.which("pwsh") or "powershell.exe"
 
 from .control import interrupt_event
 from .debuglog import log_error
+from .file_tools import _resolve_path  # 复用已验证的路径沙箱（见 SECURITY_AUDIT_REPORT V4）
+
+# 终端控制序列：CSI/OSC/DCS/简单 ESC 转义，以及其余 C0 控制字符（保留 \t \n \r）。
+# 命令输出是攻击者可控的（网页/文件内容可进入命令输出），必须中和后才能上屏。
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"       # CSI ... 终止符
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC ... BEL 或 ST
+    r"|\x1b[P^_][^\x1b]*(?:\x1b\\)"  # DCS/SOS/PM/APC ... ST
+    r"|\x1b[@-Z\\-_]"               # 两字符 ESC 序列
+    r"|[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"  # 其余 C0 控制字符 + DEL
+)
+
+
+def strip_terminal_escapes(text):
+    """移除终端控制序列，防 UI 欺骗（SECURITY_AUDIT_REPORT V13）。非字符串原样返回。"""
+    if not isinstance(text, str):
+        return text
+    return _ANSI_RE.sub("", text)
 
 
 def get_date_mock():
@@ -81,6 +100,7 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
             continue
         if line is None:  # EOF，正常结束
             break
+        line = strip_terminal_escapes(line)  # 中和控制序列后再入缓冲区/上屏（V13）
         all_lines.append(line)
         if q:
             q.put(("shell_line", line))
@@ -117,14 +137,15 @@ def search_code_mock(pattern, path=".", glob="*.py", output_mode="content"):
     path:      Directory or file to search. Relative paths resolve against WORK_DIR.
     glob:      File pattern filter (e.g. "*.py", "*.{py,js}", "*.md").
     output_mode: "content" (lines with line numbers), "files_with_matches" (paths only), "count" (match counts)."""
-    import re
     from pathlib import Path as _Path
 
-    from .config import WORK_DIR as _WD
-    file_path = _Path(path)
-    if not file_path.is_absolute():
-        file_path = _Path(_WD) / file_path
-    file_path = file_path.resolve()
+    # 复用统一路径沙箱：此前这里用 _Path.resolve() 完全绕过沙箱，
+    # 可读任意绝对路径（已实测读到 .ssh 私钥 / .dsh 凭据库）。见 SECURITY_AUDIT_REPORT V4。
+    try:
+        resolved = _resolve_path(path)
+    except Exception as e:
+        return f"[Error] search_code: {e}"
+    file_path = _Path(resolved)
     if not file_path.exists():
         return f"[Error] search_code: path not found: {path}"
 
@@ -183,16 +204,16 @@ def code_index_mock(path=".", glob="*.py"):
     """Return a project-level structural index: for each file, list its imports/functions/classes
     with line numbers. Use BEFORE reading individual files — get the lay of the land in one call.
     Then use search_code for cross-file references and read_file(function=...) for implementation."""
-    import os as _os
     from pathlib import Path as _Path
 
-    from .config import WORK_DIR as _WD
     from .file_tools import build_outline
 
-    file_path = _Path(path)
-    if not file_path.is_absolute():
-        file_path = _Path(_WD) / file_path
-    file_path = file_path.resolve()
+    # 与 search_code 同一处沙箱逃逸：改用统一路径沙箱（SECURITY_AUDIT_REPORT V4）。
+    try:
+        resolved = _resolve_path(path)
+    except Exception as e:
+        return f"[Error] code_index: {e}"
+    file_path = _Path(resolved)
     if not file_path.exists():
         return f"[Error] code_index: path not found: {path}"
 

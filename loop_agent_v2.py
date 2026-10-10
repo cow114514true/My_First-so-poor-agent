@@ -5,6 +5,7 @@ tui.py / 测试 import 的符号都必须保持可访问（详见 HANDOFF_NEXT_S
 """
 
 # 薄壳：可变全局与再导出。
+import json
 import threading
 
 from loop_agent_core.config import (WORK_DIR, _is_local_backend, _backend_config,
@@ -38,6 +39,7 @@ from loop_agent_core.memory import recall_mock, remember_mock
 import loop_agent_core.memory as memory_mod
 from loop_agent_core.vision import analyze_image_mock
 from loop_agent_core.visual_locate import visual_locate_mock
+from loop_agent_core.browser_observation import observe_browser_mock
 import loop_agent_core.confirm as confirm_mod
 from loop_agent_core.control import interrupt_event
 
@@ -46,7 +48,21 @@ _shell_output_queue = None
 
 
 def exec_shell_win_mock(shell_cmd, shell="cmd"):
-    """薄壳包装：把 TUI 注入的 _shell_output_queue 传给 core 实现。"""
+    """薄壳包装：把 TUI 注入的 _shell_output_queue 传给 core 实现。
+
+    任意命令执行是最高风险能力（可完成 write_file/edit_file 的一切），
+    此前完全不在确认门覆盖内（见 SECURITY_AUDIT_REPORT V2）——这里补上门控。
+    """
+    preview = str(shell_cmd).replace("\n", " ⏎ ")
+    if len(preview) > 300:
+        preview = preview[:300] + f"… ({len(str(shell_cmd))} chars)"
+    if not confirm_mod.request("exec_shell_win", f"[{shell}] {preview}"):
+        return json.dumps({
+            "stdout": "", "stderr": "", "returncode": None, "success": False,
+            "interrupted": False, "timed_out": False,
+            "denied": True,
+            "message": "[Denied by user] 命令未执行。如需执行请重新发起并在确认框中允许。",
+        }, ensure_ascii=False, indent=2)
     return _core_exec_shell_win(shell_cmd, shell, _shell_output_queue)
 
 
@@ -59,6 +75,7 @@ TOOL_CALL_MAP = {
     "use_ds_from_web": use_ds_from_web_mock,
     "analyze_image": analyze_image_mock,
     "browser_act": browser_act_mock,
+    "observe_browser": observe_browser_mock,
     "visual_locate": visual_locate_mock,
     "search_code": search_code_mock,
     "code_index": code_index_mock,
