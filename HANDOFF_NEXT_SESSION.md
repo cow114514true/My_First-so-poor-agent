@@ -193,3 +193,52 @@ python run_tests.py    # 7/7 套件全过（新增 test_security_hardening.py）
 注意：`test_code_index.py` / `test_vision_tool.py` 现在**显式**调用 `confirm.set_policy(...)`。
 它们原先依赖的是「`_ask=None` 隐式放行」这个已被修复的行为——即测试里也固化了不安全假设。
 
+---
+
+## 十、TUI 性能与折叠（commit `d285a48`）
+
+### 改了什么
+
+1. **大文本量下的面板重排不再卡顿**（`PanelLog`）。三个根因：
+   - 面板被挤成 0 宽（展开别的面板）时 `_text_width()` 回落到 `max(2, size.width)`，
+     于是按 2 cell 折行：2 万字 750ms / 6 万字 2407ms / 15 万字 5690ms 的 UI 冻结，
+     且一行都看不见。现在 0 宽 = 不可渲染：不折行不上屏，只记重播历史，变宽时铺回。
+   - 整段重排逐行调 `RichLog.write`（每行一次 Rich 渲染 + 建 Strip + 写 reactive
+     `virtual_size`）：2251 行 42ms → 直接建 Strip 6ms。现在只有 markup 条目走 write。
+   - `_history` 无界（长会话上百万字）而面板只显示 `max_lines=5000` 行：现在只折
+     还能上屏的尾部，重排代价与历史长度解耦（150 万字历史 4035ms → 57ms）。
+2. **补完思考面板折叠（Ctrl+T）**：`_collapsed`/`_think_round_count` 未初始化导致
+   **启动即崩**、`_apply_layout()` 未定义、轮次计数无人自增、折叠后底栏徽标不刷新。
+   另修：焦点让位漏了"别的面板占满宽度"、折叠/展开互斥只做了一个方向、跨问题的
+   轮次判断（runner 的 `tool_round` 每问从 0 重数，`_think_round` 不清零 → 只跑一轮
+   的问题之间不打分隔线且计数少一次）。
+3. 测试 `test_tui_markdown.py` 49 → 87 项（新增第 11/12/13 节）。
+
+### ⚠ 并行会话同写一个文件（下个会话务必先看这条）
+
+`tui.py` 当天被**三个会话**同时编辑，改动按文件无法拆分：本提交的 `tui.py` 里还带着
+「确认弹窗延迟」与「敏感工具 purpose 透传确认框」两条线的 hunk（后者只有 TUI 那一半）。
+教训与规避：
+
+- 用 `git worktree add tmp/xxx <sha>` 把提交单独检出跑一遍测试，能立刻发现"只提了
+  一半"导致的 `AttributeError`（本次已实测该提交 7/7 套件全过）。
+- 编辑前先 `git diff --stat` 记下文件基线；`tui.py` 的 mtime 变了就说明别的会话写过。
+- **整文件覆盖式写盘会静默冲掉别的会话的改动**，并行时不要用。
+
+### 工作区里仍未提交（截至本次收工，20:00 时这些文件还在被写）
+
+- `loop_agent_core/{confirm,ds_web,schemas,vision}.py` + `loop_agent_v2.py` +
+  `prompts.py` + `test_purpose.py`（未跟踪）——敏感工具 `purpose` 门控线。
+- `file_tools.py` + `test_code_index.py` + `BUG_LEDGER.md`（Bug 22）+ `README.md`
+  ——写文件自检的 diff 不再依赖 git。
+- `MULTI_MODEL_SWITCH_DESIGN.md`（未跟踪）——多模型切换设计稿。
+- 刻意排除、未跟踪的杂物：`agent/`、`convolution.ts`、`demo_headroom.py`、
+  `mark_coin.ps1`、`今日思考.md`（见 `SECURITY_AUDIT_REPORT.md` 的"明确排除"）。
+
+### 遗留问题（本次未做）
+
+- `PanelLog._MAX_HISTORY = 1000`：重排时静默丢弃更早的重播历史（实测写 2746 条后
+  重排只剩 1000 条，首行从 `推理片段 00000` 跳到 `01746`）。与卡顿无关，独立一个活儿。
+- `PanelLog.max_lines = 5000`：超过面板容量的历史在重排时按尾部保留（这是有意的），
+  但**流式过程中** `RichLog.write` 的裁剪与重排后的裁剪可能让可见窗口差几行。
+
