@@ -47,16 +47,17 @@ from loop_agent_core.control import interrupt_event
 _shell_output_queue = None
 
 
-def exec_shell_win_mock(shell_cmd, shell="cmd"):
+def exec_shell_win_mock(shell_cmd, shell="cmd", purpose=""):
     """薄壳包装：把 TUI 注入的 _shell_output_queue 传给 core 实现。
 
     任意命令执行是最高风险能力（可完成 write_file/edit_file 的一切），
     此前完全不在确认门覆盖内（见 SECURITY_AUDIT_REPORT V2）——这里补上门控。
+    purpose 随确认框显示：只有命令原文、没有目的时，审批人无从判断意图。
     """
     preview = str(shell_cmd).replace("\n", " ⏎ ")
     if len(preview) > 300:
         preview = preview[:300] + f"… ({len(str(shell_cmd))} chars)"
-    if not confirm_mod.request("exec_shell_win", f"[{shell}] {preview}"):
+    if not confirm_mod.request("exec_shell_win", f"[{shell}] {preview}", purpose):
         return json.dumps({
             "stdout": "", "stderr": "", "returncode": None, "success": False,
             "interrupted": False, "timed_out": False,

@@ -360,9 +360,12 @@ def test_file_not_found_suggests():
     # 无相似文件时不附加
     assert "Similar files" not in la.read_file_mock("_definitely_missing_file_zzz.py")
 
-def test_edit_git_guard():
-    """write/edit 前置备份、写失败恢复、返回附 diff；不留 .bak 残留。"""
-    import loop_agent_core.file_tools as ft
+def test_edit_backup_and_diff():
+    """write/edit 前置备份、失败恢复、进程内 diff；不留 .bak 残留。
+
+    核心回归：diff 对【未跟踪文件】也必须有效。旧实现走 `git diff -- <path>`，对未跟踪
+    文件返回空串，而 write_file 的主用途（新建文件）和 edit_file 对刚建文件的编辑都在
+    这个盲区里——等于这类编辑完全没有自检证据。"""
     probe = "_selftest_guard.txt"
     tmp = os.path.join(la.WORK_DIR, probe)
     for f in (tmp, tmp + ".bak"):
@@ -371,19 +374,39 @@ def test_edit_git_guard():
     try:
         r1 = la.write_file_mock(probe, "alpha beta\nline2\n")
         assert "Written" in r1, r1
+        # 新建文件：不做"空→全文"的伪 diff，明确说明没有基线
+        assert "new file" in r1 and "nothing to diff against" in r1, r1
+
+        # 未跟踪文件上的编辑：旧 git diff 实现此处返回空串（本测试就是它的反例）
         r2 = la.edit_file_mock(probe, "alpha beta", "ALPHA BETA")
         assert "Edited" in r2 and "1 occurrence(s) replaced" in r2, r2
+        assert "[diff for self-check]" in r2, r2
+        assert "-alpha beta" in r2 and "+ALPHA BETA" in r2, r2
+        assert "+++ " not in r2, r2  # 同一文件，diff 头两行应被剥掉
         r3 = la.edit_file_mock(probe, "line2", "LINE2")
-        assert "Edited" in r3, r3
+        assert "-line2" in r3 and "+LINE2" in r3, r3
         with open(tmp, encoding="utf-8") as f:
             content = f.read()
         assert "ALPHA BETA" in content and "LINE2" in content
         assert not os.path.exists(tmp + ".bak")  # 成功路径清理 .bak
+
+        # 覆盖写入：diff 只含本次改动，不混入工作区里已有的其他改动
+        r4 = la.write_file_mock(probe, "ALPHA BETA\nLINE2\nthird\n")
+        assert "Overwritten" in r4 and "+third" in r4, r4
+        assert "-alpha" not in r4 and "-line2" not in r4, r4
+        # 内容完全一致：明确报"无改动"，而不是给一个空 diff 让人猜
+        r5 = la.write_file_mock(probe, "ALPHA BETA\nLINE2\nthird\n")
+        assert "no textual change" in r5, r5
+
         # 找不到 old_string：不写入、返回错误（可能带相近行提示）
         before = open(tmp, encoding="utf-8").read()
-        r4 = la.edit_file_mock(probe, "zebra_does_not_exist", "x")
-        assert r4.startswith("[Error]"), r4
+        r6 = la.edit_file_mock(probe, "zebra_does_not_exist", "x")
+        assert r6.startswith("[Error]"), r6
         assert open(tmp, encoding="utf-8").read() == before  # 未写入
+
+        # 超大改动：截断必须显式标注省略量，不静默丢内容
+        r7 = la.write_file_mock(probe, "\n".join(f"line{i}" for i in range(200)) + "\n")
+        assert "more diff line(s)" in r7, r7[:400]
     finally:
         for f in (tmp, tmp + ".bak"):
             if os.path.exists(f):
@@ -400,7 +423,7 @@ if __name__ == "__main__":
                test_strip_and_garbage, test_parse_xml_tool_calls, test_parse_qwen3_toolcalls, test_dsml_corrupted_tags,
                test_stream_strip_xml, test_store_tool_args, test_rollback_tool_round, test_file_not_found_suggests,
                test_run_tools, test_prune_cap, test_prune, test_prune_notice_recycle, test_no_prune_when_small,
-               test_edit_git_guard, test_check_local_llm_cloud]:
+               test_edit_backup_and_diff, test_check_local_llm_cloud]:
         fn()
         print(f"ok: {fn.__name__}")
     print("all code-index + pruning self-checks passed")

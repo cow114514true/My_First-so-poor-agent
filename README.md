@@ -62,8 +62,8 @@
 - `fetch_url`：Tavily 读指定网页正文（extract，每 5 URL 1 credit）
 - `read_file`：安全读取文件——小文件全文返回；大文件自动返回**结构大纲**（函数/类/import + 行号），可用 `function=`（按函数名拉取函数体）或 `start_line`/`end_line`（行号区间）精准读取，所有读取受 token 预算上限约束
 - `count_tokens`：估算文件（`path=`）或任意文本（`text=`）的 token 数，用于判断是否启用索引阅读
-- `write_file`：安全写入文件（自动创建目录，覆盖已有文件，返回 git diff 供自检）
-- `edit_file`：精确替换指定字符串（默认要求唯一，找不到/不唯一报错并给出相近行候补；返回 git diff 供自检）
+- `write_file`：安全写入文件（自动创建目录，覆盖已有文件，返回**本次改动**的 diff 供自检）
+- `edit_file`：精确替换指定字符串（默认要求唯一，找不到/不唯一报错并给出相近行候补；返回**本次改动**的 diff 供自检）
 - `delegate_task`：将独立子任务委派给隔离上下文的 sub-agent（共享工作目录与所有工具），返回其最终答案
 - `search_code`：Python 原生 regex 跨文件代码搜索（三种输出：匹配行+行号 / 文件列表 / 计数），替代 cmd 的 findstr，自动跳过依赖目录
 - `code_index`：目录级符号索引——一次调用返回整个目录所有文件的函数/类/import 结构地图，配合 `search_code` + `read_file(function=)` 三件套快速理解项目结构
@@ -431,6 +431,7 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 ## 更新日志
 
 - **v2.12**：代码导航三件套 + 浏览器批量求值根治卡顿 + 稳定性修复——新增 `search_code`（跨文件 regex 搜索）与 `code_index`（目录符号索引）工具；`browser_act` 元素清单重写为 `evaluate_all` 批量求值（一次往返拿全部元素，根治 bilibili 大页 122s 卡顿 → 0.3s）；投币/点赞/收藏 className 语义化 + `.video-toolbar-left-item` 选择器（bilibili 操作栏是 div 无文本）；`scroll` 改 JS `scrollBy`（播放器劫持 PageDown 切视频）；重复 open 同 URL 跳过 goto（SPA 卡死）；`_extract_page_text` `innerText`→`textContent`；`locate` 参数命中元素 ★ 置顶；本地模型工具结果 cap 2500→6000（14→66 元素）；`_page_state` 分段计时写 `tmp/browse_timing.log`；工具/子 agent 结果超时兜底（`f.result(timeout)` + `shutdown(wait=False)`）；headroom-ai 接入（audit/optimize 模式，JSONL 存储避开 SQLite 跨线程）；禁 HF tokenizer 下载（`HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS=0`）；协议加固（`_inject_user_nudge` 合并连续 user 消息防 API 400、第 8/12 轮注入收尾提示）；本地模型 XML 工具调用解析兼容 JSON 格式；系统提示新增第三方库接入原则 + 任务完成判定；`reasoning_effort` high→medium；`READ_BUDGET_DS` 6000→12000；QuitDialog ESC 修复
+- **v2.12**：写文件自检的 diff 不再依赖 git——`_git_diff_after_edit`（子进程 `git diff`）换成进程内 `difflib.unified_diff` 对比写前/写后。修复未跟踪/新建/非 git 仓库文件拿不到 diff（`write_file` 的主用途恰是新建文件）、历史未提交改动混入同一 hunk 把本次改动挤出 500 字符窗口、截断静默丢内容三个问题；新建文件与内容无变化改为明确文字说明
 - **v2.11**：协议加固 + 连接可靠性——多工具自检合并为单条 user 消息（根除连续 user 触发 API 400）；记忆注入/`[Context trimmed]` 合并进问题文本；流式连接 httpx read 120s 超时防断流挂死；shell 非零退出不再触发 Self-check 打断；QuitDialog ESC 取消修复
 - **v2.10**：元素捕获泛化 + 性能修复——`browser_act` 元素清单去重（bilibili 158→64）、`cursor:pointer` 裸元素扫描（登录/投币等无 role 的 span/div）、祖先 title 命名（计数 span → "投币（W） 410"）、链接类别上限 + 列表上限 120、iframe 跨帧捕获 + Frame-detached 容错、open shadow DOM 自动穿透；性能——打开页面默认暂停视频、`_describe` 批量 evaluate、`innerText`→`textContent`（视频页 40s+ → 7s）；新增 `visual_locate` 工具（VLM 粗包围框 + 吸附最近 DOM 元素，视觉兜底）
 - **v2.9**：任务可中断——Esc（agent 忙碌时）设共享中断事件，流式每 chunk / 每工具前 / 每轮 API 前检查，中断时部分正文落库不丢；长 shell 命令被杀；浏览器 `browser_act` 升级——目标支持 `css=`/`xpath=`、元素清单附 CSS 选择器、新增 hover/select_option、profile 恢复 URL+sessionStorage 解决 SPA 会话丢失

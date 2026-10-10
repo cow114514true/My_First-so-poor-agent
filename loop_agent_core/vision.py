@@ -40,7 +40,7 @@ def _resolve_image_path(path):
     return os.path.abspath(os.path.join(WORK_DIR, path))
 
 
-def analyze_image_mock(path, question=None):
+def analyze_image_mock(path, question=None, purpose=""):
     """读本地图片 → 本地视觉模型 → 返回文字分析。确认门把关（TUI 弹窗）。
 
     图片路径不走 _resolve_path 沙箱：图片通常在 WORK_DIR 外（截图/照片），
@@ -49,7 +49,7 @@ def analyze_image_mock(path, question=None):
     resolved = _resolve_image_path(path)
     if not os.path.exists(resolved):
         return f"[Error] Image not found: {resolved}"
-    if not confirm.request("analyze_image", resolved):
+    if not confirm.request("analyze_image", resolved, purpose):
         return "[Denied by user]"
     ext = os.path.splitext(resolved)[1].lstrip(".").lower() or "png"
     mime = _MIME.get(ext, ext)

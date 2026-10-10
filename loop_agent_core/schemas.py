@@ -1,4 +1,13 @@
 """OpenAI function schemas（tools 列表，9 个工具定义）。"""
+# 敏感工具（执行命令/写文件/改文件/读图/上传）必须自带一个"目的"，随确认框显示。
+# 只给命令原文、不给意图时，审批人无从判断，确认框就退化成形式（见 SECURITY_AUDIT_REPORT）。
+_PURPOSE_SCHEMA = {
+    "type": "string",
+    "description": ("One short phrase (≤20 chars, in the user's language) saying WHY this action is "
+                    "needed — shown in the approval dialog so the user can judge intent. "
+                    "Always fill this in."),
+}
+
 tools = [
     {
         "type": "function",
@@ -34,7 +43,8 @@ tools = [
                     "shell_cmd": {"type": "string",
                                 "description": "The command to execute; syntax must match the chosen shell"},
                     "shell": {"type": "string", "enum": ["cmd", "powershell"],
-                              "description": "Which shell to run in. Use 'powershell' for PowerShell-native tasks (registry, services, Get-* cmdlets); leave 'cmd' (default) otherwise."}
+                              "description": "Which shell to run in. Use 'powershell' for PowerShell-native tasks (registry, services, Get-* cmdlets); leave 'cmd' (default) otherwise."},
+                    "purpose": _PURPOSE_SCHEMA
                 },
                 "required":["shell_cmd"]
             }
@@ -58,7 +68,8 @@ tools = [
                     "ask_prompt": {
                         "type": "string",
                         "description": "This parameter is necessary,you need to provide this to tell deepseek on web to know the content of picture you pass or the infomations you want to know"
-                    }
+                    },
+                    "purpose": _PURPOSE_SCHEMA
                 },
                 "required": ["file_path","ask_prompt"]
             }
@@ -104,7 +115,8 @@ tools = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path to write (relative or absolute within working directory)"},
-                    "content": {"type": "string", "description": "The complete file content to write"}
+                    "content": {"type": "string", "description": "The complete file content to write"},
+                    "purpose": _PURPOSE_SCHEMA
                 },
                 "required": ["path", "content"]
             }
@@ -121,7 +133,8 @@ tools = [
                     "path": {"type": "string", "description": "File path to edit (relative or absolute within working directory)"},
                     "old_string": {"type": "string", "description": "Exact existing text to replace."},
                     "new_string": {"type": "string", "description": "Replacement text. Empty string deletes old_string."},
-                    "replace_all": {"type": "boolean", "description": "False (default): old_string must be unique. True: replace every occurrence."}
+                    "replace_all": {"type": "boolean", "description": "False (default): old_string must be unique. True: replace every occurrence."},
+                    "purpose": _PURPOSE_SCHEMA
                 },
                 "required": ["path", "old_string", "new_string"]
             }
@@ -136,7 +149,8 @@ tools = [
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Path to the image file (absolute, or relative to the working directory)"},
-                    "question": {"type": "string", "description": "What to ask about the image. Omit for a general description."}
+                    "question": {"type": "string", "description": "What to ask about the image. Omit for a general description."},
+                    "purpose": _PURPOSE_SCHEMA
                 },
                 "required": ["path"]
             }

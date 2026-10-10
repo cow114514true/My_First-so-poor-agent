@@ -165,7 +165,20 @@
 ### Bug 21. write/edit_file 覆盖无备份、失败即毁文件
 - **现象**：模型 `write_file`/`edit_file` 改坏一个文件，原内容没了，无法回退。
 - **修复**（`a69fff0`）：写前备份 `.bak`、写失败自动恢复、返回附 git diff 供模型自检。
-- **验证**：`test_code_index.py::test_edit_git_guard`——前置备份、失败恢复、diff 输出、不留 `.bak` 残留。
+- **验证**：`test_code_index.py::test_edit_backup_and_diff`——前置备份、失败恢复、diff 输出、不留 `.bak` 残留。
+
+### Bug 22. diff 自检对未跟踪文件完全失效（Bug 21 的残留盲区）
+- **现象**：`edit_file` / `write_file` 改**未跟踪**文件时，工具结果里没有任何 diff；而 `write_file` 的
+  主用途恰恰是新建文件。叠加"成功即删 `.bak`"，这类编辑等于零验证、零回退。
+- **怎么发现**：review 时实测 `git diff -- <untracked>` 返回空串（长度 0）；且 `git diff` 是
+  "工作区 vs 索引"，同一文件里已有的历史未提交改动会混进同一个 hunk，把本次改动挤出
+  `diff[:500]` 前缀截断窗口——模型看到无关改动会误判"改错了"。
+- **修复**：`_git_diff_after_edit`（子进程 + git）→ 进程内 `difflib.unified_diff` 对比写前/写后字符串。
+  未跟踪/非 git 仓库同样有 diff；只含本次改动；超预算时截断点落在改动之后并显式标注省略量；
+  新建文件与内容无变化各有明确的文字说明（不给伪 diff）。
+- **验证**：`test_code_index.py::test_edit_backup_and_diff`——未跟踪文件上的编辑必须含
+  `-old`/`+new`、diff 头两行被剥掉、覆盖写入不混入历史改动、"无改动"有明确措辞、
+  超大改动的省略量被标注。反向验证过：把 diff 打回空串该测试即失败（断言确为 load-bearing）。
 
 ---
 

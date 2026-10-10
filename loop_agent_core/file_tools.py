@@ -1,8 +1,8 @@
 """文件工具：路径沙箱、token 估算、代码大纲、函数体拉取、读写 mock。"""
+import difflib
 import os
 import re
 import shutil
-import subprocess
 
 from .config import WORK_DIR
 from .tokens import _read_budget, estimate_tokens
@@ -21,17 +21,54 @@ def _resolve_path(path):
     return resolved
 
 
-def _git_diff_after_edit(file_path):
-    """编辑后取 git diff 文本（空串 = 无改动/未跟踪/非 git 仓库）。只读，线程安全。"""
-    try:
-        rel = os.path.relpath(file_path, WORK_DIR)
-        r = subprocess.run(
-            ["git", "diff", "--", rel],
-            cwd=WORK_DIR, capture_output=True, text=True, timeout=10,
-        )
-        return r.stdout.strip()
-    except Exception:
+# 单次工具结果里 diff 段的字符上限：够看清一处改动的上下文，又不撑爆本地模型窗口。
+_DIFF_BUDGET = 700
+
+
+def _unified_diff(before, after, budget=_DIFF_BUDGET):
+    """进程内 before→after 的 unified diff。
+
+    相比 `git diff -- <path>` 的三个优势：
+    - 未跟踪 / 刚新建 / 非 git 仓库的文件同样有 diff（git diff 对未跟踪文件返回空）；
+    - 只含本次改动，不混入工作区里已有的其他未提交改动；
+    - 截断点落在改动之后——git diff 的前缀截断会被无关 hunk 把真正的改动挤出窗口。
+    超出 budget 时保留靠前的改动并注明省略了多少行/多少处改动，绝不静默丢内容。
+    """
+    if before == after:
         return ""
+    body = list(difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm=""))
+    if len(body) >= 2 and body[0].startswith("---") and body[1].startswith("+++"):
+        body = body[2:]  # 同一文件，这两行没有信息量
+    if not body:
+        return ""
+    kept, used = [], 0
+    for i, line in enumerate(body):
+        cost = len(line) + 1
+        if used + cost > budget and kept:
+            rest = body[i:]
+            changed = sum(1 for l in rest if l[:1] in "+-")
+            kept.append(f"... [{len(rest)} more diff line(s), {changed} of them changed]")
+            break
+        kept.append(line)
+        used += cost
+    return "\n".join(kept)
+
+
+def _diff_for(before, after):
+    """构造 [diff for self-check] 段：同一文件写前→写后的对比（不依赖 git）。"""
+    diff = _unified_diff(before, after)
+    if not diff:
+        return "\n[diff for self-check] no textual change (content identical to before)"
+    return f"\n[diff for self-check]\n{diff}"
+
+
+def _read_text_or_none(resolved):
+    """尽力读为 UTF-8 文本；不可读（二进制/权限）返回 None，让调用方退化成"无 diff"而不是报错。"""
+    try:
+        with open(resolved, "r", encoding="utf-8") as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return None
 
 
 def _backup_before_write(resolved):
@@ -231,11 +268,13 @@ def count_tokens_mock(path=None, text=None):
     return f"{os.path.basename(resolved)}: {n} lines, ~{estimate_tokens(content)} tokens (estimated)"
 
 
-def write_file_mock(path, content):
-    """覆盖写入。写前备份（已有文件时），写失败自动恢复，返回附 git diff 供模型自检。"""
+def write_file_mock(path, content, purpose=""):
+    """覆盖写入。写前备份（已有文件时），写失败自动恢复，返回附本次改动的 diff 供模型自检。"""
     resolved = _resolve_path(path)
-    if not confirm.request("write_file", resolved):
+    if not confirm.request("write_file", resolved, purpose):
         return "[Denied by user]"
+    before_existed = os.path.exists(resolved)
+    before = _read_text_or_none(resolved) if before_existed else None
     existed = _backup_before_write(resolved)
     os.makedirs(os.path.dirname(resolved), exist_ok=True)
     try:
@@ -247,15 +286,19 @@ def write_file_mock(path, content):
     _cleanup_backup(resolved)  # 成功则只清理 .bak，不恢复
     size = os.path.getsize(resolved)
     msg = f"{'Written' if not existed else 'Overwritten'} {size} bytes to {resolved}"
-    diff = _git_diff_after_edit(resolved)
-    if diff:
-        msg += f"\n[diff for self-check]\n{diff[:500]}"
+    if not before_existed:
+        msg += (f"\n[diff for self-check] new file: {len(content.splitlines())} line(s) "
+                "written, nothing to diff against")
+    elif before is None:
+        msg += "\n[diff for self-check] previous content was not UTF-8 text — text diff unavailable"
+    else:
+        msg += _diff_for(before, content)
     return msg
 
 
-def edit_file_mock(path, old_string, new_string="", replace_all=False):
+def edit_file_mock(path, old_string, new_string="", replace_all=False, purpose=""):
     """精确替换 old_string。默认要求唯一（找不到/不唯一报错且不写入）；
-    replace_all=True 时替换全部出现。写前备份，写失败自动恢复，返回附 git diff 供模型自检。"""
+    replace_all=True 时替换全部出现。写前备份，写失败自动恢复，返回附本次改动的 diff 供模型自检。"""
     resolved = _resolve_path(path)
     if not os.path.exists(resolved):
         sim = _suggest_files(path)
@@ -280,7 +323,7 @@ def edit_file_mock(path, old_string, new_string="", replace_all=False):
         if suggestions:
             hint = "\nPossible close matches (check whitespace/indentation):\n" + "\n".join(suggestions[:5])
         return f"[Error] '{old_string[:40]}' not found in {os.path.basename(resolved)}.{hint}"
-    if not confirm.request("edit_file", resolved):
+    if not confirm.request("edit_file", resolved, purpose):
         return "[Denied by user]"
     if not replace_all and n > 1:
         return (f"[Error] '{old_string[:40]}' appears {n} times in {os.path.basename(resolved)}. "
@@ -294,8 +337,6 @@ def edit_file_mock(path, old_string, new_string="", replace_all=False):
         _cleanup_backup(resolved, restore=True)
         return f"[Error] edit_file failed: {e}. Original file restored from backup."
     _cleanup_backup(resolved)
-    diff = _git_diff_after_edit(resolved)
     msg = f"Edited {os.path.basename(resolved)}: {n} occurrence(s) replaced ({os.path.getsize(resolved)} bytes now)"
-    if diff:
-        msg += f"\n[diff for self-check]\n{diff[:500]}"
+    msg += _diff_for(content, new_content)
     return msg

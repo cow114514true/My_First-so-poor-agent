@@ -12,6 +12,7 @@ SUITES = [
     "test_shell_tools.py",
     "test_tui_markdown.py",
     "test_security_hardening.py",
+    "test_purpose.py",
 ]
 
 

@@ -7,7 +7,10 @@
 - **会话放行按类别 + 作用域隔离**：批准 `write` 不会顺带放行 `exec`；
   主会话的批准不会外溢到并发运行的 worker 子 agent。
 - **可撤销**：`revoke()` / `reset()`；TUI 的 `/revoke` 命令调用它。
+- **目的透传**：`request(kind, target, purpose)` 把模型自述的"操作目的"带给审批界面；
+  只给命令原文、不给意图时，审批人无从判断，确认框会退化成形式。
 """
+import inspect
 import os
 
 # ── 策略 ──────────────────────────────────────────────────────────────
@@ -16,7 +19,9 @@ import os
 # "allow_all"  : 一律放行（仅限测试/受控脚本，需显式声明）
 _POLICY = os.environ.get("AGENT_CONFIRM_POLICY", "ask").strip().lower()
 
-_ask = None           # callable(kind, target, is_worker) -> "allow"|"allow_session"|"deny"；None => 拒绝
+_ask = None           # callable(kind, target, is_worker) 或 callable(kind, target, is_worker, purpose)
+                      #   -> "allow"|"allow_session"|"deny"；None => 拒绝。
+                      # 3 参向 4 参（带 purpose）向后兼容：见 _invoke_ask。
 _worker_check = None  # thin shell 注入：thread-local _is_worker()，用于给对话框打"子任务请求"标签
 
 # 已在本会话放行的类别：(kind, scope) 集合，scope ∈ {"main", "worker"}
@@ -70,10 +75,26 @@ def _scope() -> str:
     return "worker" if bool(_worker_check and _worker_check()) else "main"
 
 
-def request(kind, target):
+def _invoke_ask(kind, target, is_worker, purpose):
+    """调用注入的 _ask，兼容 3 参（旧）与 4 参（带 purpose）两种签名。
+
+    旧测试把 `_ask` 定义成 `lambda k, t, w: ...`；新 TUI 定义成 4 参以接收 purpose。
+    用签名判断而非 try/except TypeError，避免把 _ask 内部真正的 TypeError 误当成"少参"。
+    """
+    try:
+        params = inspect.signature(_ask).parameters
+    except (TypeError, ValueError):
+        params = None
+    if params is not None and len(params) == 3:
+        return _ask(kind, target, is_worker)
+    return _ask(kind, target, is_worker, purpose)
+
+
+def request(kind, target, purpose=""):
     """Return True 表示允许继续。敏感工具在真正执行前调用。
 
     kind 既接受工具名（write_file/exec_shell_win/...），也接受类别名（write/exec/...）。
+    purpose：可选的"操作目的"短语（模型自述），随确认框显示给用户判断意图；缺省为空串。
     """
     if _POLICY == "deny_all":
         return False
@@ -88,7 +109,7 @@ def request(kind, target):
         # 无人可问 → 拒绝（fail-closed）。要放行请显式 set_policy("allow_all")。
         return False
 
-    decision = _ask(kind, target, scope == "worker")
+    decision = _invoke_ask(kind, target, scope == "worker", purpose)
     if decision == "allow_session":
         _approved.add((kind, scope))
         return True
