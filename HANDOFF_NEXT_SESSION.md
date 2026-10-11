@@ -99,6 +99,17 @@ agent/
 ### 4. XML/DSML 清洗链路
 四入口都接 `_strip_dsml`/`_normalize_toolcall_xml`：`_parse_xml_tool_calls`、`_strip_toolcall_xml`、`_stream_strip_xml`、`_is_garbage_content`。Qwen3 复数标签格式（invoke/parameter name=）归一化成旧格式（function=/parameter=）再解析。
 
+### 4.5 shell 默认是 pwsh（v2.17 起，改 shell_tools 必看）
+- 默认 **PowerShell 7**（`shell="pwsh"`，core 与薄壳两处 + schema enum/default 都是）；cmd 只在显式要时用。
+- **绝不要再用 `-EncodedCommand` 跑 pwsh**：它会把错误流序列化成 CLIXML XML（`#< CLIXML <Objs…>`），
+  模型读不到错误 → 判定"pwsh 坏了"→ 永久退回 cmd（BUG 35 有真实会话为证）。现在走 `-File` + tmp/ 临时 .ps1
+  （UTF-8-BOM），语法错也能看到 `ParserError`；用户命令在 here-string 里、执行前 `Parser::ParseInput` 预检。
+- **cmd 语法兼容层**：`shell_tools.effective_shell(cmd, shell)` 返回"实际会用谁 + 该语法的 pwsh 等价写法"；
+  结果里带 `shell_used` 与教学用的 `note`；confirm 弹窗显示 `[pwsh]` / `[cmd·cmd语法]`。
+  新增 cmd-only 语法时改 `_CMD_ONLY_SYNTAX`，别去改 `_PS_SYNTAX_MARKERS`（后者是"绝不改道"的白名单）。
+- 退出码回填：pwsh 的 cmdlet 报错是非终止错误，`_PS_EPILOGUE_BODY`/`_PS_EXIT_BODY` 负责让 rc≠0；
+  `cmd /c exit 2` → 2、用户 `exit 7` → 7 保持原样（有测试钉着）。
+
 ### 5. 上下文压缩三层（v2.13 新增，改这里务必看懂）
 `loop_agent_core/compaction.py` 是叶子，`context._prep_context()` 是唯一入口，`runner.chat_impl` 的两个调用点都走它。
 
@@ -147,6 +158,7 @@ python test_code_index.py    # 全过（XML/DSML/上下文/rollback/记忆工具
 python test_multi_agent.py   # 7 项全过（多 agent 隔离/事件/守卫）
 python test_compaction.py    # 36 项全过（L0 去重/L1 分块摘要/L2 兜底/档案/频率预算/失败退避与诊断/会话文件校验）
 python test_runner_visibility.py  # 6 项全过（回合结束必须"看得见"：notice 事件 + edit_file 候补提示）
+python test_shell_tools.py     # 9 项全过（默认 pwsh / cmd 语法改道 + 教学提示 / 错误非 CLIXML / 退出码回填）
 python run_tests.py          # 10 套件（需要 DS_KEY，config 在 import 时就要建 client）
                              # 注意：test_tui_markdown.py 现有 3 项红，属**未提交**的
                              # 思考块折叠 WIP（见 THINKING_PANEL_FOLD_DESIGN.md），与本项无关

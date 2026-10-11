@@ -36,14 +36,14 @@ tools = [
         "type": "function",
         "function": {
             "name": "exec_shell_win",
-            "description": "Execute a command in Windows. shell='cmd' (default) runs cmd.exe; shell='powershell' runs PowerShell with UTF-8 output.",
+            "description": "Execute a command in Windows. Defaults to PowerShell 7 (pwsh) with UTF-8 output — the preferred shell for everything (file ops, filtering, JSON, pipes). Pass shell='cmd' only when you specifically need cmd.exe syntax, and never use bash-isms like `<<EOF` (neither cmd nor PowerShell supports heredocs — write a .py/.ps1 file with write_file and run it instead).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "shell_cmd": {"type": "string",
                                 "description": "The command to execute; syntax must match the chosen shell"},
-                    "shell": {"type": "string", "enum": ["cmd", "powershell"],
-                              "description": "Which shell to run in. Use 'powershell' for PowerShell-native tasks (registry, services, Get-* cmdlets); leave 'cmd' (default) otherwise."},
+                    "shell": {"type": "string", "enum": ["pwsh", "cmd"], "default": "pwsh",
+                              "description": "Which shell to run in. Leave the default 'pwsh' (PowerShell 7): write PowerShell — `Get-ChildItem -Name`, `Select-String`, `Where-Object`, `$env:USERPROFILE`, `2>$null`. Use 'cmd' only for cmd.exe-only syntax (`dir /b`, `findstr`, `%VAR%`, `2>nul`, `for /f`) — if you do send cmd syntax with 'pwsh', the tool auto-runs it in cmd and tells you the PowerShell equivalent."},
                     "purpose": _PURPOSE_SCHEMA
                 },
                 "required":["shell_cmd"]

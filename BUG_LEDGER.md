@@ -405,6 +405,46 @@
 - **注**：这一条不是"模型笨"——工具把唯一的判据（退出码）换成了别人的、又把结论行删掉，
   任何模型都只能靠猜。工具应当保证"结论可见"，这与 Bug 32 是同一类问题。
 
+### Bug 35. 提示词把模型锁死在 cmd，而 pwsh 的报错是 CLIXML 垃圾 → 它再也不用 pwsh
+
+- **现象**（用户原话）："模型有点被提示词卡死了偏向于使用较古老的 cmd，即使后面鼓励使用 pwsh 也没有使用"。
+- **四重锁**（缺一不足以解释"鼓励也没用"）：
+  1. **schema 直接教它用 cmd**：`shell` 的 enum 是 `["cmd","powershell"]`，描述写着
+     "Use 'powershell' for PowerShell-native tasks (registry, services, Get-* cmdlets);
+     leave **'cmd' (default)** otherwise" —— 除注册表/服务外一律 cmd；
+  2. **工具描述与函数默认值都是 cmd**：`description: "shell='cmd' (default)…"`、
+     `exec_shell_win_mock(shell="cmd")`（core 与薄壳两处），省略参数就落到 cmd；
+  3. **pwsh 的错误是 CLIXML XML**：原实现用 `-EncodedCommand`，它会把错误流序列化成
+     `#< CLIXML <Objs Version="1.1.0.1" …><S S="Error">_x001B_[31;1mParserError: …`。
+     真实会话 `chat_20260812_175615.json` 第 11/17 条就是这坨东西；模型第 13 条的结论是
+     **"PowerShell 不支持 `<< 'EOF'` 语法。我来换个方式："** 然后**显式**改成
+     `{"shell":"cmd"}`，此后整场再没用过 pwsh（第 19 条它自己摸索出"写临时 .py 再跑"，
+     但把这个功劳记在了 cmd 头上）。**它连错误信息都读不到，当然学不会 pwsh。**
+  4. `<<EOF` 这类 **bash 语法在 cmd 与 pwsh 里都不存在**，而提示词从没说过；模型两轮都
+     试 heredoc（第 10/16 条），失败后归因给了 shell 而不是语法本身。
+- **修复**：
+  - 默认彻底翻过来：schema enum→`["pwsh","cmd"]` + `default:"pwsh"` + 描述改成
+    "Defaults to PowerShell 7 … pass shell='cmd' only when you specifically need cmd.exe
+    syntax"；`shell_tools.exec_shell_win_mock` 与薄壳包装的默认参数都改成 `"pwsh"`；
+  - **不用 `-EncodedCommand` 了**：改 `-File` 跑 tmp/ 下的临时 .ps1（UTF-8-BOM，5.1 也认中文）。
+    报错变纯文本，语法错也可见（`ParserError: “(” 后应为表达式。(第 1 行)`），
+    引号/`$`/`%`/反斜杠路径原样，退出码正常传递；用户命令放在 here-string 里再用
+    scriptblock 执行，**语法预检**（`Parser::ParseInput`）放在执行前 —— 否则未闭合的括号
+    会把结尾的退出码回填一起吞掉、报错里露出内部代码；写不了临时文件时退回 `-Command`。
+  - **cmd 语法兼容层**（`effective_shell()`）：命令像 cmd 语法（`dir /b`、`%VAR%`、`2>nul`、
+    `for /f`、`if exist`、`%~dp0`…）就用 cmd 跑，并在结果里回一句 pwsh 等价写法
+    （`Get-ChildItem -Name`、`$env:VAR`、`2>$null`…）——**兼容的同时把正确写法教会它**；
+    带 PowerShell 特征（`$`/`Get-`/`Select-`…）的一律不改道（防 `-Format "%Y%m%d"` 误判）。
+    confirm 弹窗显示**实际**会用的解释器：`[pwsh]` / `[cmd·cmd语法]`。
+  - 结果里加 `shell_used` 字段：模型能立刻看到"这次到底是谁跑的"。
+  - 提示词新增：默认 pwsh 及常用写法、**禁止 bash 语法的 `<<EOF`**（要跑多行就
+    write_file 落 .py/.ps1 再执行）、`shell='cmd'` 时才用 `&&`/`&` 且不得用 `;`。
+  - 补退出码回填：pwsh 的 cmdlet 报错是**非终止**错误，脚本照样 exit 0
+    （`Get-ChildItem /b` → rc=0 + 一条错误），现在 `$?` 会被回填成 rc=1；
+    `cmd /c exit 2` → rc=2、用户自己 `exit 7` → rc=7 都保持原样。
+- **回归**：`test_shell_tools.py` 6 → 9 项（默认是 pwsh、cmd 语法改道 + 提示、
+  PowerShell 语法不被改道、错误不是 CLIXML、语法错可见、cmdlet 错误 rc≠0、临时脚本清理）。
+
 ---
 
 ## 附：杂项清理清单（非 bug，历史遗留）

@@ -1,10 +1,11 @@
 """基础工具：日期/天气/命令执行。实时输出队列经参数注入（薄壳包装传 _shell_output_queue）。"""
-import base64
 import json
+import os
 import queue
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -13,6 +14,7 @@ from datetime import datetime
 PS_EXE = shutil.which("pwsh") or "powershell.exe"
 
 from .control import interrupt_event
+from .config import WORK_DIR
 from .debuglog import log_error
 from .file_tools import _resolve_path  # 复用已验证的路径沙箱（见 SECURITY_AUDIT_REPORT V4）
 
@@ -49,46 +51,187 @@ def get_weather_mock(location, date):
     return f"Weather in {location} on {date}: Cloudy 7~13°C"
 
 
-def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
+_PS_SHELL_ALIASES = ("powershell", "ps", "pwsh")
+
+# cmd 独有语法 → (识别名, pwsh 里怎么写)。
+# 为什么需要它：cmd 语法在 pwsh 下常常**不报错**而是静默跑错——`dir /b` 被 pwsh 当成
+# `Get-ChildItem C:\b`（"找不到路径 C:\b"），`%VAR%` 原样当字符串，`2>nul` 会去建一个叫
+# nul 的文件。模型看不出"这是 shell 语法错"，只会得出"pwsh 坏了"。命中就改用 cmd 跑，
+# 并把对应写法回给对方 —— 兼容的同时把正确写法教会它。
+_CMD_ONLY_SYNTAX = (
+    (re.compile(r"%[A-Za-z_][A-Za-z0-9_]*%"), "%VAR% 环境变量",
+     "`$env:VAR`"),
+    (re.compile(r"(?i)(^|[\s|&(])dir\s+/[a-z]"), "dir /开关",
+     "`Get-ChildItem -Name`（只要名字）/ `Get-ChildItem -Recurse -File`"),
+    (re.compile(r"(?i)(^|[\s|&(])for\s+/[fd]"), "for /f、for /d",
+     "`foreach ($x in $list) { … }` / `Get-ChildItem | ForEach-Object { … }`"),
+    (re.compile(r"(?i)(^|[\s|&(])if\s+(not\s+)?(exist|errorlevel)\b"), "if exist / if errorlevel",
+     "`if (Test-Path $p) { … }` / `if ($LASTEXITCODE -ne 0) { … }`"),
+    (re.compile(r"(?i)\d?>\s*nul\b"), "2>nul",
+     "`2>$null`"),
+    (re.compile(r"(?i)(^|[\s|&(])(set\s+/[ap]|choice\s+/|ver|vol|assoc|mklink|fc)\b"),
+     "cmd 内建命令",
+     "`Get-Volume` / `New-Item -ItemType SymbolicLink` / `Get-FileHash` / `cmd /c ver`"),
+    (re.compile(r"(^|[\s|&(])(xcopy|robocopy)\b", re.I), "xcopy / robocopy",
+     "两者本身是 exe，pwsh 可直接调用；纯拷贝可用 `Copy-Item -Recurse`"),
+    (re.compile(r"%\d|%~[a-zA-Z]"), "%~dp0 / %1 参数展开",
+     "`$args[0]` / `$PSScriptRoot`"),
+    (re.compile(r"(?i)(^|[\s|&(])@?echo\s+(off|on)\b"), "@echo off",
+     "pwsh 不回显脚本，无需这条"),
+)
+# 出现这些就是 PowerShell 写法，绝不改道（防止 `Get-Date -Format "%Y%m%d"` 被 %…% 规则误判）
+_PS_SYNTAX_MARKERS = re.compile(
+    r"(\$|Get-[A-Za-z]|Set-[A-Za-z]|Select-|Where-|ForEach|Out-|Write-|Import-|Measure-|"
+    r"Test-Path|New-Item|Remove-Item|Copy-Item|Get-ChildItem|\|\s*Where)", re.I)
+
+
+def _is_ps_shell(shell):
+    return (shell or "pwsh").strip().lower() in _PS_SHELL_ALIASES
+
+
+# 结尾把"最后一条命令是否成功"反映到退出码（见 _ps_script_text）：pwsh 里 cmdlet 报错是
+# **非终止**错误，脚本照样 exit 0（`Get-ChildItem /b` → rc=0 + 一条错误），模型看不出失败。
+_PS_EPILOGUE_BODY = ("if (-not $?) { $global:__psbad = 1;"
+                     " if ($LASTEXITCODE -and $LASTEXITCODE -ne 0)"
+                     " { $global:__pscode = $LASTEXITCODE } }")
+_PS_EXIT_BODY = ("if ($global:__psbad) {"
+                 " if ($global:__pscode) { exit $global:__pscode } else { exit 1 } }")
+
+
+def _ps_script_text(shell_cmd):
+    """包一层 pwsh 脚本：UTF-8 输出 + **语法预检** + 用户命令 + 退出码回填。
+
+    两处"不这样就会误导模型"的细节：
+    1. 用户命令放在 here-string 里、再用 scriptblock 执行：否则一个未闭合的括号会把
+       结尾的退出码回填一起吞掉，报错里露出来的是我的内部代码（实测
+       `ParserError: …\\tmp\\_pwsh_xxx.ps1:3 … $LASTEXITCODE -ne 0 …`）。
+    2. 语法预检用 `Parser::ParseInput`：模型拿到的是一句干净的
+       「ParserError: “(” 后应为表达式。(第 1 行)」，且行号是它自己的行号。
+    实测语义：`Get-ChildItem /b` → rc=1；`cmd /c exit 2` → rc=2；用户自己 `exit 7` → rc=7。
+    """
+    header = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n"
+    if any(ln.lstrip().startswith("'@") for ln in shell_cmd.splitlines()):
+        # 命令自带 here-string 终止符：无法嵌进 @'…'@，退回"直接执行 + 回填"（语法错略丑）
+        return header + shell_cmd + "\n" + _PS_EPILOGUE_BODY + "\n" + _PS_EXIT_BODY + "\n"
+    return (
+        header
+        + "$__src = @'\n" + shell_cmd + "\n'@\n"
+        + "$__perr = $null\n"
+        + "[void][System.Management.Automation.Language.Parser]::ParseInput("
+          "$__src, [ref]$null, [ref]$__perr)\n"
+        + "if ($__perr -and $__perr.Count) {\n"
+        + "  $__e = $__perr[0]\n"
+        + "  Write-Output ('ParserError: ' + $__e.Message"
+          " + ' (第 ' + $__e.Extent.StartLineNumber + ' 行)')\n"
+        + "  exit 1\n"
+        + "}\n"
+        + "$__full = $__src + \"`n\" + @'\n" + _PS_EPILOGUE_BODY + "\n'@\n"
+        + "& ([scriptblock]::Create($__full))\n"
+        + _PS_EXIT_BODY + "\n"
+    )
+
+
+def _ps_launch(shell_cmd):
+    """启动 pwsh：(argv, 临时脚本路径或 None)。
+
+    **不再用 `-EncodedCommand`**（原实现）：它会把错误流序列化成 CLIXML
+    （`#< CLIXML <Objs…><S S="Error">_x001B_[31;1m…`），任何一次语法错/拼错参数
+    都会让模型收到一坨 XML——它有真实会话为证：看到 CLIXML 后当场判定
+    "PowerShell 不支持 <<EOF"，然后**显式改用 shell='cmd' 并此后再不碰 pwsh**
+    （chat_20260812_175615.json 第 11→13 条、第 17→19 条）。
+
+    改用 `-File`（脚本落 tmp/ 的临时 .ps1，UTF-8-BOM 让 5.1 也认中文）：报错是纯文本，
+    语法错也照样可见（`ParserError: <file>:2`），引号/`$`/`%`/反斜杠路径全部原样，
+    退出码正常传递。写不了临时文件时退回 `-Command <script>`（同样没有 CLIXML，
+    代价是纯语法错只回 rc=1、不回文字）。
+    """
+    script = _ps_script_text(shell_cmd)
+    try:
+        tmp_dir = os.path.join(WORK_DIR, "tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        fd, path = tempfile.mkstemp(prefix="_pwsh_", suffix=".ps1", dir=tmp_dir)
+        with os.fdopen(fd, "w", encoding="utf-8-sig") as f:
+            f.write(script)
+        return [PS_EXE, "-NoProfile", "-NonInteractive", "-File", path], path
+    except Exception as e:  # 目录只读等：退回 -Command，功能不降级
+        log_error("pwsh temp script", e)
+        return [PS_EXE, "-NoProfile", "-NonInteractive", "-Command", script], None
+
+
+def effective_shell(shell_cmd, shell="pwsh"):
+    """(实际会用哪个 shell, cmd 语法提示或 None)。
+
+    给 confirm 弹窗用：让用户在批准前就看到**真正**会跑的解释器。
+    """
+    if _is_ps_shell(shell) and not _PS_SYNTAX_MARKERS.search(shell_cmd):
+        for pattern, label, hint in _CMD_ONLY_SYNTAX:
+            if pattern.search(shell_cmd):
+                return "cmd", (label, hint)
+    return ("pwsh" if _is_ps_shell(shell) else "cmd"), None
+
+
+def exec_shell_win_mock(shell_cmd, shell="pwsh", q=None):
     """Execute shell command with real-time output pushed to q (TUI live shell queue).
-    shell='cmd' (default) → cmd.exe; shell='powershell' → powershell.exe, UTF-8 output forced."""
+
+    shell='pwsh'（默认）→ PowerShell 7（没装则退回系统自带 5.1），UTF-8 输出；
+    shell='cmd' → cmd.exe。默认之所以是 pwsh：cmd 是 1993 年的解析器（无对象管道、
+    无 UTF-8、无 try/catch、%VAR% 展开），而模型写 cmd 语法时会被下面的兼容层接住并
+    附上 pwsh 写法——反过来（默认 cmd、让模型自觉改用 pwsh）实测不会发生。
+    """
     if q:
         q.put(("shell_start", shell_cmd))
 
-    # 模型可能发 PowerShell/ps/pwsh（本地模型无视 schema enum），统一归一化，其余值走 cmd
-    if (shell or "cmd").strip().lower() in ("powershell", "ps", "pwsh"):
-        # -EncodedCommand = base64(UTF-16LE)：整脚本做单参数传，绕开 PowerShell 引号解析。
-        # 前置一行强制管道输出 UTF-8（pwsh 本就 UTF-8；仅 5.1 兜底分支必需）。
-        script = "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n" + shell_cmd
-        argv = [PS_EXE, "-NoProfile", "-NonInteractive", "-EncodedCommand",
-                base64.b64encode(script.encode("utf-16-le")).decode("ascii")]
-        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+    shell_used, cmd_hint = effective_shell(shell_cmd, shell)
+    if cmd_hint:
+        # 兼容层：用 cmd 跑，但把"这是什么语法 + pwsh 怎么写"回给模型
+        payload = json.loads(exec_shell_win_mock(shell_cmd, shell="cmd", q=q))
+        note = (f"[note] 命令被识别为 cmd 语法（{cmd_hint[0]}），已用 cmd.exe 执行；"
+                f"pwsh 等价写法：{cmd_hint[1]}。若要固定用 cmd 请显式带 shell='cmd'。")
+        payload["note"] = (note + " " + payload["note"]) if payload.get("note") else note
+        payload["shell_used"] = "cmd"
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    if _is_ps_shell(shell):
+        argv, _tmp_script = _ps_launch(shell_cmd)
+        # stderr 单独接管：与 stdout 合并时 PowerShell 会把错误流写成 CLIXML（见 _ps_launch）
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace", bufsize=1)
+        if _tmp_script:
+            _cleanup = lambda: os.path.exists(_tmp_script) and os.remove(_tmp_script)
+        else:
+            _cleanup = None
     else:
+        _cleanup = None
         proc = subprocess.Popen(
             shell_cmd, shell=True,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", errors="replace", bufsize=1,
         )
 
     # 读输出放后台线程 → queue；主循环短轮询，同时检查 Esc 与 120s 截止时间。
     # 原实现 for line in proc.stdout 阻塞 readline，静默挂死的命令绕开超时与中断。
     lines_q = queue.Queue()
+    eof_needed = 0
 
-    def _reader():
+    def _reader(stream):
         try:
-            for line in proc.stdout:
+            for line in stream:
                 lines_q.put(line)
         except Exception as e:
             log_error("exec_shell reader", e)
         finally:
             lines_q.put(None)  # EOF 哨兵
 
-    threading.Thread(target=_reader, daemon=True).start()
+    for stream in (proc.stdout, proc.stderr):
+        if stream is None:
+            continue
+        eof_needed += 1
+        threading.Thread(target=_reader, args=(stream,), daemon=True).start()
 
     all_lines = []
     interrupted = False
     timed_out = False
+    eofs = 0
     deadline = time.monotonic() + 120
     while True:
         if interrupt_event.is_set():  # 用户按 Esc：杀掉子进程
@@ -105,8 +248,11 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
             line = lines_q.get(timeout=0.2)
         except queue.Empty:
             continue
-        if line is None:  # EOF，正常结束
-            break
+        if line is None:  # 某条流 EOF；两条都收完才算结束
+            eofs += 1
+            if eofs >= eof_needed:
+                break
+            continue
         line = strip_terminal_escapes(line)  # 中和控制序列后再入缓冲区/上屏（V13）
         all_lines.append(line)
         if q:
@@ -118,6 +264,11 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+    if _cleanup:  # 临时 .ps1 用完即删（不留垃圾在 tmp/）
+        try:
+            _cleanup()
+        except Exception as e:
+            log_error("pwsh temp script cleanup", e)
 
     stdout_text = "".join(all_lines)
 
@@ -135,6 +286,8 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
         "success": proc.returncode == 0,
         "interrupted": interrupted,
         "timed_out": timed_out,
+        # 告诉模型"这次到底是谁跑的"：默认已是 pwsh，写 cmd 语法会被兼容层接住并注明
+        "shell_used": "pwsh" if _is_ps_shell(shell) else "cmd",
     }
     # 管道陷阱（实测两次把 agent 卡在这上面）：
     # ① cmd.exe 的 returncode 取自管道**最后一个**命令，所以
