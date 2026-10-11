@@ -110,6 +110,23 @@ agent/
 - 退出码回填：pwsh 的 cmdlet 报错是非终止错误，`_PS_EPILOGUE_BODY`/`_PS_EXIT_BODY` 负责让 rc≠0；
   `cmd /c exit 2` → 2、用户 `exit 7` → 7 保持原样（有测试钉着）。
 
+### 4.6 思考面板的块与块级选择（v2.18 起，改折叠必看）
+思考面板 `PanelLog` 的内容是"块列表 + 平铺正文"：块头以 `("h", ThinkBlock)` 混在 `_history` 里，
+正文照旧平铺其后（所以折行/残尾/重排全沿用旧机制）。`begin_block` 开新块时把上一块
+`collapsed=True`（渐进披露），折叠块只渲染标题 + 正文尾部预览（`_TAIL_KEEP`）。
+
+- **键位分两层**：`j`/`k`/`Enter`/`空格` 绑在 `PanelLog` 上（**只有面板获得焦点时才响应**，
+  输入框里打字不会误触发）；`z`（整体切换）/`o`（展开全部）留在 App 上，输入框里也能按。
+- **块光标**：`self._cursor`（`_blocks` 下标，`begin_block` 时跟到最新块）。选中块标题反白
+  （`_block_title` 里判断），`focus_block()` 移动后 reflow + `_scroll_to_cursor()`。
+- **鼠标点标题**：`on_click` → `_line_index_at(event)`（鼠标 y 减边框、加 `scroll_offset.y`）
+  → `block_at_line()` → `is_title_click()`。**两个易错点**：
+  1. `_block_line`（块 key → 标题行号）必须在**每次 reflow 时重建**，且 `max_lines` 裁掉
+     行首时要同步上移（`flush_pending` 里的 `drop`），否则点谁都折第一块；
+  2. 折叠态的块要把**尾部预览那一行**也算进点击区，否则"看得见却点不动"。
+- 折叠态判定同样靠 `_tail_history`：窗口若从块体中间开始会**往前补块头**，否则重排不知道
+  这一块是折叠的、会把折起的内容整段铺回来。
+
 ### 5. 上下文压缩三层（v2.13 新增，改这里务必看懂）
 `loop_agent_core/compaction.py` 是叶子，`context._prep_context()` 是唯一入口，`runner.chat_impl` 的两个调用点都走它。
 
@@ -156,6 +173,7 @@ agent/
 ```bash
 python test_code_index.py    # 全过（XML/DSML/上下文/rollback/记忆工具 + 压缩契约）
 python test_multi_agent.py   # 7 项全过（多 agent 隔离/事件/守卫）
+python test_tui_markdown.py  # 108 项全过（含第 14 节：块级选择 j/k/Enter + 真鼠标点标题）
 python test_compaction.py    # 36 项全过（L0 去重/L1 分块摘要/L2 兜底/档案/频率预算/失败退避与诊断/会话文件校验）
 python test_runner_visibility.py  # 6 项全过（回合结束必须"看得见"：notice 事件 + edit_file 候补提示）
 python test_shell_tools.py     # 9 项全过（默认 pwsh / cmd 语法改道 + 教学提示 / 错误非 CLIXML / 退出码回填）

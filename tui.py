@@ -373,6 +373,15 @@ class PanelLog(RichLog):
     _MIN_RENDER_WIDTH = 4  # 窄于这个宽度就当作不可见：不折行、不上屏，等变宽再重排
     _STASH_CHARS = 4096  # 不可见时攒够这么多字就并进重播记录（str += 是 O(n)，不能无限攒）
 
+    # 控件级绑定：**只有本面板拿到焦点时才生效**（Textual 会沿 MRO 合并，RichLog 的
+    # 滚动键位不受影响）。这正是"按块操作"该有的作用域——输入框里打字不会误触发。
+    BINDINGS = [
+        Binding("j", "cursor_next_block", "下一块", show=False),
+        Binding("k", "cursor_prev_block", "上一块", show=False),
+        Binding("enter", "toggle_cursor_block", "展开/折叠", show=False),
+        Binding("space", "toggle_cursor_block", "", show=False),
+    ]
+
     class ExpandRequest(Message):
         """Posted when panel is double-clicked."""
         def __init__(self, panel_id: str) -> None:
@@ -395,6 +404,11 @@ class PanelLog(RichLog):
         # 块模型：块头以 ("h", ThinkBlock) 标记项混在 _history 里，正文照旧平铺其后。
         self._blocks: list = []
         self._cur_block = None  # 正在写入的块（流式文本都记在它身上）
+        # 块光标：j/k 移动、Enter 展开/折叠；鼠标单击标题同效（见 on_click）。
+        # 光标块标题行反白，滚动位置自动跟随（_scroll_to_cursor）。
+        self._cursor: int = -1
+        self._block_line: dict = {}  # 块 key → 在 self.lines 里的行号，reflow 时重建
+        self._last_title_click: float = 0.0
 
     @staticmethod
     def _safe_strip(text):
@@ -679,8 +693,12 @@ class PanelLog(RichLog):
                                for line in pending])
             pending.clear()
             if self.max_lines is not None and len(self.lines) > self.max_lines:
-                self._start_line += len(self.lines) - self.max_lines
+                drop = len(self.lines) - self.max_lines
+                self._start_line += drop
                 self.lines = self.lines[-self.max_lines:]
+                # 行号会整体上移：鼠标点击的落点映射要跟着修，否则点到隔壁块
+                for k in list(self._block_line):
+                    self._block_line[k] = max(0, self._block_line[k] - drop)
 
         def flush_block() -> None:
             if not chunks:
@@ -700,13 +718,20 @@ class PanelLog(RichLog):
                     super(PanelLog, self).write("[dim]...[/dim]", width=width, scroll_end=False)
 
         collapsed = False
+        self._block_line = {}  # 每次重排重建：块 key → 标题行在 self.lines 里的下标
         for kind, payload in self._tail_history(width):
             if kind == "h":
                 # 块头：先把上一块的正文铺完，再决定本块是整段铺开还是只留标题+预览
                 flush_block()
                 flush_pending()
+                before = len(self.lines)
                 if payload.has_header:
                     write_rich(self._block_title(payload))
+                    # 标题渲染成 "\n── … ──"（首行空行），标题落在最后一行的位置
+                    self._block_line[payload.key] = max(before, len(self.lines) - 1)
+                else:
+                    # 会话首个块没有标题行：块体从当前行开始
+                    self._block_line[payload.key] = before
                 collapsed = payload.collapsed
                 if collapsed:
                     preview = self._preview_text(payload, width)
@@ -747,6 +772,7 @@ class PanelLog(RichLog):
         block = ThinkBlock(key, label, has_header)
         self._blocks.append(block)
         self._cur_block = block
+        self._cursor = len(self._blocks) - 1  # 块光标跟着最新块走（打开就能看到高亮）
         self._history.append(("h", block))
         self._trim_history()
         if self._text_width():
@@ -763,7 +789,10 @@ class PanelLog(RichLog):
             self._cur_block.add_tool(name)
 
     def _block_title(self, block: ThinkBlock) -> str:
-        """块标题行，如 `── ▸ Round 3 · edit_file · 1.2k 字 · 4.1s ──`。"""
+        """块标题行，如 `── ▸ Round 3 · edit_file · 1.2k 字 · 4.1s ──`。
+
+        光标块（j/k 选中的那一块）反白显示，让人一眼看到"选中的是哪一轮"。
+        """
         arrow = "▸" if block.collapsed else "▾"
         bits = [f"{arrow} {block.label}"]
         if block.tools:
@@ -771,7 +800,10 @@ class PanelLog(RichLog):
         bits.append(self._fmt_chars(block.chars))
         if block.duration >= 0.1:
             bits.append(f"{block.duration:.1f}s")
-        return f"\n[dim]── {escape(' · '.join(bits))} ──[/dim]"
+        body = escape(" · ".join(bits))
+        if self._cursor_block() is block:
+            return f"\n[bold reverse]▶ {body} ◀[/bold reverse]"
+        return f"\n[dim]── {body} ──[/dim]"
 
     @staticmethod
     def _fmt_chars(n: int) -> str:
@@ -815,7 +847,113 @@ class PanelLog(RichLog):
         else:
             self.collapse_all()
 
+    # -- 块光标：选一轮、只展开那一轮 --
+
+    def _cursor_block(self):
+        if 0 <= self._cursor < len(self._blocks):
+            return self._blocks[self._cursor]
+        return None
+
+    def focus_block(self, delta: int) -> None:
+        """移动块光标（j/k）。还没选过时按方向落到最近的一端。"""
+        if not self._blocks:
+            return
+        if self._cursor < 0:
+            self._cursor = len(self._blocks) - 1 if delta < 0 else 0
+        else:
+            self._cursor = max(0, min(len(self._blocks) - 1, self._cursor + delta))
+        if self._text_width():
+            self.reflow()  # 反白高亮在标题行里，得重铺才知道选中了谁
+        self._scroll_to_cursor()
+
+    def _scroll_to_cursor(self) -> None:
+        blk = self._cursor_block()
+        line = self._block_line.get(blk.key) if blk is not None else None
+        if line is None or line < 0:
+            return
+        try:
+            self.scroll_to(y=max(0, line - 1), animate=False, immediate=True)
+        except Exception:
+            pass
+
+    def toggle_block(self, block) -> None:
+        """只展开/折叠这一块，其它块不受影响（Enter 与鼠标单击标题都走这里）。"""
+        block.collapsed = not block.collapsed
+        if self._text_width():
+            self.reflow()
+        self._scroll_to_cursor()
+
+    def block_at_line(self, line_idx: int):
+        """这一行属于哪一块（块按时间顺序排；标题行算它自己）。"""
+        if line_idx is None or line_idx < 0:
+            return None
+        found = None
+        for b in self._blocks:
+            start = self._block_line.get(b.key)
+            if start is None:
+                continue
+            if start <= line_idx:
+                found = b
+            else:
+                break
+        return found
+
+    def _line_index_at(self, event) -> int:
+        """鼠标 y → self.lines 下标（扣掉边框，加上滚动）。"""
+        try:
+            off = event.y - (self.content_region.y - self.region.y)
+            return int(self.scroll_offset.y + off)
+        except Exception:
+            return -1
+
+    def action_cursor_next_block(self) -> None:
+        self.focus_block(1)
+
+    def action_cursor_prev_block(self) -> None:
+        self.focus_block(-1)
+
+    def action_toggle_cursor_block(self) -> None:
+        blk = self._cursor_block()
+        if blk is None and self._blocks:
+            self._cursor = len(self._blocks) - 1
+            blk = self._cursor_block()
+        if blk is not None:
+            self.toggle_block(blk)
+
+    def on_focus(self) -> None:
+        """把块操作键位写在边框副标题上——不然没人知道能选块（用户就是这么反馈的）。"""
+        if self.panel_id == "think-panel":
+            self.border_subtitle = " j/k 选块 · Enter 展开 · 单击标题 · z 全折/全开 "
+
+    def on_blur(self) -> None:
+        if self.panel_id == "think-panel":
+            self.border_subtitle = ""
+
+    def is_title_click(self, block, line_idx: int) -> bool:
+        """这一行是不是"该块的标题点击区"：标题行本身（折叠态再加上尾部预览行）。
+
+        单击展开/折叠的落点判据。抽成方法是为了能被测试直接钉住——点正文不该折块
+        （正文上的单击要留给"双击放大面板"）。
+        """
+        if block is None or not block.has_header or line_idx is None:
+            return False
+        title = self._block_line.get(block.key)
+        if title is None:
+            return False
+        return title <= line_idx <= title + (1 if block.collapsed else 0)
+
     def on_click(self, event) -> None:
+        # 单击块标题（折叠态的块含它的预览行）= 展开/折叠那一块。这是"选一轮来看"的
+        # 鼠标入口；落点不在标题上时保持原有的双击放大面板手势。
+        line_idx = self._line_index_at(event)
+        blk = self.block_at_line(line_idx)
+        if self.is_title_click(blk, line_idx):
+            now = time.monotonic()
+            if now - self._last_title_click > 0.35:  # 双击标题只折一次
+                self._cursor = self._blocks.index(blk)
+                self.toggle_block(blk)
+            self._last_title_click = now
+            return
         now = time.monotonic()
         if self._last_click and now - self._last_click < 0.4:
             self.post_message(self.ExpandRequest(self.panel_id))
@@ -987,6 +1125,7 @@ class AgentTUI(App):
         Binding("ctrl+j", "submit_input", "Send"),
         Binding("ctrl+t", "toggle_think_panel", "Fold Think", show=False),
         Binding("z", "toggle_think_blocks", "Fold Blocks", show=False),
+        Binding("o", "expand_think_blocks", "Expand Blocks", show=False),
         Binding("`", "toggle_shell", "Shell"),
     ]
 
@@ -1252,12 +1391,12 @@ class AgentTUI(App):
             self._restore_panels()
 
     def action_toggle_think_blocks(self) -> None:
-        """z：思考块在"展开全部 / 折叠全部"之间切换。
-
-        已完成块默认自动折叠（只留标题 + 尾部预览），这里给一个整体展开的入口；
-        块级逐条导航留到后续阶段。
-        """
+        """z：思考块在"展开全部 / 折叠全部"之间切换（整体操作）。"""
         self.query_one("#think-panel", PanelLog).toggle_all()
+
+    def action_expand_think_blocks(self) -> None:
+        """o：展开全部块（幂等）。想看某一轮就用 2 聚焦思考面板后 j/k + Enter。"""
+        self.query_one("#think-panel", PanelLog).expand_all()
 
     def action_toggle_think_panel(self) -> None:
         """Ctrl+T：折叠/展开思考面板（同一按键来回切换，再按一次即恢复）。
@@ -1618,6 +1757,9 @@ class AgentTUI(App):
   Tab         切换焦点到下一个组件
   Ctrl+J      发送消息（Enter 换行）
   Ctrl+T      折叠/展开思考面板（再按一次即恢复）
+  z / o       思考块整体折叠 / 展开全部
+  2 → j / k   聚焦思考面板后上下选块（选中的标题反白）
+  Enter       展开/折叠选中的那一块（鼠标单击标题同样可以）
   `           展开/收起 Shell 终端面板
   Esc         折叠展开的面板
   双击面板     展开/恢复该面板

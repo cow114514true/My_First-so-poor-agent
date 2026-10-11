@@ -17,6 +17,7 @@ harness 驱动真实的 AgentTUI，喂入 runner.py 实际发出的事件序列�
   11. 大文本量下的展开/收回：不可见的面板不重排、整段批量铺行
   12. 思考面板折叠（Ctrl+T）：折叠只改宽度不动内容、轮次徽标、展开态互斥
   13. 折叠的边角：焦点让位（0 宽控件）、跨问题轮次重数、/clear 归零
+  14. 块级选择：j/k 选一轮、Enter/单击标题只展开那一轮（z/o 仍是整体操作）
 退出码非 0 = 失败。
 """
 import asyncio
@@ -757,6 +758,117 @@ async def run() -> None:
               and len(think.lines) == 0 and "(1)" not in (think.border_title or ""),
               f"count={app._think_round_count} 行={len(think.lines)} "
               f"title={think.border_title!r}")
+
+        print("14. 块级选择：j/k 选一轮、Enter/单击标题只展开那一轮")
+        # 用户反馈原话："不知道怎么选中特定回合展开" —— 只有 z（全折/全开）时确实是
+        # 全有或全无，所以这里钉住"能选中单块"的三条入口：键盘光标、Enter、鼠标单击。
+        app._restore_panels()
+        await pilot.pause(0.2)
+        think.clear()
+        app._think_round = None
+        for rnd in (1, 2, 3):
+            for ch in f"第{rnd}轮的思考内容":
+                app._handle_event({"type": "thinking_chunk", "content": ch, "round": rnd})
+            app._flush_think()
+        await pilot.pause(0.3)
+        check("三个块都建出来了", len(think._blocks) == 3, f"{len(think._blocks)} 块")
+        check("光标默认落在最新块上", think._cursor == 2, f"cursor={think._cursor}")
+        check("已完成块自动折叠", [b.collapsed for b in think._blocks] == [True, True, False],
+              f"{[b.collapsed for b in think._blocks]}")
+
+        app.action_focus_panel("think")
+        await pilot.pause(0.3)
+        check("聚焦思考面板时边框副标题给出键位提示",
+              "j/k" in (think.border_subtitle or ""), f"{think.border_subtitle!r}")
+
+        await pilot.press("k")
+        await pilot.pause(0.3)
+        check("k 把光标上移一块", think._cursor == 1, f"cursor={think._cursor}")
+        picked = think._blocks[1]
+        rendered = "".join("".join(s.text for s in ln) for ln in think.lines)
+        check("选中的块标题反白标记出现在屏幕上",
+              rendered.count("▶") == 1 and "Round 2" in rendered.split("▶")[1][:40],
+              f"▶×{rendered.count('▶')}")
+
+        before = [b.collapsed for b in think._blocks]
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        after = [b.collapsed for b in think._blocks]
+        check("Enter 只翻转选中那一块", before[1] and not after[1] and before[0] == after[0]
+              and before[2] == after[2], f"{before} -> {after}")
+        check("展开的那一块正文回到屏幕上", "第2轮的思考内容" in
+              "".join("".join(s.text for s in ln) for ln in think.lines), "")
+
+        # 鼠标入口：行号 → 块 的映射（点标题行只折它自己；点正文不折、留给双击放大）
+        title_line = think._block_line[picked.key]
+        check("标题行映射回它自己", think.block_at_line(title_line) is picked,
+              f"line={title_line}")
+        check("展开态只有标题行算点击区",
+              think.is_title_click(picked, title_line) and not picked.collapsed
+              and not think.is_title_click(picked, title_line + 3),
+              f"title={title_line} collapsed={picked.collapsed}")
+        picked.collapsed = True
+        think.reflow()
+        await pilot.pause(0.2)
+        check("折叠态连尾部预览行一起算点击区（否则预览行点了没反应）",
+              think.is_title_click(picked, title_line + 1)
+              and not think.is_title_click(picked, title_line + 2),
+              f"title={title_line}")
+        picked.collapsed = False  # 还原成 [True, False, False]，后面几条断言要干净状态
+        think.reflow()
+        await pilot.pause(0.2)
+
+        think._cursor = 0
+        await pilot.press("enter")
+        await pilot.pause(0.3)
+        check("再选第一块并展开（逐块独立）",
+              [b.collapsed for b in think._blocks] == [False, False, False],
+              f"{[b.collapsed for b in think._blocks]}")
+
+        await pilot.press("z")
+        await pilot.pause(0.3)
+        check("z 仍是整体折叠（当前块除外）",
+              [b.collapsed for b in think._blocks] == [True, True, False],
+              f"{[b.collapsed for b in think._blocks]}")
+        await pilot.press("o")
+        await pilot.pause(0.3)
+        check("o 展开全部（幂等）", all(not b.collapsed for b in think._blocks),
+              f"{[b.collapsed for b in think._blocks]}")
+
+        # 真鼠标点击：坐标换算（边框 + 滚动）必须落到"那一行"，否则点谁都折第一块
+        think.expand_all()
+        await pilot.pause(0.3)
+        target = think._blocks[1]
+        click_line = think._block_line[target.key]
+        click_y = 1 + (click_line - int(think.scroll_offset.y))  # +1 = 上边框那一行
+        collapsed_before = [b.collapsed for b in think._blocks]
+        await pilot.click("#think-panel", offset=(3, max(0, click_y)))
+        await pilot.pause(0.3)
+        collapsed_after = [b.collapsed for b in think._blocks]
+        check("真鼠标点标题行：只有被点的那一块折叠",
+              (not collapsed_before[1]) and collapsed_after[1]
+              and collapsed_after[0] == collapsed_before[0]
+              and collapsed_after[2] == collapsed_before[2],
+              f"y={click_y} {collapsed_before} -> {collapsed_after}")
+
+        # 点正文不该折块（留双击放大面板）。用**最后一块**的正文行：它下面没有别的块，
+        # 不会因为上一块折叠导致行号移位而误点到隔壁块的标题。
+        think.expand_all()
+        await pilot.pause(0.3)
+        last = think._blocks[-1]
+        body_y = 1 + (think._block_line[last.key] + 1 - int(think.scroll_offset.y))
+        collapsed_before = [b.collapsed for b in think._blocks]
+        await pilot.click("#think-panel", offset=(3, max(0, body_y)))
+        await pilot.pause(0.3)
+        check("真鼠标点正文不会折块",
+              [b.collapsed for b in think._blocks] == collapsed_before,
+              f"y={body_y} {collapsed_before}")
+
+        keys = {b.key for b in PanelLog.BINDINGS}
+        check("块操作键位绑在面板上（只在聚焦时生效）",
+              {"j", "k", "enter", "space"} <= keys, f"{sorted(keys)}")
+        check("整体操作键位留在 App 上（输入框里也能按）",
+              {"z", "o"} <= {b.key for b in AgentTUI.BINDINGS}, "")
 
 
 def main() -> None:
