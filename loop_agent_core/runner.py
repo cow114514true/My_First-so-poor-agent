@@ -6,8 +6,10 @@ import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .config import _is_local_backend, client, cfg, WORK_DIR
+from .compaction import cstate, next_turn
 from .control import interrupt_event
-from .context import _append_msg, _prune_cap, _prune_messages, _rollback_tool_round
+from .context import (_append_msg, _prep_context, _prune_cap, _prune_messages,
+                      _rollback_tool_round)
 from .events import _default_on_event
 from .schemas import tools
 from .tokens import estimate_tokens
@@ -97,7 +99,7 @@ def _store_tool_args(name, arguments):
     return arguments
 
 
-_WORKER_FORBIDDEN = ("delegate_task", "recall", "remember")  # worker 内禁用的工具
+_WORKER_FORBIDDEN = ("delegate_task", "recall", "remember", "recall_archive")  # worker 内禁用的工具
 _SYNC_MAX = 8  # 同步工具并发上限（工具多为 I/O 密集，线程池并发即够）
 _TOOL_TIMEOUT = 150  # 单工具结果超时（秒）：browser/ds_web 内部无兜底会卡死线程，这里兜底
 _WORKER_TIMEOUT = 600  # 子 agent 超时（秒）：长任务给足 10 分钟，防误杀合法委托
@@ -276,8 +278,13 @@ def _safe_create(conv, **kwargs):
 
 
 def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
-              default_on_event=_default_on_event,is_main_session=False):
-    """主循环实现。API 调用一律 messages=conv["messages"]（worker 隔离）。"""
+              default_on_event=_default_on_event, is_main_session=False,
+              summarize_fn=None):
+    """主循环实现。API 调用一律 messages=conv["messages"]（worker 隔离）。
+
+    summarize_fn(prefix, block_msgs) 由薄壳注入，用于 L1 分块滚动摘要；
+    为 None（或非主会话）时只做 L0 去重 + L2 硬裁剪。
+    """
     def _emit(event):
         if on_event:
             on_event(event)
@@ -288,6 +295,16 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     conv["_empty_retries"] = 0  # thinking-only 回合的重试计数（有界，防死循环）
     if conv["size"] is None:
         conv["size"] = estimate_tokens(json.dumps(conv["messages"], ensure_ascii=False))
+    # 三层压缩（L0/L1）只在主会话启用；worker 会话生命周期短，本轮不压。
+    # L2 硬裁剪对两者都生效（worker 原先也走 _prune_messages）。
+    active_summarize = summarize_fn if is_main_session else None
+    conv["_user_turn"] = next_turn(conv)
+    # 压缩记账必须挂在跨轮存活的 _compact_state 上：conv 每次 chat() 都是新建的包装 dict，
+    # 直接写在 conv 上会让计数器每轮归零（MIN_ROUNDS/MAX_PER_SESSION 退化成"每轮"口径）
+    _st = cstate(conv)
+    _st.setdefault("_compact_count", 0)
+    _st.setdefault("_dedup_saved", 0)
+    _st.setdefault("_compact_last_turn", None)
     # 添加用户问题（记忆注入合并进问题文本，避免额外 user 消息破坏 user/assistant 交替协议）
     if is_main_session and not any(
         m.get("role") == "user" and "[长期记忆" in str(m.get("content", ""))
@@ -308,10 +325,8 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         tool_round += 1
         if interrupt_event.is_set():  # 用户已按 Esc 中断
             return "[Interrupted by user]"
-        # 每次 API 调用前裁剪旧内容（超预算时）
-        q_idx, pruned = _prune_messages(_prune_cap(), q_idx, conv)
-        if pruned:
-            _emit({"type": "pruned", "removed": pruned})
+        # 每次 API 调用前整理上下文：L0 去重 → L1 分块摘要 → L2 硬裁剪
+        q_idx, pruned = _prep_context(_prune_cap(), q_idx, conv, active_summarize, _emit)
         # 流式调用：思考/正文边生成边上屏，工具调用在流结束时统一解析
         response = _safe_create(conv, model=cfg["model"], messages=conv["messages"], stream=True,
                                 tools=tools, stream_options={"include_usage": True}, **cfg["extra_kwargs"])
@@ -441,9 +456,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     for final_round in range(12):
         if interrupt_event.is_set():  # 用户已按 Esc 中断
             return "[Interrupted by user]"
-        q_idx, pruned = _prune_messages(_prune_cap(), q_idx, conv)
-        if pruned:
-            _emit({"type": "pruned", "removed": pruned})
+        q_idx, pruned = _prep_context(_prune_cap(), q_idx, conv, active_summarize, _emit)
         response_stream = _safe_create(conv, model=cfg["model"], messages=conv["messages"], stream=True,
                                        tools=tools, stream_options={"include_usage": True}, **cfg["extra_kwargs"])
 

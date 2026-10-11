@@ -200,6 +200,107 @@
 1. **错误要能看见**——吞错的 finally 修成落日志（Bug 20），400 落盘（Bug 10），被过滤内容落盘 `debug_filtered.txt`（`runner._dump_filtered`）。看不见的 bug 等于不存在。
 2. **本地后端是压力测试器**——OpenAI 协议的每个"标准假设"（流式空 choices、XML 工具调用、合成 id）几乎都是本地 Qwen 先踩出来的，DeepSeek 反而没炸过。
 3. **修复必须留回归**——四个测试套件 + `run_tests.py` 一键跑，每个 Bug 9/11/12/18/21 都有对应断言，防止下个功能把它们又放出来。
+### Bug 23. 压缩后的 span 起点落在 assistant 上 → 当前问题被错位到 assistant 之后
+- **现象**：L1 摘要的区间起点若落在一个 `assistant` 消息上（该轮的第一个 `user` 被留在上下文里），
+  摘要替换后保留部分就以"孤儿 assistant"开头；再叠加末尾未吸附到组边界，最终历史变成
+  "… → assistant → 当前问题"，语义断裂且模型失去该轮的意图。
+- **怎么发现**：`test_apply_and_expand_roundtrip` 断言 `msgs[new_q]` 必须是 user 且含当前问题，直接挂掉；
+  手工打印 `_find_groups` 才看清起点是 `assistant`（用户轮的第一个 user 排在被选中的组之外）。
+- **修复**：`compaction_span()` 两条硬规矩 —— 起点必须落在某轮的第一个 `user`（逐个 pop 候选组，
+  连续多条 user 时也要能前移到最后一个候选）、末尾必须吸附到 `_find_groups()` 的组边界。
+- **回归**：`test_span_never_cuts_tool_chain`、`test_apply_and_expand_roundtrip`。
+
+### Bug 24. 滚动摘要的前缀无界 → "单次摘要输入上限"形同虚设
+- **现象**：`run_rolling_summary` 把前序所有块的摘要拼接成前缀喂给下一块，前缀随块数线性增长
+  （实测 385 → 770 → 1155 token…）。看起来每块输入受限，实际总输入无界，`COMPACT_BLOCK_TOKENS`
+  这道防线被绕过，正是 arXiv 2605.23296 指出的"摘要保留率随输入断崖下跌"的成因。
+- **怎么发现**：测试断言"每次调用的输入 ≤ 块上限"时，第 3 块实测 1579 token（块本身只有 ~100）。
+- **修复**：`bounded_prefix()` 把累计摘要按 token 预算二分截断（**保留尾部**，越近的工作越重要），
+  并在前缀首部留省略标记。
+- **回归**：`test_rolling_summary_calls_and_prefix_stability`（断言前缀 token 有界且带省略标记）。
+
+### Bug 25. 每次压缩产生两条重复档案（`record_archive` 被调两次）
+- **现象**：一次压缩后 `_archive` 出现两条内容相同的条目，`/expand` 只还原一条、另一条残留，
+  档案体积与 `COMPACT_ARCHIVE_MAX_CHARS` 预算都被浪费一倍。
+- **怎么发现**：全链路冒烟脚本打印 `archive entries: 2`（预期 1）。
+- **修复**：`apply_compaction` 内部已记录档案，`_prep_context` 里那次多余的 `record_archive` 删除。
+- **回归**：`test_prep_context_chains_l0_then_l1` 断言 `len(conv["_archive"]) == 1`。
+
+### Bug 26. `[Context trimmed]` 计数被下次裁剪抹掉
+- **现象**：反复裁剪时提示被**重写**成"已删除 N 条"（最后一次的数量），模型只看到最新数字，
+  低估自己累计丢了多少历史；而该提示正是模型判断"是否需要重新获取信息"的唯一依据。
+- **怎么发现**：写测试时检查 `render_prune_notice` 的累加语义，发现旧实现直接 `format` 覆盖。
+- **修复**：`render_prune_notice()` 解析已有前缀计数并**累加**，同时保持问题原文在提示之后。
+- **回归**：`test_trim_notice_accumulates`、`test_disabled_matches_legacy_prune`。
+
+### Bug 27. 摘要输出预算不足 → 整次压缩恒失败（"压缩失败（summarizer_failed）"刷屏之一）
+
+- **现象**：真实长会话里每次压缩都在几秒后失败并回退硬裁剪，同样的输入重试永远失败；
+  面板上连续出现"正在压缩上下文（4~5 块）… / 压缩失败（summarizer_failed）"。
+- **怎么发现**：`summarize_block` 的 `except` 只 `print` 原始异常，而 TUI 下 stdout 被界面覆盖 —— 等于把证据丢了。
+  于是用真实会话原文复现一次摘要调用，直接打印响应元数据，一次就看到了根因：
+  `finish_reason=length`、`completion_tokens=1500`（正好等于 `COMPACT_MAX_TOKENS`）、
+  `reasoning_tokens=680`、缺 3 个小标题。
+- **根因**：两个叠加的预算问题。(a) `COMPACT_MAX_TOKENS=1500` 小于一个 ~7.6k token 真实块所需的
+  摘要输出量（实测需要 1761，含思考）。(b) `deepseek-v4-flash` **默认就开思考**，把近一半输出预算
+  花在 `reasoning_content` 上。截断后的摘要缺小标题 → `validate_summary` 不过 → 按"失败即整体放弃"
+  设计作废整次压缩；下一轮再拿同样大小的块重试，于是永远失败。
+- **修复**：默认值按论文的"摘要输出几乎不随输入变化"给足（DS `3000` / 本地 `1500`）；
+  被截断时**升级一次**预算（`COMPACT_MAX_TOKENS_HARD`）重试；给摘要器下发
+  `extra_body={"thinking":{"type":"disabled"}}`（仅云端后端，后端不认则自动摘掉重试）；
+  小标题已齐、仅末尾被切时直接采用，不白扔调用。
+- **回归**：`test_summarize_block_escalates_on_truncation`、`test_summarize_block_drops_unsupported_param`。
+  真实 API 复核：同一块由"失败"变为成功（5 个小标题齐全，1130 token 输出）。
+
+### Bug 28. 失败重试风暴 + 频率预算被"每轮归零"废掉（刷屏主因）
+
+- **现象**：一轮长任务里每隔一个工具调用就打印一条"正在压缩上下文（N 块）/ 压缩失败"，
+  一段时间内反复压缩；`COMPACT_MIN_ROUNDS`（最小间隔）看起来完全不起作用。
+- **怎么发现**：读 `runner.chat_impl` 才发现 `conv` 是**每个用户轮新建**的包装 dict
+  （薄壳 `{"messages": messages, "size": _msg_size, ...}`），而 `_compact_count` /
+  `_compact_last_turn` / `_user_turn` 全写在 `conv` 上 → 每轮归零，
+  `interval` 永远不成立、`MAX_PER_SESSION` 实际退化成"每轮上限"。
+  又因为失败路径**不写** `_compact_last_turn`，同一轮的每次 API 调用都会重试一次
+  （一轮 10 次工具调用 = 10 次全量摘要重试，每次 4~5 个 8k 块）。
+- **修复**：压缩记账改挂跨轮存活的 `_session_state["_compact"]`（`compaction.cstate()` 统一取用；
+  没有该键时退回 `conv` 自身，测试与生产路径都不受影响）；失败时记 `_compact_fails` 并设
+  `_compact_retry_turn`（退避 `min_rounds × 2^(连续失败-1)`，封顶 `COMPACT_MAX_BACKOFF`），
+  连续 `COMPACT_MAX_FAILS` 次停用自动 L1（`/compact` 手动解锁，且手动路径清退避）；
+  同类提示每轮只报一次（`_notice_once`）；Esc 中断不计入失败（否则按三次 Esc 就停用 L1）。
+- **回归**：`test_cross_turn_attempt_cadence`（E2E：5 个用户轮只允许 2 次尝试）、
+  `test_compaction_failure_backoff_stops_retry_storm`、`test_compaction_failure_hard_stop_then_manual_reset`、
+  `test_compact_state_survives_new_conv_wrapper`、`test_interrupted_compaction_is_not_a_failure`。
+
+### Bug 29. 压缩失败只有"summarizer_failed"一句话，没有可诊断信息
+
+- **现象**：`compact_failed` 事件只有 `{"reason": "summarizer_failed"}`；接口报错、输出截断、
+  模型没按小标题写、被用户中断，四种完全不同的故障在面板和日志里长得一模一样。
+- **怎么发现**：定位 Bug 27 时几乎无从下手 —— 只能靠另写脚本复现，无法从产品自身拿到任何线索。
+- **修复**：`run_rolling_summary(..., on_error=)` 回传具体原因 + 块号；`summary_reject_reason()`
+  返回 `too_short` / `too_long` / `missing_headings:缺哪些` 等具体原因（`validate_summary` 保留为布尔包装）；
+  `summarize_block` 用 `{"error": ...}` 显式报错；`failure_hint()` 把原因翻成可执行的一句话
+  （"调大 COMPACT_MAX_TOKENS / 调小 COMPACT_BLOCK_TOKENS"…）；失败明细追加写
+  `tmp/compaction_error.log`（TUI 下 `print` 等于丢弃，这是本次定位困难的直接原因）。
+- **回归**：`test_summary_reject_reason_is_specific`、`test_rolling_summary_reports_error_reason`、
+  `test_failure_hint_and_log`。
+
+### Bug 30. `/compact` 把 `cap=0` 传进 L2 → 低于阈值时把历史删光（且连压缩都没试）
+
+- **现象**：`/compact` 在**低于触发阈值**的会话上直接调用，历史被删到只剩 `system` + 当前问题
+  （复现：8 条 → 2 条），而且**一次压缩都没尝试**。
+- **怎么发现**：为 Bug 28 写回归测试时顺手核对 `/compact` 的落点。它是自己在失败提示里
+  推荐的"自救路径"，所以在推荐之前必须先确认它不毁数据。
+- **根因**：`compact_session()` 为了让 L1"强制触发"把 `cap=0` 传给了 `_prep_context`，
+  但 `cap` 是 **L2 的裁剪目标**（L1 的阈值走 `compaction_cap()`，与它无关）。于是
+  "强制"完全没生效，破坏却生效了：`_prune_messages(0, ...)` 的循环条件是
+  `while size > 0`，永远不成立 → 把**所有**可删组删光。
+- **修复**：`cap` 一律用正常的 `_prune_cap()`；"强制"改为 `_prep_context(..., force=True)` →
+  `should_compact(force=True)` 只跳过**排期类**闸门（阈值/间隔/退避/硬停），
+  会话次数上限 `COMPACT_MAX_PER_SESSION` 仍然生效。
+- **顺带删掉的死代码**：原来的"同一轮只压一次" token 闸门 key 只能取 `id(conv)` 或
+  `(轮次, size)`，前者会被 CPython 地址复用骗到，后者会把"上下文未变时显式再来一次 /compact"
+  静默变成无操作（测试实测命中）。它要防的场景已被 interval / backoff / 中断三条闸门覆盖。
+- **回归**：`test_compact_command_never_wipes_history`。
 
 ---
 

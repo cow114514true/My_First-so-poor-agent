@@ -1110,10 +1110,16 @@ class AgentTUI(App):
         filepath = os.path.join(save_dir, filename)
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(_agent_messages, f, ensure_ascii=False, indent=2)
+        # 折叠档案是 sidecar：会话文件仍只有 messages 数组（replay/旧加载逻辑完全不受影响）
+        try:
+            loop_agent_v2.persist_archive_sidecar(filepath)
+        except Exception:
+            pass
 
         # Clean up corrupted files from previous failed saves
         for f in os.listdir(save_dir):
-            if f.startswith("chat_") and f.endswith(".json") and f != filename:
+            if (f.startswith("chat_") and f.endswith(".json")
+                    and not f.endswith(".archive.json") and f != filename):
                 try:
                     with open(os.path.join(save_dir, f), "r", encoding="utf-8") as fh:
                         if not isinstance(json.load(fh), list):
@@ -1133,6 +1139,10 @@ class AgentTUI(App):
         try:
             with open(os.path.join(save_dir, filename), "w", encoding="utf-8") as f:
                 json.dump(_agent_messages, f, ensure_ascii=False, indent=2)
+            try:
+                loop_agent_v2.persist_archive_sidecar(os.path.join(save_dir, filename))
+            except Exception:
+                pass
             self._autosave_counter += 1
         except Exception:
             pass  # autosave 失败不崩 TUI
@@ -1244,6 +1254,11 @@ class AgentTUI(App):
 
         _agent_messages.clear()
         _agent_messages.extend(loaded)
+        # 恢复该会话的折叠档案（sidecar），使 /expand 与 recall_archive 在 /load 后仍可用
+        try:
+            loop_agent_v2.adopt_archive(filepath)
+        except Exception:
+            pass
 
         chat_panel.clear_messages()
         chat_panel.note(f"--- Loaded {os.path.basename(filepath)} ---")
@@ -1287,6 +1302,10 @@ class AgentTUI(App):
         if result == "restore":
             _agent_messages.clear()
             _agent_messages.extend(self._recovery_data)
+            try:
+                loop_agent_v2.adopt_archive(self._recovery_path)
+            except Exception:
+                pass
             chat_panel.note(f"--- Recovered {len(self._recovery_data)} messages from autosave ---")
             chat_panel.replay(self._recovery_data)
             try:
@@ -1315,6 +1334,8 @@ class AgentTUI(App):
         if question == "/clear":
             _agent_messages.clear()
             _agent_messages.append({"role": "system", "content": loop_agent_v2.system_prompt})
+            # 折叠档案属于本次对话：不清掉会让 recall_archive / /expand 拿到上个会话的原文
+            loop_agent_v2.clear_archive()
             self.query_one("#chat-panel", ChatTranscript).clear_messages()
             for pid in ("#think-panel", "#tool-panel"):
                 self.query_one(pid, RichLog).clear()
@@ -1349,6 +1370,26 @@ class AgentTUI(App):
         # /load [name] — load a saved conversation
         if question.startswith("/load"):
             self._cmd_load(question)
+            return
+
+        # /compact — 立即跑一次上下文压缩（越过排期闸门，仍受会话次数上限约束）
+        if question == "/compact":
+            chat_panel = self.query_one("#chat-panel", ChatTranscript)
+            try:
+                chat_panel.note(loop_agent_v2.compact_session())
+            except Exception as e:
+                chat_panel.note(f"压缩出错：{e}", classes="error")
+            self._update_footer()
+            return
+
+        # /expand — 还原最近一次压缩（只还原会话历史，不重绘面板）
+        if question == "/expand":
+            chat_panel = self.query_one("#chat-panel", ChatTranscript)
+            try:
+                chat_panel.note(loop_agent_v2.expand_compaction())
+            except Exception as e:
+                chat_panel.note(f"还原出错：{e}", classes="error")
+            self._update_footer()
             return
 
         # /quit — safe quit with save dialog
@@ -1388,16 +1429,23 @@ class AgentTUI(App):
 
 命令
   /clear      清空对话历史，重置上下文
+  /compact    立即压缩上下文（L0 去重 + L1 分块摘要；不受触发阈值/间隔/退避约束，仍计入会话次数上限）
+  /expand     还原最近一次压缩的原始历史（注意：面板不重绘）
   /load       列出所有可加载的对话（加载前自动保存当前会话）
   /load N     加载指定编号的对话
   /save       立即保存当前对话到 conversations/
   /quit       安全退出（可保存对话）
   /help       显示此帮助信息
 
+上下文管理
+  - L0 去重：重复的工具结果只留最后一份，更早的换成占位符（零信息损失）
+  - L1 压缩：达阈值时把旧历史分块滚动摘要成 [上下文摘要]（模型可用 recall_archive 回取原文）
+  - L2 裁剪：压缩失败或仍超限时，删除旧消息并注入 [Context trimmed]（计数累加）
+
 系统功能
   - 后端：local-3.5 / local-3.6 (Qwen 9B/35B) 或 DeepSeek
   - 跨会话记忆：recall/remember 工具
-  - 11 个工具：9 个基础工具 + recall + remember
+  - 工具：基础工具 + recall/remember + recall_archive（回取被折叠的原文）
   - 纯实现位于 loop_agent_core/ 包，loop_agent_v2.py 为薄壳
 
 ================================================================================"""
@@ -1529,6 +1577,12 @@ class AgentTUI(App):
             "response_chunk": self._h_response_chunk,
             "response_done": self._h_response_done,
             "status": self._h_status,
+            # 上下文管理三层（此前压缩对用户完全不可见）
+            "deduped": self._h_deduped,
+            "compacting": self._h_compacting,
+            "compacted": self._h_compacted,
+            "compact_failed": self._h_compact_failed,
+            "compact_skipped": self._h_compact_skipped,
         }
         if handler := handlers.get(etype):
             handler(event)
@@ -1709,6 +1763,46 @@ class AgentTUI(App):
 
     def _h_status(self, e: dict) -> None:
         self._set_status(e.get("state", "idle"))
+
+    # -- 上下文管理事件（压缩此前对用户完全不可见） --
+
+    def _h_deduped(self, e: dict) -> None:
+        """L0 去重：重复的工具结果被换成占位符（零信息损失的那一层）。"""
+        self.query_one("#chat-panel", ChatTranscript).note(
+            f"🧹 上下文去重：{e.get('replaced')} 处重复工具结果，省 ~{e.get('saved')} token")
+
+    def _h_compacting(self, e: dict) -> None:
+        """L1 摘要开始：每块一次非流式调用，会阻塞十几秒，必须先给反馈。"""
+        self.query_one("#chat-panel", ChatTranscript).note(
+            f"⏳ 正在压缩上下文（{e.get('blocks')} 块）…")
+
+    def _h_compacted(self, e: dict) -> None:
+        self.query_one("#chat-panel", ChatTranscript).note(
+            f"📦 上下文已压缩：{e.get('removed')} 条 → {e.get('after')} token"
+            f"（原 {e.get('before')}，{e.get('blocks')} 块）"
+            + ("；收益偏低，已改用裁剪兜底" if e.get("low_reclaim") else ""))
+
+    def _h_compact_failed(self, e: dict) -> None:
+        """压缩失败：必须给出**具体**原因 + 下一步怎么做（只报"失败"等于让用户干瞪眼）。"""
+        head = f"压缩失败（{e.get('reason')}）"
+        if e.get("block") is not None:
+            head += f" @第{e.get('block') + 1}块"
+        if e.get("attempt"):
+            head += f"，第 {e.get('attempt')}/{e.get('max_attempts')} 次"
+        line = f"{head}：{e.get('hint') or '已回退到硬裁剪'}。"
+        if e.get("disabled"):
+            line += "（可用 /compact 手动重试）"
+        elif e.get("retry_in_turns"):
+            line += f"（{e['retry_in_turns']} 轮后再试）"
+        self.query_one("#chat-panel", ChatTranscript).note(line, classes="notice")
+
+    def _h_compact_skipped(self, e: dict) -> None:
+        reason = loop_agent_v2.skip_label(e.get("reason"))
+        if e.get("reason") == "failed" and e.get("fails") is not None:
+            reason += f"（已连续失败 {e.get('fails')}/{e.get('max_fails')} 次）"
+        elif e.get("reason") == "backoff" and e.get("retry_in_turns"):
+            reason += f"（还需 {e['retry_in_turns']} 轮）"
+        self.query_one("#chat-panel", ChatTranscript).note(f"跳过压缩（{reason}）", classes="note")
 
     # -- helpers --
 

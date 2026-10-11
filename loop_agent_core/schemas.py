@@ -343,3 +343,21 @@ tools.append({
         }
     }
 })
+
+# recall_archive
+tools.append({
+    "type": "function",
+    "function": {
+        "name": "recall_archive",
+        "description": "Search the ORIGINAL text of history that was folded away by context compression. When older messages are compacted they are replaced by a '[上下文摘要]' summary (lossy by design); this tool retrieves the exact pre-fold messages. Use it when the summary is missing a detail you need — a file path, an exact command, an error message, or a decision's rationale. Prefer this over re-reading a file or re-running a command that already ran: a placeholder like '[已省略] ... 逐字节相同' means the content is still available there.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Keyword to match against the archived original messages (file name, function name, command, error text). Use a specific term, not a whole sentence."},
+                "index": {"type": "integer", "description": "Which folded entry to search, by index into the archive list. Default -1 = the most recent fold. Use -2, -3, ... to look further back."},
+                "limit": {"type": "integer", "description": "Maximum number of matching messages to return. Default 3."}
+            },
+            "required": ["query"]
+        }
+    }
+})

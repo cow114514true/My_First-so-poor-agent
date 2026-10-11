@@ -32,6 +32,64 @@ def check_local_llm(timeout=1.0):
         return False, "unreachable"
 
 
+_compact_k_cache = None
+
+
+def _compact_k():
+    """上下文压缩旋钮（惰性求值 + 缓存）。
+
+    **必须惰性**：测试在 import 之后才改环境变量，import 时定死会读不到。
+    同时保证"不新增第二套 ctx 计算"：阈值口径一律是 context._prune_cap() * trigger_ratio。
+    """
+    global _compact_k_cache
+    if _compact_k_cache is not None:
+        return _compact_k_cache
+    local = _is_local_backend()
+
+    def _envi(key, default):
+        v = os.environ.get(key)
+        return int(v) if v not in (None, "") else default
+
+    def _envf(key, default):
+        v = os.environ.get(key)
+        try:
+            return float(v) if v not in (None, "") else default
+        except ValueError:
+            return default
+
+    _compact_k_cache = {
+        # L0 去重
+        "dedup_enabled": _envi("DEDUP_ENABLED", 1),
+        "dedup_min_chars": _envi("DEDUP_MIN_CHARS", 1000),
+        "dedup_min_saved": _envi("DEDUP_MIN_SAVED", 200),
+        # L1 摘要
+        "compact_enabled": _envi("COMPACT_ENABLED", 1),
+        # 0.5 而非 0.7：阈值越晚，单次摘要输入越大、保留率越低（arXiv 2605.23296：96k 输入仅保留 ~3%）
+        "trigger_ratio": _envf("COMPACT_TRIGGER_RATIO", 0.5),
+        # 单次摘要输入的硬上限；本地窗口小，取一半口径
+        "block_tokens": _envi("COMPACT_BLOCK_TOKENS", 4000 if local else 8000),
+        "keep_rounds": _envi("COMPACT_KEEP_ROUNDS", 2 if local else 3),
+        # 输出规模靠结构性控制（max_tokens + 块数），不靠 prompt 请求"写详细点"。
+        # 1500 实测不够：一次 ~7.6k token 的真实块，DeepSeek 产出 1761（含 717 思考）就被
+        # finish_reason=length 截断，缺 3 个小标题 → validate_summary 不过 → 整次压缩作废。
+        # 论文（arXiv 2605.23296）说摘要**输出几乎不随输入变化**，所以这个预算不能按块大小缩放，
+        # 必须按"不变输出量 + 思考开销"给足。
+        "max_tokens": _envi("COMPACT_MAX_TOKENS", 1500 if local else 3000),
+        # 截断时的单次升级上限（只升一次）：宁可多花一次调用，也不要整次压缩白费
+        "max_tokens_hard": _envi("COMPACT_MAX_TOKENS_HARD", 2000 if local else 6000),
+        "min_reclaim": _envf("COMPACT_MIN_RECLAIM", 0.15),
+        # 频率预算：同步压缩可占端到端耗时最高 62%，本地后端尤其不能频繁压
+        "min_rounds": _envi("COMPACT_MIN_ROUNDS", 3),
+        "max_per_session": _envi("COMPACT_MAX_PER_SESSION", 20),
+        # 失败退避：连续失败 max_fails 次即本会话停用 L1（避免"每次工具调用重试一次"的
+        # 刷屏 + 空烧 token；实测踩到）。退避轮数 = min_rounds * 2^(失败次数-1)，封顶 max_backoff。
+        "max_fails": _envi("COMPACT_MAX_FAILS", 3),
+        "max_backoff": _envi("COMPACT_MAX_BACKOFF", 32),
+        "archive_max_chars": _envi("COMPACT_ARCHIVE_MAX_CHARS", 200000),
+    }
+    return _compact_k_cache
+
+
 def _backend_config():
     if os.environ.get("MODEL_BACKEND") == "local-3.5":
         return {
@@ -60,6 +118,10 @@ def _backend_config():
                 "reasoning_effort": "medium",
                 "extra_body": {"thinking": {"type": "enabled"}},
             },
+            # 摘要器专用：deepseek-v4-flash **默认就开思考**（实测 reasoning_tokens 680~717，
+            # 白吃掉近一半输出预算且随时可能把摘要截断）。摘要是有界的机械压缩任务，思考无收益。
+            # 只在云端后端下发：本地 llama.cpp 不认这个参数。后端若拒绝，薄壳会退回不带它的调用。
+            "summary_extra_kwargs": {"extra_body": {"thinking": {"type": "disabled"}}},
             "max_tool_rounds": 16,
             "ctx": 65536
         }

@@ -30,7 +30,11 @@ agent/
 │   │                         #   _parse_xml_tool_calls/_strip_toolcall_xml/_is_garbage_content/_XML_TOOLCALL_RE
 │   ├── validation.py         # validate_tool_result 工具结果自检（含 recall/remember 分支）
 │   ├── context.py            # _append_msg/_find_groups/_is_trim_notice/_prune_messages/_rollback_tool_round
-│   │                         #   （纯函数，只操作传入的 conv dict）
+│   │                         #   （纯函数，只操作传入的 conv dict）+ render_prune_notice（计数累加）
+│   │                         #   + _prep_context：三层总入口（L0 去重 → L1 摘要 → L2 裁剪 + 频率预算）
+│   ├── compaction.py         # 上下文压缩：L0 dedup_tool_results / L1 compaction_span·split_blocks·
+│   │                         #   build_block_prompt·run_rolling_summary·apply_compaction /
+│   │                         #   档案 record_archive·expand_last·find_archive·persist/load_archive
 │   ├── events.py             # _default_on_event、事件类型
 │   ├── runner.py             # chat_impl 主循环、run_tools、_stream_strip_xml、_safe_create、_xml_to_tool_calls
 │   └── memory.py             # 跨会话记忆：_load/_save、recall_mock、remember_mock、build_memory_injection
@@ -64,6 +68,8 @@ agent/
 
 `test_code_index.py`（~25 个符号）：`build_outline`、`extract_function`、`estimate_tokens`、`WORK_DIR`、`read_file_mock`、`count_tokens_mock`、`_parse_xml_tool_calls`、`_strip_toolcall_xml`、`_is_garbage_content`、`_stream_strip_xml`、`_store_tool_args`、`_xml_to_tool_calls`、`_run_tools`、`_append_msg`、`_prune_messages`、`_find_groups`、`_is_trim_notice`、`_prune_cap`、`_rollback_tool_round`、`_DSML_RE`、`messages`、`_msg_size` 等。
 
+**上下文压缩契约（v2.13 新增，v2.14 扩充，薄壳再导出）**：`dedup_tool_results`、`should_compact`、`compaction_span`、`split_blocks`、`apply_compaction`、`expand_last`、`latest_compaction`、`record_archive`、`persist_archive`、`load_archive`、`run_rolling_summary`、`validate_summary`、`summary_reject_reason`、`build_block_prompt`、`compaction_cap`、`placeholder_text`、`cstate`、`next_turn`、`reset_failures`、`failure_hint`、`log_compaction_failure`、`_prep_context`、`render_prune_notice`、`_compact_k`、`_compact_state`、`clear_compact_state`、`persist_archive_sidecar`、`adopt_archive`、`clear_archive`、`expand_compaction`、`compact_session`、`summarize_block`。`chat_impl` 新增 `summarize_fn=None`（**默认值不可去掉**）。工具数 11 → 12（新增 `recall_archive`）。
+
 `test_multi_agent.py`：`tools`、`TOOL_CALL_MAP`、`WORKER_SYSTEM_PROMPT`、`_in_worker`、`delegate_task_mock`、`chat`、`validate_tool_result`；**monkeypatch** `la.chat` / `la.delegate_task_mock`。
 
 `BACKEND_SWITCH_GUIDE.md`：`loop_agent_v2.client.base_url`、`python loop_agent_v2.py` CLI。
@@ -93,6 +99,31 @@ agent/
 ### 4. XML/DSML 清洗链路
 四入口都接 `_strip_dsml`/`_normalize_toolcall_xml`：`_parse_xml_tool_calls`、`_strip_toolcall_xml`、`_stream_strip_xml`、`_is_garbage_content`。Qwen3 复数标签格式（invoke/parameter name=）归一化成旧格式（function=/parameter=）再解析。
 
+### 5. 上下文压缩三层（v2.13 新增，改这里务必看懂）
+`loop_agent_core/compaction.py` 是叶子，`context._prep_context()` 是唯一入口，`runner.chat_impl` 的两个调用点都走它。
+
+- **顺序固定 L0 → L1 → L2**，只在**两次 API 调用之间**执行（流式进行中绝不压）。
+- **L0 去重**：判定是 `(tool_call_key, result_digest)` **双条件**。`tool_call_key` 会对参数做 `json.loads` + `sort_keys` 归一化，所以 `read_file` 的不同区间/`function=`/路径**天然不会被合并**（这是刻意的反例，有测试守着）。只改 `content`、**不动位置与 `tool_call_id`**（动了就破坏 assistant↔tool 配对 → 400）。
+- **L1 摘要的 span 有两条硬规矩**（都踩过）：
+  1. **起点必须落在某轮的第一个 `user`**，否则该轮的 user 留在上下文而 assistant/tool 被摘要带走，语义断裂；
+  2. **末尾必须吸附到 `_find_groups()` 的组边界**，否则当前问题会跟在 assistant 后面。
+  这两条一起保证"不切轮次"。`apply_compaction` 的落点也沿用 `context.py:88` 的规避法（段首紧贴 system → 独立 system 消息；否则**并入段后第一条 user 消息**），绝不产生裸 user 消息。
+- **前缀必须有界**：`run_rolling_summary` 用 `bounded_prefix()` 把累计摘要压到预算内（保留尾部）。不做这一步，前缀会随块数线性增长，`COMPACT_BLOCK_TOKENS` 就形同虚设。
+- **失败即整体放弃**：任一块失败/校验不过 → 不 apply、不落盘，回退 L2；绝不留下半折叠状态。
+- **`record_archive` 只能由 `apply_compaction` 内部调一次**（`_prep_context` 里不要再调，否则每次压缩产生两条重复档案）。
+- **频率预算只约束 L1**：`should_compact()` 返回 `interval`/`budget`/`backoff`/`failed` 时必须继续走 `_finalize_prune`，**绝不能因预算而不做 L2**。
+- **记账必须跨用户轮**（BUG 28 根因）：`conv` 是**每个用户轮新建**的包装 dict，计数器写在 `conv` 上会每轮归零 → `interval` 永不成立、`MAX_PER_SESSION` 退化成"每轮上限"。所有压缩记账（`_user_turn`/`_compact_count`/`_compact_last_turn`/`_compact_fails`/`_compact_retry_turn`/`_notice_once_*`）一律经 `compaction.cstate(conv)` 读写，薄壳把 `_session_state["_compact"]` 作为 `conv["_compact_state"]` 传进来；`cstate` 在没有该键时退回 `conv` 自身（单元测试可直接写 `conv`，生产路径行为不变）。**新增计数器时不要直接写 `conv[...]`。**
+- **失败退避**（BUG 28）：失败 → `_compact_fails += 1`、`_compact_retry_turn = turn + min(min_rounds · 2^(fails-1), max_backoff)`；`fails >= max_fails` 即本会话停用自动 L1（`/compact` 会清退避后手动重试）。`interrupted` 单独分支，**不计入失败**（否则按三次 Esc 就停用 L1）。同类提示用 `_notice_once()` 保证每轮只报一次 —— 一轮有 N 次工具调用就有 N 次 `_prep_context`，不设闸门就刷屏。
+- **失败必须可诊断**（BUG 27/29）：`run_rolling_summary(..., on_error=)` 回传具体原因 + 块号；`summary_reject_reason()` 给出 `too_short`/`too_long`/`missing_headings:缺哪些`；`summarize_block` 用 `{"error": ...}` 报错；`compact_failed` 事件带 `hint`（可执行提示）；明细落盘 `tmp/compaction_error.log`。**TUI 下 stdout 会被界面覆盖，绝不要靠 `print` 留证据。**
+- **token 记账**：`dedup_tool_results` 与 `apply_compaction` 都按差额折算；跨条目求和会漂移 1~数 token，需要精确相等时用 `compaction._recompute_size()`（整包 `json.dumps` 口径，与 `chat_impl` 首次初始化一致）。
+- **摘要器在薄壳**：`summarize_block()` 用**独立 OpenAI client**——不复用被 headroom 包装的全局 `client`，也不走 `runner._safe_create`（它遇 400 会 `_rollback_tool_round` 回滚**主会话**）；不传 `tools`，`extra_kwargs` 也不复用主模型的（`reasoning_effort` 是 DeepSeek 专属，本地后端传了会 400），改走 `cfg["summary_extra_kwargs"]`（仅云端后端有值：`thinking={"type":"disabled"}`，因为 `deepseek-v4-flash` 默认开思考、实测白吃 680~717 个 `reasoning_tokens`）；后端不认该参数时自动摘掉重试一次。
+- **输出预算按"不变量"给**（BUG 27）：论文说摘要输出几乎不随输入变化，所以 `COMPACT_MAX_TOKENS` 不能按块大小缩放，必须覆盖那个不变输出量（DS 默认 3000；1500 时实测 7.6k 的真实块必被 `finish_reason=length` 截断）。截断时**升级一次**到 `COMPACT_MAX_TOKENS_HARD` 重试；小标题已齐仅末尾被切则直接采用。
+- **worker 不压**：`chat_impl` 用 `active_summarize = summarize_fn if is_main_session else None` 门控；但 **L2 对 worker 依然生效**（与改造前一致）。`recall_archive` 在 worker 内禁用（`_WORKER_FORBIDDEN`）。
+- **档案（可回滚）**：挂在薄壳 `_session_state["_archive"]`（**同一个 list 对象**，`_archive()` 返回它，apply/expand 都就地改）；`/save` 与 autosave 写 `<会话名>.archive.json` sidecar，`/load` 与 autosave 恢复时 `adopt_archive()` 取回。会话文件本身**仍是 `messages` 数组**（格式未变，`replay()` 不受影响）。
+- **阈值口径**：`compaction_cap() = _prune_cap() * COMPACT_TRIGGER_RATIO`（默认 0.5）。不新增第二套 ctx 计算。
+- **`/compact` 的 cap 必须用 `_prune_cap()`，绝不能传 0**（BUG 30）：`cap` 是 **L2 的裁剪目标**，与 L1 阈值无关；`_prune_messages(0)` 会删光所有可删组（实测 8 条 → 2 条）。"强制"靠在 `_prep_context(..., force=True)` → `should_compact(force=True)`（只跳过排期闸门，`COMPACT_MAX_PER_SESSION` 仍生效）。另：不要再引入"同一轮只压一次"的 token 闸门——`id(conv)` 会被地址复用骗到，`(轮次,size)` 会把显式 `/compact` 变成静默无操作；防重复靠 interval/backoff/中断三条闸门。
+- **依据**：arXiv 2605.23296 —— 摘要保留率随输入增长断崖下跌（96k 输入仅 ~3%）、摘要输出与输入/提示词近乎无关、同步压缩可占端到端耗时最高 62%、运行间不稳定（余弦 0.62–0.86，故必须留原文档案）。
+
 ---
 
 ## 五、本会话已完成的改动
@@ -111,8 +142,10 @@ agent/
 ## 六、测试
 
 ```bash
-python test_code_index.py    # 18 项全过（XML/DSML/上下文/rollback/记忆工具）
+python test_code_index.py    # 全过（XML/DSML/上下文/rollback/记忆工具 + 压缩契约）
 python test_multi_agent.py   # 7 项全过（多 agent 隔离/事件/守卫）
+python test_compaction.py    # 33 项全过（L0 去重/L1 分块摘要/L2 兜底/档案/频率预算/失败退避与诊断）
+python run_tests.py          # 9 套件全过（需要 DS_KEY，config 在 import 时就要建 client）
 python test_progress.py      # 悬空，跑会 SKIP，可无视
 ```
 
@@ -122,12 +155,14 @@ python test_progress.py      # 悬空，跑会 SKIP，可无视
 
 - **提交记忆功能**（本会话成果尚未 commit）。
 - 让用户用真实 agent 跑一轮：确认记忆注入、recall/remember 在真实对话中可用。
+- **压缩修复的真实后端复验**（v2.14）：真实 TUI 分别用 DS 与本地后端跑一次长任务，确认面板不再被"压缩失败"刷屏（失败应至多每轮一条且带具体原因）、`/expand` 与 sidecar 正常、本地后端 `api_error.log` 无新增；随后按实测调 `COMPACT_TRIGGER_RATIO` 与 `COMPACT_BLOCK_TOKENS`（都是环境变量，不需要改代码）。单发健康检查：`python tmp/check_compaction_real.py`（取最新会话的一块走真实摘要器，打印保留率与校验结果；`tmp/` 是 gitignore 的临时目录，脚本按仓库惯例不入库）。
 - 杂物可清理：`_verify_fix.py`（DSML 诊断脚本，已无用）、`test_progress.py`（悬空测试）、`tui.py.bak`/`tui.py.backup`/`backup_conflict_files/`/`.DS_Store`/`compile.jpeg`/`seitsuna.png` 等图片。
 
 ---
 
 ## 八、历史已完成项（速览，细节见 git log）
 
+- **上下文压缩三层**（v2.13；v2.14 修"失败刷屏"与 `/compact` 清空历史）：`loop_agent_core/compaction.py`（L0 去重 / L1 分块滚动摘要 / 档案回滚）+ `context._prep_context`（编排 + 频率预算 + 失败退避）+ `recall_archive` 工具 + TUI `/compact`·`/expand`·5 个压缩事件 + sidecar 档案；`test_compaction.py` 33 项。设计依据见 §四.5。
 - **单文件拆分重构**（2026-08-04）：`loop_agent_v2.py` 1515 行 → 106 行薄壳 + `loop_agent_core/` 13 模块。修 worker 隔离 bug（全局 messages → conv["messages"]）。
 - **400 错误修复**（2026-08-04）：DeepSeek 只认自己签发的 tool_call id → 非本地后端忽略 XML 调用；最终阶段补 `tools=tools`；新增 `_safe_create` + `_rollback_tool_round`。
 - **DSML 污染修复**（2026-08-04）：全角竖线 `|DSML|` 变体污染工具标签 → `_DSML_RE` 匹配 `[|｜]+DSML[|｜]+`，四入口剥离。

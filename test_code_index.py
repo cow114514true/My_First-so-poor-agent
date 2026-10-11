@@ -418,12 +418,64 @@ def test_check_local_llm_cloud():
     if not _is_local_backend():  # 默认 DeepSeek
         assert check_local_llm() == (True, "cloud")
 
+def test_trim_notice_accumulates():
+    """反复裁剪时 [Context trimmed] 的计数必须**累加**。
+
+    改造前是重写：第二次裁剪会把"已删除 N 条"抹成新数字，模型看不到自己累计丢了多少历史。
+    """
+    content = "CURRENT QUESTION"
+    once = la.render_prune_notice(content, 3)
+    assert "已删除 3 条" in once and once.endswith(content)
+    twice = la.render_prune_notice(once, 4)
+    assert "已删除 7 条" in twice, twice
+    assert twice.endswith(content), "问题原文必须保留在提示之后"
+    assert once.count("已删除") == 1 and twice.count("已删除") == 1, "不能堆叠多条提示"
+
+def test_compaction_contract():
+    """上下文压缩的薄壳契约：tui / 其他测试 import 的符号必须都在。"""
+    for name in ("dedup_tool_results", "should_compact", "compaction_span", "split_blocks",
+                 "apply_compaction", "expand_last", "latest_compaction", "record_archive",
+                 "persist_archive", "load_archive", "run_rolling_summary", "validate_summary",
+                 "build_block_prompt", "compaction_cap", "placeholder_text", "_prep_context",
+                 "persist_archive_sidecar", "adopt_archive", "clear_archive"):
+        assert hasattr(la, name), f"薄壳缺少符号 {name}"
+    assert "recall_archive" in la.TOOL_CALL_MAP
+    # 工具数：原 11 + search_code/code_index/observe_browser/visual_locate/browser_act 等历史增量 + recall_archive
+    assert any(t["function"]["name"] == "recall_archive" for t in la.tools)
+    # 两层全关 → 行为与改造前一致（只走 L2）
+    import loop_agent_core.config as cm
+    os.environ["COMPACT_ENABLED"] = "0"
+    os.environ["DEDUP_ENABLED"] = "0"
+    cm._compact_k_cache = None
+    try:
+        msgs = [_mkmsg("system", "sys"), _mkmsg("user", "Q1"),
+                _mkmsg("assistant", "", tool_calls=_tc("c1")),
+                _mkmsg("tool", "res1" * 50, tool_call_id="c1"),
+                _mkmsg("assistant", "A1"), _mkmsg("user", "CURRENT")]
+        la.messages[:] = msgs
+        la._msg_size = la.estimate_tokens(json.dumps(msgs, ensure_ascii=False))
+        conv = {"messages": la.messages, "size": la._msg_size,
+                "_compact_count": 0, "_compact_last_turn": None, "_user_turn": 1, "_dedup_saved": 0}
+        events = []
+        q_idx = len(msgs) - 1
+        new_q, removed = la._prep_context(la._msg_size - 50, q_idx, conv, None, events.append)
+        assert [e["type"] for e in events] == ["pruned"], events
+        assert removed > 0
+        assert la.messages[new_q]["role"] == "user"
+    finally:
+        os.environ.pop("COMPACT_ENABLED", None)
+        os.environ.pop("DEDUP_ENABLED", None)
+        cm._compact_k_cache = None
+        la.messages[:] = [{"role": "system", "content": la.system_prompt}]
+        la._msg_size = None
+
 if __name__ == "__main__":
     for fn in [test_outline, test_extract, test_count, test_gate, test_noncode_preview, test_count_tool,
                test_strip_and_garbage, test_parse_xml_tool_calls, test_parse_qwen3_toolcalls, test_dsml_corrupted_tags,
                test_stream_strip_xml, test_store_tool_args, test_rollback_tool_round, test_file_not_found_suggests,
                test_run_tools, test_prune_cap, test_prune, test_prune_notice_recycle, test_no_prune_when_small,
-               test_edit_backup_and_diff, test_check_local_llm_cloud]:
+               test_edit_backup_and_diff, test_check_local_llm_cloud,
+               test_trim_notice_accumulates, test_compaction_contract]:
         fn()
         print(f"ok: {fn.__name__}")
     print("all code-index + pruning self-checks passed")

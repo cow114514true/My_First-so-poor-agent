@@ -19,7 +19,8 @@
 ├── loop_agent_v2.py       # 主 Agent 入口（薄壳：持有可变全局并再导出公共 API）
 ├── loop_agent_core/       # 纯实现包（config/tokens/schemas/prompts/file_tools/shell_tools/
 │                          #   ds_web/browse/xmlutil/validation/context/events/runner/
-│                          #   memory/tavily_tool/vision/visual_locate/confirm/control/debuglog）
+│                          #   memory/tavily_tool/vision/visual_locate/confirm/control/debuglog/
+│                          #   compaction）
 ├── tui.py                 # Textual TUI 界面（三面板图形交互）
 ├── BUG_LEDGER.md          # 开发以来全部 bug 记录（现象/根因/修复/验证）
 ├── profile.json           # 浏览器登录状态（运行 Get_State.py 后生成）
@@ -42,6 +43,7 @@
 - **安全文件操作**：读写文件路径严格限定在项目工作目录内，防止路径遍历攻击
 - **代码索引（大文件智能阅读）**：`read_file` 遇到大文件自动返回结构大纲而非全文，支持按函数名或行号区间精准拉取；内置**双模式 token 估算器**（DeepSeek 官方 tokenizer / llama.cpp `/tokenize`），所有读取受预算上限约束，节省上下文与 API 成本
 - **上下文裁剪**：全局对话自动裁剪——`messages` 超过阈值时先删旧工具链、再删旧主干，并注入 `[Context trimmed]` 提示，防止上下文膨胀、避免本地模型上下文溢出
+- **上下文压缩（三层）**：L0 重复工具结果去重（零成本零损失）→ L1 分块滚动摘要（超阈值时把旧历史折叠成 `[上下文摘要]`）→ L2 硬裁剪兜底；原文可回滚（`recall_archive` 工具 / `/expand` 命令）、档案落盘 sidecar；含压缩频率预算 + **失败退避**（失败不会每轮重试、连续失败自动停用），避免"压缩比干活还贵"甚至刷屏
 
 ### TUI 图形界面
 - **三面板布局**：聊天面板、思考面板、工具面板，实时展示 Agent 工作流
@@ -68,6 +70,7 @@
 - `search_code`：Python 原生 regex 跨文件代码搜索（三种输出：匹配行+行号 / 文件列表 / 计数），替代 cmd 的 findstr，自动跳过依赖目录
 - `code_index`：目录级符号索引——一次调用返回整个目录所有文件的函数/类/import 结构地图，配合 `search_code` + `read_file(function=)` 三件套快速理解项目结构
 - `recall` / `remember`：跨会话记忆——`recall` 查询已保存的项目/系统记忆，`remember` 写入新记忆，实现 agent 的长期记忆能力
+- `recall_archive`：回取被上下文压缩折叠掉的**原文**——摘要丢失细节时（文件名、准确命令、报错原文、决策理由）用 `query` 关键词检索压缩前的原始消息，避免重复执行已完成的工具调用
 
 ## 前置要求
 
@@ -175,7 +178,10 @@ python tui.py
 | `/quit` | 安全退出（弹出保存对话框） |
 | `/load` | 列出已保存的历史对话，显示日期和首条提问预览 |
 | `/load <编号>` | 加载指定编号的对话（如 `/load 2`） |
-| `/clear` | 清除当前对话，重置上下文 |
+| `/clear` | 清除当前对话，重置上下文（一并撤销会话放行与折叠档案） |
+| `/compact` | 立即压缩上下文（L0 去重 + L1 分块摘要，仍受频率预算约束） |
+| `/expand` | 还原最近一次压缩的原始历史（只还原会话历史，面板不重绘） |
+| `/save` | 立即保存当前对话到 `conversations/`（同时写 `<会话名>.archive.json` 折叠档案） |
 
 ### 第三步：（可选）使用命令行模式
 
@@ -320,7 +326,46 @@ def _resolve_path(path):
    - 先删**已完成的 tool 链**（`assistant(tool_calls)` + 对应 `tool` 结果 + `[Self-check]`）；
    - 仍超限则删**主干单条消息**（旧用户提问 / 旧回答）。
    - system 提示词与当前回合永不删除。
-4. **注入提示**：裁剪后把 `[Context trimmed]` 提示合并进当前问题文本（而非独立 user 消息），告知模型旧内容已删、继续任务或问用户（该提示在后续裁剪中会被回收，避免堆叠）。
+4. **注入提示**：裁剪后把 `[Context trimmed]` 提示合并进当前问题文本（而非独立 user 消息），告知模型旧内容已删、继续任务或问用户（计数**累加**；旧提示在后续裁剪中被回收，避免堆叠）。
+
+### 上下文压缩（三层）
+
+裁剪之上叠了两层更温和的压缩，主会话每次 API 调用前按 **L0 → L1 → L2** 顺序执行（`loop_agent_core/compaction.py`）：
+
+| 层 | 做什么 | 代价 | 丢失 |
+|---|---|---|---|
+| **L0 去重** | 逐字节重复的工具结果只留最后一份，更早的换成 `[已省略]` 占位符 | 0 元、0 延迟 | 只有纯冗余 |
+| **L1 摘要** | 达阈值时把旧历史**分块滚动摘要**成一条 `[上下文摘要]` | 每块一次非流式调用 | 过程细节，保留结论 |
+| **L2 裁剪** | 上面两层没做/失败/仍超限时的兜底 | 0 | 整段历史 |
+
+- **L0 判定是双条件**：工具调用参数（规范化 JSON）+ 结果内容哈希都相同才算重复。因此 `read_file` 的不同 `start_line/end_line`、不同 `function=`、不同路径**不会**被合并——部分读取的内容本来就不同。
+- **L1 单次输入有硬上限**（`COMPACT_BLOCK_TOKENS`）：块按工具链整组装箱，组不切半；块间顺序执行，前缀是**有界**的累计摘要（保留尾部）。依据见 [arXiv 2605.23296](https://arxiv.org/abs/2605.23296)：摘要保留率随输入增长断崖下跌（输入 96k 仅保留 ~3%），输出规模与输入/提示词近乎无关（只能靠结构性手段控量），同步压缩可占端到端耗时最高 62%（故必须有频率预算）。
+- **输出预算按"不变量"给足，不按块大小缩放**：论文说摘要输出几乎不随输入变化，所以 `COMPACT_MAX_TOKENS` 必须覆盖那个不变输出量。给 1500 时一块 7.6k token 的真实历史会被 `finish_reason=length` 截断、缺小标题 → 整次压缩作废（实测踩到，见 BUG_LEDGER 27）。截断时摘要器会**升级一次**预算（上限 `COMPACT_MAX_TOKENS_HARD`）重试，而不是把历史退回硬裁剪。
+- **摘要器关掉"思考"**：`deepseek-v4-flash` 默认就开思考（实测 `reasoning_tokens` 680~717，吃掉近一半输出预算）。摘要是有界的机械压缩任务，思考无收益；该参数只在云端后端下发，后端不认就自动摘掉重试（本地后端不受影响）。
+- **频率预算**：`COMPACT_MIN_ROUNDS`（距上次压缩的最小用户轮次）+ `COMPACT_MAX_PER_SESSION`。预算只约束 L1，**绝不削弱 L2 兜底**。
+- **失败退避**：失败后同一轮内不再重试（一轮有 N 次工具调用就有 N 次 API 调用），退避窗口按 `COMPACT_MIN_ROUNDS × 2^(连续失败次数-1)` 递增，连续失败 `COMPACT_MAX_FAILS` 次则本会话停用自动 L1（`/compact` 可手动重试）。没有退避时面板会被"压缩失败"刷满且白烧 token（实测踩到，见 BUG_LEDGER 28）。失败原因与块号写入 `tmp/compaction_error.log`。
+- **可回滚**：被折叠的原文进会话档案，模型可用 `recall_archive(query)` 回取，用户可用 `/expand` 还原；档案同时落盘到 `conversations/<会话名>.archive.json`（sidecar，会话文件本身仍是 `messages` 数组）。
+- **失败即整体放弃**：任一块摘要失败/校验不过就回退 L2，绝不留下"半折叠"的历史。
+- **记账跨轮存活**：轮次/次数/失败退避挂在薄壳的 `_session_state["_compact"]` 上（`conv` 每个用户轮都是新建的包装 dict）。否则 `COMPACT_MIN_ROUNDS`/`COMPACT_MAX_PER_SESSION` 会退化成"每轮"口径。
+
+相关环境变量：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `DEDUP_ENABLED` | `1` | 关闭 L0 |
+| `DEDUP_MIN_CHARS` | `1000` | 小于此长度的工具结果不参与去重 |
+| `COMPACT_ENABLED` | `1` | 设为 0 完全退回改造前的裁剪行为 |
+| `COMPACT_TRIGGER_RATIO` | `0.5` | 触发阈值 = `_prune_cap() × 该比例` |
+| `COMPACT_BLOCK_TOKENS` | DS `8000` / 本地 `4000` | 单次摘要输入的硬上限 |
+| `COMPACT_KEEP_ROUNDS` | DS `3` / 本地 `2` | 保留最近 N 轮用户提问不压 |
+| `COMPACT_MAX_TOKENS` | DS `3000` / 本地 `1500` | 单块摘要输出上限（按论文的"不变输出量"给足） |
+| `COMPACT_MAX_TOKENS_HARD` | DS `6000` / 本地 `2000` | 被截断时升级预算的上限（只升一次） |
+| `COMPACT_MIN_RECLAIM` | `0.15` | 回收率低于此值判"无效压缩"，继续走 L2 |
+| `COMPACT_MIN_ROUNDS` | `3` | 压缩最小间隔（用户轮次），也是退避基数 |
+| `COMPACT_MAX_PER_SESSION` | `20` | 会话内压缩次数上限 |
+| `COMPACT_MAX_FAILS` | `3` | 连续失败几次后本会话停用自动 L1 |
+| `COMPACT_MAX_BACKOFF` | `32` | 退避窗口上限（用户轮次） |
+| `COMPACT_ARCHIVE_MAX_CHARS` | `200000` | 内存档案上限，超出丢最旧条目 |
 
 ### 网页桥接机制
 
@@ -430,6 +475,8 @@ MAX_TOOL_ROUNDS = 10  # 增加允许的轮次
 
 ## 更新日志
 
+- **v2.14**：压缩"失败刷屏"根治（真实用量暴露的两个 bug）——(27) 摘要输出预算不足：`COMPACT_MAX_TOKENS` 1500 时一块 7.6k token 的真实历史被 `finish_reason=length` 截断、缺小标题 → `validate_summary` 不过 → 整次压缩作废（实测 `completion_tokens=1500`、缺 3 个小标题），现按论文"摘要输出几乎不随输入变化"把默认值提到 DS `3000`（本地 `1500`），截断时**升级一次**（`COMPACT_MAX_TOKENS_HARD`）重试，并给摘要器关掉 `deepseek-v4-flash` 默认开启的思考（实测白吃 680~717 个 `reasoning_tokens`；该参数仅云端下发，后端不认自动摘除）；(28) 失败重试风暴：`conv` 每个用户轮都是新建的包装 dict，计数写在 `conv` 上会归零 → `COMPACT_MIN_ROUNDS`/`COMPACT_MAX_PER_SESSION` 退化成"每轮"口径、"距上次压缩不足最小轮次"永不成立，且失败时**一轮内每次工具调用都重试一次**（实测面板被"压缩失败"刷满）→ 记账改挂跨轮存活的 `_session_state["_compact"]`（`compaction.cstate`），失败退避 `min_rounds × 2^(连续失败-1)`（封顶 `COMPACT_MAX_BACKOFF`）、连续 `COMPACT_MAX_FAILS` 次停用自动 L1（`/compact` 可手动解锁）、同类提示每轮只报一次、Esc 中断不计入失败；`compact_failed` 事件现在带**具体**原因 + 块号 + 可执行提示（"调大 COMPACT_MAX_TOKENS / 调小 COMPACT_BLOCK_TOKENS"…），并落盘 `tmp/compaction_error.log`（TUI 下 stdout 会被界面覆盖，原来等于把原始异常丢掉）；`test_compaction.py` 22 → 33 项（含跨用户轮尝试节奏的 E2E）；(30) `/compact` 曾把 `cap=0` 传给 L2——`cap` 是**L2 的裁剪目标**、与 L1 阈值无关，于是"强制压缩"没生效而破坏生效了：低于阈值时 `_prune_messages(0)` 把历史删到只剩 system + 当前问题（实测 8 条 → 2 条）。现改为 `force=True`（只跳过排期类闸门，仍受会话次数上限约束）+ L2 用正常 `_prune_cap()`；顺带删掉"同一轮只压一次"的 token 闸门（key 用 `id(conv)` 会被地址复用骗到，用 `(轮次,size)` 会把显式再来一次 `/compact` 静默变成无操作，而它要防的场景已被 interval/backoff 覆盖）
+- **v2.13**：上下文压缩三层落地——新增 `loop_agent_core/compaction.py`：**L0 重复工具结果去重**（参数规范化 JSON + 内容哈希双条件判定，只改 content 不动 `tool_call_id` 从而不破坏 assistant↔tool 配对；`read_file` 的不同区间/`function=`/路径不会被误合并）、**L1 分块滚动摘要**（按 `_find_groups` 整组装箱、组不切半；块间顺序执行且前缀**有界**，避免"输入上限形同虚设"；全部块成功才一次性替换，失败整体回退）、**L2 硬裁剪兜底**（原有逻辑，`[Context trimmed]` 计数改为累加，不再被下次裁剪抹掉）；触发阈值提前到 `0.5 × _prune_cap()`，并加**频率预算**（`COMPACT_MIN_ROUNDS` / `COMPACT_MAX_PER_SESSION`）——依据 arXiv 2605.23296：摘要保留率随输入增长断崖下跌（96k 输入仅保留 ~3%）、同步压缩可占端到端耗时最高 62%；新增 `recall_archive` 工具与 `/compact`、`/expand` 命令，折叠原文可回取、可还原，并落盘 `conversations/<会话名>.archive.json` sidecar（会话文件格式不变）；摘要器用**独立 OpenAI client**（不复用被 headroom 包装的 client、不走会回滚主会话的 `_safe_create`，且不传 DeepSeek 专属 `extra_kwargs`，保证本地后端可用）；TUI 新增 5 个压缩事件（去重/压缩中/已压缩/失败/跳过），压缩不再是隐形行为；新增 `test_compaction.py`（22 项）并加入 `run_tests.py`
 - **v2.12**：代码导航三件套 + 浏览器批量求值根治卡顿 + 稳定性修复——新增 `search_code`（跨文件 regex 搜索）与 `code_index`（目录符号索引）工具；`browser_act` 元素清单重写为 `evaluate_all` 批量求值（一次往返拿全部元素，根治 bilibili 大页 122s 卡顿 → 0.3s）；投币/点赞/收藏 className 语义化 + `.video-toolbar-left-item` 选择器（bilibili 操作栏是 div 无文本）；`scroll` 改 JS `scrollBy`（播放器劫持 PageDown 切视频）；重复 open 同 URL 跳过 goto（SPA 卡死）；`_extract_page_text` `innerText`→`textContent`；`locate` 参数命中元素 ★ 置顶；本地模型工具结果 cap 2500→6000（14→66 元素）；`_page_state` 分段计时写 `tmp/browse_timing.log`；工具/子 agent 结果超时兜底（`f.result(timeout)` + `shutdown(wait=False)`）；headroom-ai 接入（audit/optimize 模式，JSONL 存储避开 SQLite 跨线程）；禁 HF tokenizer 下载（`HEADROOM_HF_TOKENIZER_LOAD_TIMEOUT_SECS=0`）；协议加固（`_inject_user_nudge` 合并连续 user 消息防 API 400、第 8/12 轮注入收尾提示）；本地模型 XML 工具调用解析兼容 JSON 格式；系统提示新增第三方库接入原则 + 任务完成判定；`reasoning_effort` high→medium；`READ_BUDGET_DS` 6000→12000；QuitDialog ESC 修复
 - **v2.12**：写文件自检的 diff 不再依赖 git——`_git_diff_after_edit`（子进程 `git diff`）换成进程内 `difflib.unified_diff` 对比写前/写后。修复未跟踪/新建/非 git 仓库文件拿不到 diff（`write_file` 的主用途恰是新建文件）、历史未提交改动混入同一 hunk 把本次改动挤出 500 字符窗口、截断静默丢内容三个问题；新建文件与内容无变化改为明确文字说明
 - **v2.11**：协议加固 + 连接可靠性——多工具自检合并为单条 user 消息（根除连续 user 触发 API 400）；记忆注入/`[Context trimmed]` 合并进问题文本；流式连接 httpx read 120s 超时防断流挂死；shell 非零退出不再触发 Self-check 打断；QuitDialog ESC 取消修复
