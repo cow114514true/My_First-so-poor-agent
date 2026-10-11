@@ -9,7 +9,7 @@ from .config import _is_local_backend, client, cfg, WORK_DIR
 from .compaction import cstate, next_turn
 from .control import interrupt_event
 from .context import (_append_msg, _prep_context, _prune_cap, _prune_messages,
-                      _rollback_tool_round)
+                      _rollback_tool_round, conversation_problems)
 from .events import _default_on_event
 from .schemas import tools
 from .tokens import estimate_tokens
@@ -19,9 +19,11 @@ from .xmlutil import (_is_garbage_content, _parse_xml_tool_calls, _strip_dsml,
 
 
 def _dump_filtered(reason, snippet):
-    """Diagnostic: dump what got filtered so we can see why (debug_filtered.txt)."""
+    """Diagnostic: dump what got filtered so we can see why (debug_filtered.txt).
+    路径可用 FILTERED_LOG 覆盖：自检套件会跑到这些分支，别污染真实诊断日志。"""
+    path = os.environ.get("FILTERED_LOG") or os.path.join(WORK_DIR, "debug_filtered.txt")
     try:
-        with open(os.path.join(WORK_DIR, "debug_filtered.txt"), "a", encoding="utf-8") as f:
+        with open(path, "a", encoding="utf-8") as f:
             f.write(f"=== {reason} ===\n{snippet}\n\n")
     except Exception:
         pass
@@ -58,8 +60,13 @@ def _dump_api_error(e, conv, kwargs):
 _EMPTY_NUDGE = ("[Self-check] 你刚才只输出了思考过程，没有调用工具也没有给出回答。"
                 "请继续：调用下一步需要的工具，或直接给出最终回答。")
 # nudge 耗尽仍卡 → 准确说明是思考循环，不是乱码
+# （不要再写死"换用 DeepSeek 后端"：实测云端后端同样会卡在只输出思考，
+#   而这条文案正好在 DeepSeek 会话里出现，等于给了反向建议。）
 _STUCK_MSG = ("[模型陷入思考循环：连续多轮只输出思考、没有工具调用或回答。"
-              "任务未能完成，请重试，或换用 DeepSeek 后端处理复杂任务。]")
+              "本轮已中止，任务可能未完成——请重试、把要求说得更具体，或新开一个会话。]")
+# 与 _STUCK_MSG 同因的**可见**提示：历史里存的那条消息以前只 return、不上屏，
+# 用户看到的就是"agent 静默停止工作"。
+_STUCK_NOTICE = "模型连续多轮只输出思考、没有工具调用也没有回答，已中止本轮（任务可能未完成）。"
 
 # 工具轮次接近上限时注入收尾提示，不依赖模型自觉
 _WRAPUP_NUDGE = ("[System] 已使用 {used}/{max} 轮工具调用。"
@@ -291,10 +298,29 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         else:
             default_on_event(event)
 
+    def _notice(level, message):
+        """把"这个回合是怎么结束的"发到面板上（level: info / warn）。
+
+        此前 4 类终局消息（思考循环 / 乱码过滤 / 中断 / 兜底）只在函数末尾 return，
+        TUI 又丢掉 chat() 的返回值 → 面板上零输出、状态回 idle，看起来就是
+        "agent 静默停止工作"（实测 2026-10-11 20:52 那次：3 轮只出思考 + 1 次中止，
+        4 次 API 调用对用户完全不可见）。注入的 nudge 同理，必须显式说明，
+        否则用户不知道模型被"催"过几次。
+        """
+        _emit({"type": "notice", "level": level, "message": message})
+
     # 初始化消息 token 记账（首次）
     conv["_empty_retries"] = 0  # thinking-only 回合的重试计数（有界，防死循环）
     if conv["size"] is None:
         conv["size"] = estimate_tokens(json.dumps(conv["messages"], ensure_ascii=False))
+    # 发出去之前先查一遍结构：坏结构在 API 端只会回一句晦涩的 422
+    # （实测 "messages[0]: missing field `role`"，面板上无从判断该怎么办）
+    _problems = conversation_problems(conv["messages"])
+    if _problems:
+        _msg = ("会话历史结构已损坏（" + "；".join(_problems) + "），已拒绝发送。"
+                "请 /load 一个有效会话，或 /clear 重置后重来。")
+        _emit({"type": "error", "message": _msg})
+        return "[Internal error] " + _msg
     # 三层压缩（L0/L1）只在主会话启用；worker 会话生命周期短，本轮不压。
     # L2 硬裁剪对两者都生效（worker 原先也走 _prune_messages）。
     active_summarize = summarize_fn if is_main_session else None
@@ -319,11 +345,13 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
 
     MAX_TOOL_ROUNDS = cfg["max_tool_rounds"]
     tool_round = 0
+    _warned_xml = False  # 工具调用藏在思考里→重试：整回合最多提示一次，别刷屏
 
     # 循环处理工具调用
     while tool_round < MAX_TOOL_ROUNDS:
         tool_round += 1
         if interrupt_event.is_set():  # 用户已按 Esc 中断
+            _notice("warn", "已中断（Esc）：本回合没有给出回答（此前已执行的工具结果仍保留在历史里）。")
             return "[Interrupted by user]"
         # 每次 API 调用前整理上下文：L0 去重 → L1 分块摘要 → L2 硬裁剪
         q_idx, pruned = _prep_context(_prune_cap(), q_idx, conv, active_summarize, _emit)
@@ -379,6 +407,9 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             partial = _strip_toolcall_xml(content).strip()
             if partial and not _is_garbage_content(partial):
                 _append_msg({"role": "assistant", "content": partial}, conv)
+                _notice("info", "已中断（Esc）：已保留本回合已生成的部分内容。")
+            else:
+                _notice("warn", "已中断（Esc）：本回合没有给出回答。")
             return "[Interrupted by user]"
 
         # 组装工具调用：优先 OpenAI JSON tool_calls，其次本地模型的 XML（在 reasoning/content 里）。
@@ -402,16 +433,26 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                     return cleaned
                 if "<tool_call" in (reasoning + content):
                     # 模型想调工具但 XML 没解析出来（常见于工具调用写在 thinking 里）→ 重试，别掐断回合
+                    if not _warned_xml:
+                        _warned_xml = True
+                        _notice("info", "模型把工具调用写进了思考但没能解析出来，正在重试。")
                     continue
                 if reasoning.strip() and not cleaned:
                     # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
                     conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
                     if conv["_empty_retries"] <= 3:
                         _inject_user_nudge(_EMPTY_NUDGE, conv)
+                        _notice("info", f"模型这一轮只输出了思考过程，已要求它继续（{conv['_empty_retries']}/3）。")
                         continue
                     msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
+                    _notice("warn", _STUCK_NOTICE)
+                    # 留痕：notice 会随滚动消失，这条能事后 grep（debug_filtered.txt）
+                    _dump_filtered("turn_end:stuck",
+                                   f"round={tool_round} retries={conv['_empty_retries']} "
+                                   f"reasoning={reasoning[:200]}")
                 else:
                     msg = "[Response filtered: detected garbled output. Please rephrase your request.]"
+                    _notice("warn", "模型输出被判为乱码，已中止本轮。请换个说法重试。")
                 _dump_filtered("main_no_toolcall", f"reasoning={reasoning[:400]} content={content[:400]}")
                 _append_msg({"role": "assistant", "content": msg}, conv)
                 return msg
@@ -446,6 +487,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         # 工具轮次逼近上限时注入收尾提示（合并到末条 user 或追加，不破坏交替协议）
         if tool_round == MAX_TOOL_ROUNDS - 4:
             _inject_user_nudge(_WRAPUP_NUDGE.format(used=tool_round, max=MAX_TOOL_ROUNDS), conv)
+            _notice("info", f"已用 {tool_round}/{MAX_TOOL_ROUNDS} 轮工具调用，已要求模型收尾并给结论。")
         # 继续循环，让助手处理工具结果
 
     # 主循环已实时输出正文；若工具轮次耗尽仍无正文，交给下面的最终流式阶段
@@ -455,6 +497,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # 就执行并重试。上限固定 12，够写完多文件又不至于死循环拖太久。
     for final_round in range(12):
         if interrupt_event.is_set():  # 用户已按 Esc 中断
+            _notice("warn", "已中断（Esc）：本回合没有给出回答（此前已执行的工具结果仍保留在历史里）。")
             return "[Interrupted by user]"
         q_idx, pruned = _prep_context(_prune_cap(), q_idx, conv, active_summarize, _emit)
         response_stream = _safe_create(conv, model=cfg["model"], messages=conv["messages"], stream=True,
@@ -500,6 +543,9 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             partial = _strip_toolcall_xml(full_response).strip()
             if partial and not _is_garbage_content(partial):
                 _append_msg({"role": "assistant", "content": partial}, conv)
+                _notice("info", "已中断（Esc）：已保留本回合已生成的部分内容。")
+            else:
+                _notice("warn", "已中断（Esc）：本回合没有给出回答。")
             return "[Interrupted by user]"
 
         # 模型还没读完/还在发工具调用（本地模型常把 <tool_call> 写在 reasoning 里）→ 执行后重试。
@@ -524,6 +570,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                     # 同样在逼近上限时注入收尾提示
                     if final_round == 8:  # 12 轮中的第 9 轮（0-indexed）
                         _inject_user_nudge(_WRAPUP_NUDGE.format(used=final_round + 1, max=12), conv)
+                        _notice("info", f"已用 {final_round + 1}/12 轮工具调用，已要求模型收尾并给结论。")
                 continue  # 模型还会再请求，直到给出正文
 
         # 正常答案：剥 XML + 垃圾检测后保存
@@ -534,10 +581,16 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
                 if conv["_empty_retries"] <= 3:
                     _inject_user_nudge(_EMPTY_NUDGE, conv)
+                    _notice("info", f"模型这一轮只输出了思考过程，已要求它继续（{conv['_empty_retries']}/3）。")
                     continue
                 msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
+                _notice("warn", _STUCK_NOTICE)
+                _dump_filtered("turn_end:stuck",
+                               f"final_round={final_round} retries={conv['_empty_retries']} "
+                               f"thinking={full_thinking[:200]}")
             else:
                 msg = "[Response filtered: detected garbled output. Please rephrase your request.]"
+                _notice("warn", "模型输出被判为乱码，已中止本轮。请换个说法重试。")
             _dump_filtered("final_stage", f"thinking={full_thinking[:400]} response={full_response[:400]}")
             _append_msg({"role": "assistant", "content": msg}, conv)
             return msg
@@ -546,6 +599,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             return save_response
 
     # 多次重试仍无正文（极端情况），兜底
+    _notice("warn", "模型多轮都没有产出可用的正文，已中止本轮。请换个说法重试。")
     _dump_filtered("fallback", f"thinking={full_thinking[:400]} response={full_response[:400]}")
     _append_msg({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"}, conv)
     return "[Response filtered: detected garbled output. Please rephrase your request.]"

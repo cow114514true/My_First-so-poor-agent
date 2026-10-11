@@ -302,6 +302,109 @@
   静默变成无操作（测试实测命中）。它要防的场景已被 interval / backoff / 中断三条闸门覆盖。
 - **回归**：`test_compact_command_never_wipes_history`。
 
+### Bug 31. 折叠档案 sidecar 被当成会话加载 → 历史被换成档案条目（422 + "历史保存失败"）
+
+- **现象**：用户跑一轮任务后，面板弹出
+  `ERROR: Error code: 422 - ... Failed to deserialize the JSON body into the target type:
+  messages[0]: missing field 'role' at line 1 column 17088`；同时"今天几条历史都保存失败"——
+  `conversations/` 里出现 3 个**同样大小**的 `chat_*.json`（30624 字节），打开是
+  **2 条没有 `role` 的档案条目**（`ts/messages/inserted/shape/added_tokens/removed_tokens`）。
+- **怎么发现**：422 说 `messages[0]` 缺 `role`，而 messages[0] 本该是 system —— 说明内存里的
+  `messages` 本身坏了。于是按结构（只打印 keys/长度，不复述内容）检查那几个文件：它们是
+  **档案数组**，不是会话。回头看 `/load` 的列目录口径
+  `f.startswith("chat_") and f.endswith(".json")` —— sidecar 名是
+  `<会话>.json.archive.json`，**同样满足这个条件**，而它内容是 list，于是被归为"有效会话"。
+- **根因**：v2.13 引入 sidecar（`conversations/<会话名>.archive.json`）时，只给**保存清理**逻辑
+  加了 `.archive.json` 例外（`tui.py` 的清理循环），**没给出 `/load` 的列目录**。当时
+  `sorted(reverse=True)` 下 `chat_20261011_202701.json.archive.json` 排在
+  `chat_20261011_202701.json` 之前（前缀相同、后缀更长者更大），所以 `/load 1`
+  正好加载了 sidecar → `_load_file` 直接 `_agent_messages.clear(); extend(loaded)`，
+  没有任何校验 → 会话被替换成档案条目；此后每次请求都 422，每次保存都写出坏历史，
+  用户看到的就是"历史保存失败"。
+- **修复**（三层防线，缺一不可）：
+  1. `tui.is_conversation_file()` 明确排除 `.archive.json`（列表、加载、autosave 恢复三处共用）；
+  2. `context.conversation_problems()` + `tui.read_conversation()`：**先校验再动历史**，
+     加载失败时当前会话原封不动（校验点：list 非空、每项是对象且有 `role`）；
+  3. `runner.chat_impl` 发请求前的护栏：结构坏了直接 emit `error` 事件并拒绝发送，
+     把"API 天书"换成"请 /load 有效会话或 /clear 重置"。
+- **回归**：`test_conversation_problems_detects_bad_shapes`、
+  `test_sidecar_is_never_listed_or_loaded_as_conversation`（含 `inspect.getsource` 接线断言）、
+  `test_chat_refuses_corrupted_history`。
+- **附带**：`chat_*.json` 与 sidecar 同名的坑在文件系统层面无法避免，故凡"按名字筛会话"的地方
+  都必须走 `is_conversation_file`——这条要写进交接文档，别再用裸的 `endswith(".json")`。
+
+---
+
+### Bug 32. 回合结束"零输出"：终局消息只 return 不发事件 → agent 静默停止工作
+
+- **现象**（用户原话："agent 出现了两次静默停止工作"）：模型干到一半，思考面板的字流停住，
+  聊天面板**什么都不出现**，状态回 `idle`。用户只能重开会话，任务就此断在半路。
+- **证据**（2026-10-11 20:52:34 那次，`conversations/chat_20261011_205234.json`）：
+  - 第 47 条 user 消息是同一条 `[Self-check] 你刚才只输出了思考过程…` **重复 3 次**，
+    第 48 条是 `_STUCK_MSG` → 说明连续 4 轮 API 调用（3 次 nudge + 1 次中止）**全部无输出**；
+  - `debug_filtered.txt` 最后一条（20:52:09）`thinking=… response=`（空），内容正是它在追查
+    "第 11 节那 3 个失败是既存还是我引入的" —— 它卡住的位置就是它当时的任务；
+  - 压缩日志（`tmp/compaction_error.log`）同期为空，排除压缩。
+- **根因**：`runner.chat_impl` 的 4 类终局消息只 `return`，不发事件 ——
+  `_STUCK_MSG`（思考循环）、`[Response filtered…]`（乱码）、`[Interrupted by user]`（中断）、
+  兜底消息；而 `tui._run_agent` 把 `chat()` 的**返回值直接丢掉**
+  （`tui.py` 的 `_h_response_done` 注释自证"runner 当前不发此事件"）→ 面板零输出。
+  注入的 nudge（`_EMPTY_NUDGE` / `_WRAPUP_NUDGE`）同样不可见，且 `_inject_user_nudge`
+  在末条是 user 时会**合并**，于是 3 次催办叠进同一条历史消息，用户一条也看不到。
+- **修复**：
+  1. `runner` 新增 `_notice(level, message)` → `{"type": "notice", "level", "message"}`，
+     覆盖全部终局分支 + 每次 nudge 注入（含"已用 12/16 轮工具调用，已要求模型收尾"）；
+  2. 思考循环额外落一条 `turn_end:stuck` 到 `debug_filtered.txt`（notice 会随滚动消失，这条可 grep）；
+  3. `tui` 注册 `_h_notice` 渲染到聊天面板（warn 用 ⚠，info 用 ·）；
+  4. `_STUCK_MSG` 不再写死"换用 DeepSeek 后端"——实测云端后端同样会卡在只输出思考，
+     而这条文案恰好出现在 DeepSeek 会话里（`12/16 轮` → `max_tool_rounds=16`），属于反向建议。
+- **回归**：`test_runner_visibility.py`（新套件，假 client 驱动真循环；含"空流/中断/收尾催办
+  都必须发 notice"与 `tui` 接线断言）。
+
+### Bug 33. `edit_file` 找不到锚点时的"相近行"候补被空行占满（空行恒真）
+
+- **现象**：模型改文件时 `edit_file` 报 `'…' not found in tui.py.`，随后给出的
+  `Possible close matches` 全是空内容 —— 实测原话（`chat_20261011_202701.json` 第 43 条
+  self-check 消息）：`line 5: / line 14: / line 28: / line 33: / line 34:` 后面**什么都没有**。
+- **根因**：`file_tools.edit_file_mock` 判相近用的是
+  `old_string[:5] in stripped or stripped[:5] in old_string`。空行的 `stripped` 是 `""`，
+  而 `""` 恒为任意字符串的子串 → 每个空行都成了候选，且按行号排在前 5 就把真候选挤掉了。
+  模型拿不到任何纠错线索，只能盲目重试；实测那次它最后**放弃 `edit_file`，改写一个
+  Python 脚本批量改盘**（`_patch_think.py`）——绕过了确认与备份，风险高得多。
+- **修复**：抽出 `_close_match_hint()`：空行不再参与（唯一的过滤条件就是"不能是空行"）；
+  前缀命中优先，前缀对不上时用 `difflib` 相似度兜底（只扫长度相近的行，避免大文件退化）。
+- **回归**：`test_runner_visibility.py::test_edit_hint_never_lists_blank_lines`
+  （旧实现下该用例必红：候补里出现 `line 2: ` 这种空内容）。
+
+### Bug 34. 用 findstr 过滤命令输出：结论被滤掉、失败显示成 success → agent 反复重试直到卡死
+
+- **现象**（用户："agent 又卡在 findstr 上了"）：agent 收尾折叠工作时，最后几步反复是
+  `python test_tui_markdown.py 2>&1 | findstr /C:…`，每次只回两三行，然后进入思考循环、
+  以 `_STUCK_MSG` 收场。
+- **两个坑，都会单独要命**：
+  1. **returncode 不是被测程序的**。cmd.exe 管道的退出码取自**最后一个**命令，于是
+     `python test_x.py 2>&1 | findstr …` 里 `success` / `returncode` 反映的是 findstr。
+     真实证据（`chat_20261011_205234.json` 第 39 条工具结果）：三条 `[FAIL]` 同时带着
+     `"returncode": 0, "success": true` → 模型据此认为"没失败"。
+  2. **汇总行被滤掉**。findstr 只显示匹配行，而汇总行是 `test_tui_markdown: 全部通过`
+     或 `N 项失败: [...]`；模型的 `/C:` 模式里只有 `[FAIL]` / `项失败` / `passed`，
+     于是**测试全绿时反而什么都看不到**（`chat_20261011_211606.json` 第 35/36 条只回了
+     两三条 `[PASS]`）。它只能换个模式再过滤 → 还是看不全 → 烧完工具轮次仍拿不到结论。
+- **另一条同源错误**：把 **PowerShell 的 `;`** 用在 cmd 命令里 →
+  `FINDSTR: Cannot open ; / Cannot open echo / Cannot open ===RESTORE===`，
+  整条 `git stash` 对照实验静默失效（第 41 条工具结果，`returncode: 1`），
+  于是"这三条红是我引入的吗"始终没有答案 —— 它后来自己也在思考里承认
+  "my earlier stash test failed to run the test (findstr parse error)"。
+- **修复**：
+  1. `shell_tools.exec_shell_win_mock`：命令里含 `|` 时，结果里附 `note`（通用管道提示；
+     命中 findstr 再加一条"汇总行会被滤掉"的说明）；
+  2. `prompts.py`：明确禁止用 findstr 过滤测试结论（要看结论就别过滤，或在 Python 侧过滤），
+     并写明 `shell='cmd'` 是 cmd.exe、只能用 `&&`/`&` 串联，不得用 `;`；
+  3. `test_shell_tools.py::test_pipe_commands_get_a_note`（管道必有提示、findstr 有专属提示、
+     非管道不加噪音）。
+- **注**：这一条不是"模型笨"——工具把唯一的判据（退出码）换成了别人的、又把结论行删掉，
+  任何模型都只能靠猜。工具应当保证"结论可见"，这与 Bug 32 是同一类问题。
+
 ---
 
 ## 附：杂项清理清单（非 bug，历史遗留）

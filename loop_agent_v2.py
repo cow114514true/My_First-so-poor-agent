@@ -31,7 +31,7 @@ from loop_agent_core.browse import (_validate_url, _get_browser_page, _extract_p
 from loop_agent_core.tavily_tool import search_web_mock, fetch_url_mock
 from loop_agent_core.context import (_prune_cap, _append_msg, _find_groups, _is_trim_notice,
                                      _prep_context, _prune_messages, _rollback_tool_round,
-                                     render_prune_notice)
+                                     render_prune_notice, conversation_problems)
 # 上下文压缩三层：L0 去重（compaction）/ L1 分块滚动摘要（compaction）/ L2 硬裁剪（context）
 # 再导出公共符号，保持 tui/测试对薄壳的既有契约（见 HANDOFF_NEXT_SESSION.md 第三节）
 from loop_agent_core.compaction import (tool_call_key, result_digest, dedup_key,

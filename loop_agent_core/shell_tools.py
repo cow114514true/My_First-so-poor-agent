@@ -38,6 +38,13 @@ def get_date_mock():
     return datetime.now().strftime("%Y-%m-%d")
 
 
+# 管道命令的两条提示（见 exec_shell_win_mock 末尾的注释：实测两次把 agent 卡住）
+_PIPE_NOTE = ("[note] 这是管道命令：returncode/success 取自管道最后一个命令，不代表被测程序是否成功。")
+_FINDSTR_NOTE = ("findstr 只显示匹配行——测试的汇总行（`N 项失败` / `全部通过`）若不在你的 /C: 模式里就会被滤掉，"
+                 "于是「看不全 → 换模式再过滤 → 还是看不全」。要看结论就别过滤，或把汇总关键字一起写进模式，"
+                 "或在 Python 侧过滤。")
+
+
 def get_weather_mock(location, date):
     return f"Weather in {location} on {date}: Cloudy 7~13°C"
 
@@ -121,14 +128,26 @@ def exec_shell_win_mock(shell_cmd, shell="cmd", q=None):
     if q:
         q.put(("shell_done", proc.returncode))
 
-    return json.dumps({
+    payload = {
         "stdout": stdout_text,
         "stderr": "",
         "returncode": proc.returncode,
         "success": proc.returncode == 0,
         "interrupted": interrupted,
         "timed_out": timed_out,
-    }, ensure_ascii=False, indent=2)
+    }
+    # 管道陷阱（实测两次把 agent 卡在这上面）：
+    # ① cmd.exe 的 returncode 取自管道**最后一个**命令，所以
+    #    `python test_x.py 2>&1 | findstr /C:"FAIL"` 即使测试全失败也会返回 success=true
+    #    （真实证据：三条 [FAIL] 配 "returncode": 0, "success": true）；
+    # ② findstr 只显示匹配行 —— 汇总行("N 项失败"/"全部通过")不在 /C: 模式里就被滤掉，
+    #    模型"看不全 → 再换模式过滤 → 还是看不全"，把工具轮次烧完还没拿到结论。
+    if "|" in shell_cmd:
+        notes = [_PIPE_NOTE]
+        if "findstr" in shell_cmd.lower():
+            notes.append(_FINDSTR_NOTE)
+        payload["note"] = " ".join(notes)
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 def search_code_mock(pattern, path=".", glob="*.py", output_mode="content"):

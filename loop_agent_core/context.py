@@ -104,6 +104,28 @@ def _rollback_tool_round(conv):
     return False
 
 
+def conversation_problems(msgs, sample=3):
+    """会话消息数组的**硬性结构**问题清单（空列表 = 可用）。
+
+    为什么需要本地先查一遍：API 端对坏结构只会回一句晦涩的话。实测把"折叠档案 sidecar"
+    当成会话加载后，messages 变成档案条目（没有 `role`），此后每次请求都是
+    `422 ... messages[0]: missing field 'role'`，而面板上只看到一串英文报错；
+    保存出来的历史同样是坏的，用户以为"保存失败"。本地查一次 O(n) 的字典查找，
+    换来一句能直接照做的提示。
+    """
+    if not isinstance(msgs, list) or not msgs:
+        return ["不是非空的消息数组"]
+    problems = []
+    for i, m in enumerate(msgs):
+        if not isinstance(m, dict):
+            problems.append(f"messages[{i}] 不是对象")
+        elif not m.get("role"):
+            problems.append(f"messages[{i}] 缺少 role")
+        if len(problems) >= max(1, int(sample)):
+            break
+    return problems
+
+
 # ─────────────────────── 三层上下文管理总入口（L0 → L1 → L2） ───────────────────────
 
 def _parse_trim_notice(content):

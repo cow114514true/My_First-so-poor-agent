@@ -466,8 +466,11 @@ async def run() -> None:
                   f"width={think.content_region.width}")
 
             # (b) 隐藏期间继续流式写入：不上屏但必须记账
+            #     这里**不能**再置 _think_round = None：轮次一变 _h_thinking_chunk 就会
+            #     begin_block，而 begin_block 会把上一块自动折起 → 那 2 万字只剩标题 +
+            #     尾部预览，(c) 的"内容没有丢"自然就对不上了。判据是"还是同一轮"，
+            #     所以本节的 big + hidden 必须落在同一个块里（见 (c) 的块数断言）。
             hidden = "隐藏期间继续输出的思考内容也不会丢" * 20
-            app._think_round = None
             for ch in hidden:
                 app._handle_event({"type": "thinking_chunk", "content": ch, "round": 1})
             app._flush_think()
@@ -484,6 +487,13 @@ async def run() -> None:
                   f"{len(rows)} vs {len(big + hidden)} 字")
             # 重排结果必须与纯折行函数逐行一致：直接铺 Strip 绕开了 RichLog.write，
             # 少一行、多一行、或哪一行被截断了都要在这里暴露。
+            # 这条等式只在"本节内容全在同一个无标题块里"时成立：块与块之间各自独立
+            # wrap_cjk，块边界不会像旧单缓冲那样跨块合并，块数-1 行、再加每块的标题行
+            # 都会让行数与单次 wrap_cjk 不一致。所以先钉住这个前提。
+            check("本节内容在一个无标题块里（块边界不跨块合并折行）",
+                  len(think._blocks) == 1 and not think._blocks[0].has_header,
+                  f"{len(think._blocks)} 块, has_header="
+                  f"{[b.has_header for b in think._blocks]}")
             expect = wrap_cjk(big + hidden, think.content_region.width)
             got = ["".join(s.text for s in ln) for ln in think.lines]
             check("重排逐行等于 wrap_cjk 的结果", got == expect,
@@ -631,6 +641,20 @@ async def run() -> None:
         await pilot.pause(0.6)
         check("再按一次 Ctrl+T 恢复等分", str(think.styles.width) == "1fr",
               f"think={think.styles.width}")
+
+        # 新行为：一轮结束（下一轮开始）后该块自动折叠，只留标题 + 尾部预览；
+        # 正在写入的块保持展开。全文要展开才看得到（z 键 / expand_all）。
+        check("已完成块自动折叠、当前块保持展开",
+              [b.collapsed for b in think._blocks] == [True, False],
+              f"{[b.collapsed for b in think._blocks]}")
+        folded_view = "".join("".join(s.text for s in ln) for ln in think.lines).replace(" ", "")
+        check("折叠块只留标题与尾部预览（正文不再铺出）",
+              folded_view.count(folded) == 0 and "Round2" in folded_view
+              and len(folded_view) < len(folded),
+              f"折叠视图 {len(folded_view)} 字 / 全文 {len(folded)} 字")
+
+        think.expand_all()
+        await pilot.pause(0.3)
         rows = "".join("".join(s.text for s in ln) for ln in think.lines).replace(" ", "")
         check("折叠期间的思考内容原样回来",
               rows.startswith(folded + "同一轮续写") and rows.endswith("第二轮"),

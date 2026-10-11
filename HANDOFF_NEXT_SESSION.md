@@ -122,6 +122,7 @@ agent/
 - **档案（可回滚）**：挂在薄壳 `_session_state["_archive"]`（**同一个 list 对象**，`_archive()` 返回它，apply/expand 都就地改）；`/save` 与 autosave 写 `<会话名>.archive.json` sidecar，`/load` 与 autosave 恢复时 `adopt_archive()` 取回。会话文件本身**仍是 `messages` 数组**（格式未变，`replay()` 不受影响）。
 - **阈值口径**：`compaction_cap() = _prune_cap() * COMPACT_TRIGGER_RATIO`（默认 0.5）。不新增第二套 ctx 计算。
 - **`/compact` 的 cap 必须用 `_prune_cap()`，绝不能传 0**（BUG 30）：`cap` 是 **L2 的裁剪目标**，与 L1 阈值无关；`_prune_messages(0)` 会删光所有可删组（实测 8 条 → 2 条）。"强制"靠在 `_prep_context(..., force=True)` → `should_compact(force=True)`（只跳过排期闸门，`COMPACT_MAX_PER_SESSION` 仍生效）。另：不要再引入"同一轮只压一次"的 token 闸门——`id(conv)` 会被地址复用骗到，`(轮次,size)` 会把显式 `/compact` 变成静默无操作；防重复靠 interval/backoff/中断三条闸门。
+- **sidecar 名与会话名冲突，筛会话必须走 `tui.is_conversation_file()`**（BUG 31）：sidecar 是 `<会话>.json.archive.json`，**也**匹配 `chat_*.json`；只用 `endswith(".json")` 列目录会把它当会话，`/load` 后 `messages` 被换成没有 `role` 的档案条目 → 每次请求 422、每次保存写出坏历史。校验统一用 `context.conversation_problems()` / `tui.read_conversation()`（**先校验再动 `_agent_messages`**），`runner.chat_impl` 发请求前也有一道同款护栏。
 - **依据**：arXiv 2605.23296 —— 摘要保留率随输入增长断崖下跌（96k 输入仅 ~3%）、摘要输出与输入/提示词近乎无关、同步压缩可占端到端耗时最高 62%、运行间不稳定（余弦 0.62–0.86，故必须留原文档案）。
 
 ---
@@ -144,8 +145,11 @@ agent/
 ```bash
 python test_code_index.py    # 全过（XML/DSML/上下文/rollback/记忆工具 + 压缩契约）
 python test_multi_agent.py   # 7 项全过（多 agent 隔离/事件/守卫）
-python test_compaction.py    # 33 项全过（L0 去重/L1 分块摘要/L2 兜底/档案/频率预算/失败退避与诊断）
-python run_tests.py          # 9 套件全过（需要 DS_KEY，config 在 import 时就要建 client）
+python test_compaction.py    # 36 项全过（L0 去重/L1 分块摘要/L2 兜底/档案/频率预算/失败退避与诊断/会话文件校验）
+python test_runner_visibility.py  # 6 项全过（回合结束必须"看得见"：notice 事件 + edit_file 候补提示）
+python run_tests.py          # 10 套件（需要 DS_KEY，config 在 import 时就要建 client）
+                             # 注意：test_tui_markdown.py 现有 3 项红，属**未提交**的
+                             # 思考块折叠 WIP（见 THINKING_PANEL_FOLD_DESIGN.md），与本项无关
 python test_progress.py      # 悬空，跑会 SKIP，可无视
 ```
 
@@ -162,7 +166,7 @@ python test_progress.py      # 悬空，跑会 SKIP，可无视
 
 ## 八、历史已完成项（速览，细节见 git log）
 
-- **上下文压缩三层**（v2.13；v2.14 修"失败刷屏"与 `/compact` 清空历史）：`loop_agent_core/compaction.py`（L0 去重 / L1 分块滚动摘要 / 档案回滚）+ `context._prep_context`（编排 + 频率预算 + 失败退避）+ `recall_archive` 工具 + TUI `/compact`·`/expand`·5 个压缩事件 + sidecar 档案；`test_compaction.py` 33 项。设计依据见 §四.5。
+- **上下文压缩三层**（v2.13；v2.14 修"失败刷屏"与 `/compact` 清空历史；v2.15 修 sidecar 被当会话加载）：`loop_agent_core/compaction.py`（L0 去重 / L1 分块滚动摘要 / 档案回滚）+ `context._prep_context`（编排 + 频率预算 + 失败退避）+ `recall_archive` 工具 + TUI `/compact`·`/expand`·5 个压缩事件 + sidecar 档案；`test_compaction.py` 36 项。设计依据见 §四.5。
 - **单文件拆分重构**（2026-08-04）：`loop_agent_v2.py` 1515 行 → 106 行薄壳 + `loop_agent_core/` 13 模块。修 worker 隔离 bug（全局 messages → conv["messages"]）。
 - **400 错误修复**（2026-08-04）：DeepSeek 只认自己签发的 tool_call id → 非本地后端忽略 XML 调用；最终阶段补 `tools=tools`；新增 `_safe_create` + `_rollback_tool_round`。
 - **DSML 污染修复**（2026-08-04）：全角竖线 `|DSML|` 变体污染工具标签 → `_DSML_RE` 匹配 `[|｜]+DSML[|｜]+`，四入口剥离。

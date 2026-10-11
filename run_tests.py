@@ -14,6 +14,7 @@ SUITES = [
     "test_security_hardening.py",
     "test_purpose.py",
     "test_compaction.py",
+    "test_runner_visibility.py",
 ]
 
 

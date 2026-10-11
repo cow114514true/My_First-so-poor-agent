@@ -296,6 +296,41 @@ def write_file_mock(path, content, purpose=""):
     return msg
 
 
+def _close_match_hint(content: str, old_string: str, limit: int = 5) -> str:
+    """old_string 在同一文件里找不到时，给模型几条**真正相近**的行做锚点纠错。
+
+    旧实现判相近用的是 `stripped[:5] in old_string`：空行的 stripped 是 ""，而 ""
+    恒为任意字符串的子串 → 候补被空行占满。实测模型收到的是
+    `line 5: / line 14: / line 28: / line 33: / line 34:` 后面全是空的，
+    拿不到任何线索，只能盲目重试（真实会话里它最后放弃了 edit_file，
+    改成写一个 Python 脚本批量改盘——风险高得多）。
+    """
+    probe = next((ln.strip() for ln in old_string.splitlines() if ln.strip()), "")
+    if len(old_string) <= 5 or not probe:
+        return ""
+    scored = []
+    for i, line in enumerate(content.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped:  # 空行跟任何 old_string 都"相似"，不是候选
+            continue
+        if probe[:5] in stripped or stripped[:5] in probe:
+            scored.append((1.0, i, stripped))
+    if not scored:
+        # 前缀对不上（缩进/换行被改过）→ 用难度分数兜底，候选按相似度排序
+        for i, line in enumerate(content.splitlines(), 1):
+            stripped = line.strip()
+            if not stripped or abs(len(stripped) - len(probe)) > max(20, len(probe)):
+                continue
+            ratio = difflib.SequenceMatcher(None, probe, stripped).ratio()
+            if ratio >= 0.6:
+                scored.append((ratio, i, stripped))
+    if not scored:
+        return ""
+    scored.sort(key=lambda t: (-t[0], t[1]))
+    lines = [f"  line {i}: {s[:70]}" for _, i, s in scored[:limit]]
+    return "\nPossible close matches (check whitespace/indentation):\n" + "\n".join(lines)
+
+
 def edit_file_mock(path, old_string, new_string="", replace_all=False, purpose=""):
     """精确替换 old_string。默认要求唯一（找不到/不唯一报错且不写入）；
     replace_all=True 时替换全部出现。写前备份，写失败自动恢复，返回附本次改动的 diff 供模型自检。"""
@@ -314,15 +349,8 @@ def edit_file_mock(path, old_string, new_string="", replace_all=False, purpose="
     n = content.count(old_string)
     if n == 0:
         # 找不到：给出相近行候补，帮本地模型纠错（空白/缩进偏差常见）
-        suggestions = []
-        for i, line in enumerate(content.splitlines(), 1):
-            stripped = line.strip()
-            if len(old_string) > 5 and (old_string[:5] in stripped or stripped[:5] in old_string):
-                suggestions.append(f"  line {i}: {stripped[:60]}")
-        hint = ""
-        if suggestions:
-            hint = "\nPossible close matches (check whitespace/indentation):\n" + "\n".join(suggestions[:5])
-        return f"[Error] '{old_string[:40]}' not found in {os.path.basename(resolved)}.{hint}"
+        return (f"[Error] '{old_string[:40]}' not found in {os.path.basename(resolved)}."
+                f"{_close_match_hint(content, old_string)}")
     if not confirm.request("edit_file", resolved, purpose):
         return "[Denied by user]"
     if not replace_all and n > 1:

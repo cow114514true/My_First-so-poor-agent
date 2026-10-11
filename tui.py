@@ -32,6 +32,36 @@ import loop_agent_v2
 import loop_agent_core.config as _cfg
 
 
+# ─────────────────── 会话文件：识别 + 校验（BUG 31 的防线） ───────────────────
+
+def is_conversation_file(name: str) -> bool:
+    """是否是**会话**文件（排除折叠档案 sidecar 与 autosave）。
+
+    坑：sidecar 名是 `<会话>.json.archive.json`，它**同样**满足
+    `startswith("chat_") and endswith(".json")` —— 用这个口径列目录会把 sidecar
+    当成会话（实测：用户 `/load 1` 加载了 sidecar，`messages` 被换成折叠档案条目，
+    此后每次请求都 `422 messages[0]: missing field role`，保存出来的历史也是坏的）。
+    """
+    return (name.startswith("chat_") and name.endswith(".json")
+            and not name.endswith(".archive.json"))
+
+
+def read_conversation(path: str):
+    """读取并**校验**会话文件，返回 `(messages, error)`；校验不过绝不返回半份数据。
+
+    校验必须在动 `_agent_messages` **之前**做：加载失败时当前会话必须原封不动。
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return None, f"读取失败：{e}"
+    problems = loop_agent_v2.conversation_problems(data)
+    if problems:
+        return None, "不是有效会话（" + "；".join(problems) + "）"
+    return data, ""
+
+
 class QuitDialog(Screen):
     """Modal: save conversation before exit?"""
 
@@ -296,6 +326,45 @@ def wrap_cjk(text: str, width: int) -> list:
     return lines
 
 
+class ThinkBlock:
+    """思考面板里的一个块 = 一轮思考，可折叠。
+
+    块并不另存正文：它只是 _history 里的一条 ("h", block) 标记，正文仍按原来的方式
+    平铺在标记之后。这样流式折行、残尾缓冲、重排、裁尾（_tail_history）这些已经调好
+    的逻辑一行都不用改，块只负责"标题 + 折叠状态 + 统计"。
+
+    has_header=False 的块（会话/清空后的第一块）不打标题行，与旧版"第一轮不打
+    分隔线"的表现一致。
+    """
+
+    __slots__ = ("key", "label", "has_header", "collapsed", "chars",
+                 "tools", "tail", "started", "duration")
+
+    _TAIL_KEEP = 400  # 折叠预览只看正文尾部这么多字符
+
+    def __init__(self, key, label: str, has_header: bool = True) -> None:
+        self.key = key                  # (问题序号, 轮次)：轮次重号时也不会串块
+        self.label = label              # 标题里显示的轮次，如 "Round 3"
+        self.has_header = has_header
+        self.collapsed = False
+        self.chars = 0
+        self.tools: list = []
+        self.tail = ""
+        self.started = time.monotonic()
+        self.duration = 0.0
+
+    def add_text(self, raw: str) -> None:
+        self.chars += len(raw)
+        self.tail = (self.tail + raw)[-self._TAIL_KEEP:]
+
+    def add_tool(self, name: str) -> None:
+        if name not in self.tools:
+            self.tools.append(name)
+
+    def close(self) -> None:
+        self.duration = time.monotonic() - self.started
+
+
 class PanelLog(RichLog):
     """RichLog with double-click detection for panel expansion + reflow on resize."""
 
@@ -323,6 +392,9 @@ class PanelLog(RichLog):
         self._block_emitted: bool = False  # 当前文本块是否已经上过屏
         self._last_width: int = 0
         self._reflow_timer = None
+        # 块模型：块头以 ("h", ThinkBlock) 标记项混在 _history 里，正文照旧平铺其后。
+        self._blocks: list = []
+        self._cur_block = None  # 正在写入的块（流式文本都记在它身上）
 
     @staticmethod
     def _safe_strip(text):
@@ -419,6 +491,8 @@ class PanelLog(RichLog):
         else:
             self._history.append(("t", [raw]))
             self._trim_history()
+        if self._cur_block is not None:
+            self._cur_block.add_text(raw)  # 块只统计字数/留一段尾部（折叠预览用）
 
     def flush_text(self) -> None:
         """把残尾也上屏（句末 / 硬换行 / 超时兜底 / 轮次收尾时调用）。"""
@@ -496,6 +570,8 @@ class PanelLog(RichLog):
 
     def clear(self):
         self._history.clear()
+        self._blocks.clear()
+        self._cur_block = None
         self._pending_text = ""
         self._pending_since = time.monotonic()
         self._block_emitted = False
@@ -542,9 +618,12 @@ class PanelLog(RichLog):
         if not max_lines:
             return list(self._history)
         target = int(max_lines * width * 1.25)
+        hist = self._history
         tail: list = []
         cells = 0
-        for kind, payload in reversed(self._history):
+        start = 0
+        for i in range(len(hist) - 1, -1, -1):
+            kind, payload = hist[i]
             if kind == "t":
                 keep: list = []
                 for chunk in reversed(payload):
@@ -557,8 +636,17 @@ class PanelLog(RichLog):
             else:
                 tail.append((kind, payload))
             if cells >= target:
+                start = i
                 break
         tail.reverse()
+        # 若窗口从某个块体中间开始，往前补上它的块头标记：否则重排时不知道这个块是
+        # 折叠的，会把已经折起的内容又整段铺出来。
+        if tail and tail[0][0] != "h":
+            j = start
+            while j > 0 and hist[j][0] != "h":
+                j -= 1
+            if hist[j][0] == "h":
+                tail.insert(0, hist[j])
         return tail
 
     def reflow(self) -> None:
@@ -611,7 +699,22 @@ class PanelLog(RichLog):
                 except Exception:
                     super(PanelLog, self).write("[dim]...[/dim]", width=width, scroll_end=False)
 
+        collapsed = False
         for kind, payload in self._tail_history(width):
+            if kind == "h":
+                # 块头：先把上一块的正文铺完，再决定本块是整段铺开还是只留标题+预览
+                flush_block()
+                flush_pending()
+                if payload.has_header:
+                    write_rich(self._block_title(payload))
+                collapsed = payload.collapsed
+                if collapsed:
+                    preview = self._preview_text(payload, width)
+                    if preview:
+                        write_rich(f"[dim]{escape(preview)}[/dim]")
+                continue
+            if collapsed:
+                continue  # 折叠块：正文整段跳过
             if kind == "t":
                 chunks.extend(payload)
                 continue
@@ -627,6 +730,90 @@ class PanelLog(RichLog):
         self.virtual_size = Size(self._widest_line_width, len(self.lines))
         self.refresh()
         self.scroll_to(y=min(y, self.max_scroll_y), animate=False, immediate=True)
+
+    # -- 块（思考面板的折叠单元） --
+
+    def begin_block(self, key, label: str, has_header: bool = True) -> ThinkBlock:
+        """开启一个新块；上一个块自动收尾并折叠，当前块保持展开。
+
+        has_header 由调用方给：会话/清空后的第一块不打标题行，与旧版"第一轮不打
+        分隔线"一致。
+        """
+        self.flush_text()
+        cur = self._cur_block
+        if cur is not None:
+            cur.close()
+            cur.collapsed = True
+        block = ThinkBlock(key, label, has_header)
+        self._blocks.append(block)
+        self._cur_block = block
+        self._history.append(("h", block))
+        self._trim_history()
+        if self._text_width():
+            self.reflow()  # 上一块的正文要以"折叠"形态重铺，只能整体重建
+        return block
+
+    def note_tool(self, name: str) -> None:
+        """记下当前块调用过的工具（折叠标题里显示）。
+
+        这里刻意不重排：标题会在下一次 begin_block/resize 时自然更新，避免每次工具
+        调用都把整块屏幕重建一遍。
+        """
+        if self._cur_block is not None:
+            self._cur_block.add_tool(name)
+
+    def _block_title(self, block: ThinkBlock) -> str:
+        """块标题行，如 `── ▸ Round 3 · edit_file · 1.2k 字 · 4.1s ──`。"""
+        arrow = "▸" if block.collapsed else "▾"
+        bits = [f"{arrow} {block.label}"]
+        if block.tools:
+            bits.append(", ".join(block.tools))
+        bits.append(self._fmt_chars(block.chars))
+        if block.duration >= 0.1:
+            bits.append(f"{block.duration:.1f}s")
+        return f"\n[dim]── {escape(' · '.join(bits))} ──[/dim]"
+
+    @staticmethod
+    def _fmt_chars(n: int) -> str:
+        return f"{n / 1000:.1f}k 字" if n >= 1000 else f"{n} 字"
+
+    def _preview_text(self, block: ThinkBlock, width: int) -> str:
+        """折叠体默认显示的尾部预览：取正文末尾，截到一行放得下。"""
+        text = " ".join(block.tail.split())
+        if not text:
+            return ""
+        budget = max(8, width - 8)
+        out: list = []
+        cells = 0
+        for ch in reversed(text):
+            c = cell_len(ch)
+            if cells + c > budget:
+                break
+            out.append(ch)
+            cells += c
+        body = "".join(reversed(out))
+        return "…" + body if len(out) < len(text) else body
+
+    def expand_all(self) -> None:
+        """展开所有块（折叠块只显示标题 + 尾部预览，展开才看得到全文）。"""
+        for b in self._blocks:
+            b.collapsed = False
+        if self._text_width():
+            self.reflow()
+
+    def collapse_all(self) -> None:
+        """折叠所有已完成的块；正在写入的块保持展开。"""
+        cur = self._cur_block
+        for b in self._blocks:
+            b.collapsed = b is not cur
+        if self._text_width():
+            self.reflow()
+
+    def toggle_all(self) -> None:
+        if any(b.collapsed for b in self._blocks):
+            self.expand_all()
+        else:
+            self.collapse_all()
 
     def on_click(self, event) -> None:
         now = time.monotonic()
@@ -799,6 +986,7 @@ class AgentTUI(App):
         Binding("escape", "collapse_panel", "", show=False),
         Binding("ctrl+j", "submit_input", "Send"),
         Binding("ctrl+t", "toggle_think_panel", "Fold Think", show=False),
+        Binding("z", "toggle_think_blocks", "Fold Blocks", show=False),
         Binding("`", "toggle_shell", "Shell"),
     ]
 
@@ -928,6 +1116,7 @@ class AgentTUI(App):
         self._stream_buffer: str = ""
         self._stream_width: int = 0        # 缓存当前流式消息的面板宽度
         self._think_round = None
+        self._q_index: int = 0             # 问题序号：块 key 用它区分重号的轮次
         self._shell_visible: bool = False
         self._expanded_panel: str = ""  # non-empty when a panel is expanded
         self._collapsed: set = set()       # 被折叠（宽度置 0）的面板裸 id，Ctrl+T 切换
@@ -1062,6 +1251,14 @@ class AgentTUI(App):
         if self._expanded_panel:
             self._restore_panels()
 
+    def action_toggle_think_blocks(self) -> None:
+        """z：思考块在"展开全部 / 折叠全部"之间切换。
+
+        已完成块默认自动折叠（只留标题 + 尾部预览），这里给一个整体展开的入口；
+        块级逐条导航留到后续阶段。
+        """
+        self.query_one("#think-panel", PanelLog).toggle_all()
+
     def action_toggle_think_panel(self) -> None:
         """Ctrl+T：折叠/展开思考面板（同一按键来回切换，再按一次即恢复）。
 
@@ -1170,7 +1367,7 @@ class AgentTUI(App):
         os.makedirs(self._save_dir, exist_ok=True)
 
         all_files = sorted(
-            [f for f in os.listdir(self._save_dir) if f.startswith("chat_") and f.endswith(".json")],
+            [f for f in os.listdir(self._save_dir) if is_conversation_file(f)],
             reverse=True,
         )
 
@@ -1178,20 +1375,15 @@ class AgentTUI(App):
             chat_panel.note("No saved conversations found.")
             return
 
-        # Separate valid from corrupted
+        # Separate valid from corrupted（sidecar / 半截文件都会落到 corrupted）
         valid_files = []
         corrupted_files = []
         for f in all_files:
-            filepath = os.path.join(self._save_dir, f)
-            try:
-                with open(filepath, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                if not isinstance(data, list):
-                    corrupted_files.append(f)
-                else:
-                    valid_files.append((f, data))
-            except Exception:
-                corrupted_files.append(f)
+            data, err = read_conversation(os.path.join(self._save_dir, f))
+            if err:
+                corrupted_files.append((f, err))
+            else:
+                valid_files.append((f, data))
 
         # Number selection → /load N (only counts valid files)
         try:
@@ -1236,20 +1428,23 @@ class AgentTUI(App):
 
         if corrupted_files:
             chat_panel.note("Corrupted files (will be skipped on save cleanup):", classes="notice")
-            for f in corrupted_files:
-                chat_panel.note(f"  ✗ {f}")
+            for f, err in corrupted_files:
+                chat_panel.note(f"  ✗ {f}  {err}")
 
         if valid_files:
             chat_panel.note(f"Usage: /load <number> (1-{len(valid_files)})")
 
     def _load_file(self, filepath: str) -> None:
-        """Load a conversation file and rebuild UI."""
+        """Load a conversation file and rebuild UI.
+
+        **先校验再动历史**：加载失败/文件不是会话（如把折叠档案 sidecar 当会话）时必须
+        保持当前会话原封不动，否则一次误加载就会把内存里的对话换成垃圾，且此后每次请求
+        都 422、每次保存都写出坏历史（实测踩到）。
+        """
         chat_panel = self.query_one("#chat-panel", ChatTranscript)
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-        except Exception as e:
-            chat_panel.note(f"Failed to load: {e}", classes="error")
+        loaded, err = read_conversation(filepath)
+        if err:
+            chat_panel.note(f"Failed to load {os.path.basename(filepath)}：{err}", classes="error")
             return
 
         _agent_messages.clear()
@@ -1271,16 +1466,16 @@ class AgentTUI(App):
         self._update_footer()
 
     def _try_recover_autosave(self) -> None:
-        """启动时检测 .autosave.json，有可恢复内容则弹恢复对话框。"""
+        """启动时检测 .autosave.json，有可恢复内容则弹恢复对话框。
+
+        同样要**先校验**：坏 autosave（例如被误加载的折叠档案又被 autosave 写出来）
+        弹给用户恢复，等于把损坏的历史请回来。
+        """
         autosave_path = os.path.join(self._save_dir, ".autosave.json")
         if not os.path.exists(autosave_path):
             return
-        try:
-            with open(autosave_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, list) or len(data) <= 1:
-                return
-        except Exception:
+        data, err = read_conversation(autosave_path)
+        if err or len(data) <= 1:
             return
         self._recovery_data = data
         self._recovery_path = autosave_path
@@ -1583,6 +1778,9 @@ class AgentTUI(App):
             "compacted": self._h_compacted,
             "compact_failed": self._h_compact_failed,
             "compact_skipped": self._h_compact_skipped,
+            # 回合怎么结束的（思考循环 / 乱码 / 中断 / 收尾催办）：以前这些只在
+            # runner 里 return，返回值又被丢掉 → 面板零输出，看起来像"静默停止工作"
+            "notice": self._h_notice,
         }
         if handler := handlers.get(etype):
             handler(event)
@@ -1618,6 +1816,7 @@ class AgentTUI(App):
         哨兵不能是 None——None 表示"面板里还没有过轮次"，那时不该打分隔线。
         """
         self._think_round = self._NEW_QUESTION
+        self._q_index += 1
 
     def _reset_think_rounds(self) -> None:
         """思考面板被清空（/clear、/load）后把轮次计数一起归零，避免徽标留着旧计数。"""
@@ -1630,15 +1829,18 @@ class AgentTUI(App):
         if not content:
             return
         r = e.get("round", "?")
-        self._note_think_round()
         panel = self.query_one("#think-panel", PanelLog)
+        if r != self._think_round:
+            panel.flush_text()
+            panel.begin_block((self._q_index, r), f"Round {r}",
+                              has_header=self._think_round is not None)
+            self._think_round = r
+            self._note_think_round()
         if len(content) > 300:
-            panel.write_wrapped(f"\n[dim]── Round {r} (enter to expand) ──[/dim]")
             panel.stream_text(escape(content[:300]))
             panel.flush_text()
             panel.write_wrapped(f"[dim]... ({len(content)} chars)[/dim]")
         else:
-            panel.write_wrapped(f"\n[dim]── Round {r} ──[/dim]")
             panel.stream_text(escape(content))
             panel.flush_text()
 
@@ -1649,11 +1851,10 @@ class AgentTUI(App):
         rnd = e.get("round", self._think_round)
         panel = self.query_one("#think-panel", PanelLog)
         if rnd != self._think_round:
-            # 新轮次：本轮残尾先收尾，再打分隔线（write 内部也会 flush，这里显式写
-            # 是为了让"上一轮的内容"和"分隔线"之间不留歧义）
-            panel.flush_text()
-            if self._think_round is not None:
-                panel.write(f"\n[dim]── Round {rnd} ──[/dim]")
+            # 新轮次：开一个新块（旧块自动收尾并折叠），块标题兼作旧版的分隔线。
+            # key 用 (问题序号, 轮次)：runner 每个问题都从 round=1 重数，只认轮次会串块。
+            panel.begin_block((self._q_index, rnd), f"Round {rnd}",
+                              has_header=self._think_round is not None)
             self._think_round = rnd
             self._note_think_round()
         # 折行、禁则、残尾缓冲都在 PanelLog 里做：只把折满的整行上屏，
@@ -1681,8 +1882,10 @@ class AgentTUI(App):
         self._set_status("calling_tool")
         chat_panel = self.query_one("#chat-panel", ChatTranscript)
         tool_panel = self.query_one("#tool-panel", RichLog)
+        think_panel = self.query_one("#think-panel", PanelLog)
         for c in e.get("calls", []):
             name = c["name"]
+            think_panel.note_tool(name)  # 本轮调用的工具：折叠标题里要显示
             chat_panel.note(f"  calling {name}...")
             tool_panel.write(f"\n[bold yellow]→ {escape(name)}[/bold yellow]")
             try:
@@ -1803,6 +2006,19 @@ class AgentTUI(App):
         elif e.get("reason") == "backoff" and e.get("retry_in_turns"):
             reason += f"（还需 {e['retry_in_turns']} 轮）"
         self.query_one("#chat-panel", ChatTranscript).note(f"跳过压缩（{reason}）", classes="note")
+
+    def _h_notice(self, e: dict) -> None:
+        """回合结束原因 / 催办提示（runner 的 notice 事件）。
+
+        这是"静默停止"的正解：以前模型卡在只输出思考时，runner 的消息只 return、
+        不上屏，面板看起来就是 agent 自己停了。warn 用 ⚠ 标出（失败的回合），
+        info 用 ·（自愈动作，例如"已要求模型继续 1/3"）。
+        """
+        msg = str(e.get("message", "")).strip()
+        if not msg:
+            return
+        icon = "⚠" if e.get("level") == "warn" else "·"
+        self.query_one("#chat-panel", ChatTranscript).note(f"{icon} {msg}", classes="notice")
 
     # -- helpers --
 

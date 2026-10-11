@@ -601,6 +601,7 @@ def test_thin_shell_reexports_contract():
                  "persist_archive", "load_archive", "build_block_prompt", "validate_summary",
                  "summary_reject_reason", "failure_hint", "skip_label", "log_compaction_failure",
                  "cstate", "next_turn", "reset_failures", "clear_compact_state", "_compact_state",
+                 "conversation_problems",
                  "run_rolling_summary", "compaction_cap", "placeholder_text",
                  "persist_archive_sidecar", "adopt_archive", "clear_archive",
                  "expand_compaction", "compact_session", "summarize_block", "_compact_k"):
@@ -1008,6 +1009,97 @@ def test_compact_command_never_wipes_history():
         _env(COMPACT_ENABLED=None, COMPACT_TRIGGER_RATIO=None)
 
 
+# ────────────── 会话文件校验：sidecar 不能被当成会话加载（BUG 31） ──────────────
+
+def test_conversation_problems_detects_bad_shapes():
+    """坏结构必须能在本地被点名（API 端只说 `messages[0]: missing field role`）。"""
+    assert la.conversation_problems([_mkmsg("system", "s"), _mkmsg("user", "q")]) == []
+    assert la.conversation_problems([]) == ["不是非空的消息数组"]
+    assert la.conversation_problems("不是 list") == ["不是非空的消息数组"]
+    # 折叠档案条目：是 dict、是 list 元素，但没有 role —— 正是线上 422 的形态
+    entry = {"ts": "2026-10-11 20:27:01", "messages": [_mkmsg("user", "q")],
+             "inserted": "...", "shape": "system"}
+    problems = la.conversation_problems([entry, entry])
+    assert problems and "role" in problems[0], problems
+    assert len(problems) <= 3, "问题清单要有界（样例会截断）"
+
+
+def test_sidecar_is_never_listed_or_loaded_as_conversation():
+    """BUG 31 回归：sidecar 名 `<会话>.json.archive.json` 也匹配 `chat_*.json`。
+
+    直接测 TUI 用的两个函数 + 断言 `/load` 确实接了它们（否则改回旧口径测试也发现不了）。
+    """
+    import inspect
+    import tui
+
+    assert tui.is_conversation_file("chat_20261011_202701.json") is True
+    assert tui.is_conversation_file("chat_20261011_202701.json.archive.json") is False, \
+        "折叠档案 sidecar 不是会话"
+    assert tui.is_conversation_file(".autosave.json") is False
+    assert tui.is_conversation_file("chat_20261011_202701.json.bak") is False
+
+    # 接线：列表、加载、autosave 恢复三处都必须走这套校验
+    for fn in (tui.AgentTUI._cmd_load, tui.AgentTUI._load_file, tui.AgentTUI._try_recover_autosave):
+        src = inspect.getsource(fn)
+        assert "is_conversation_file" in src or "read_conversation" in src, fn.__name__
+
+    tmpdir = os.path.join(la.WORK_DIR, "tmp")
+    os.makedirs(tmpdir, exist_ok=True)
+    good = os.path.join(tmpdir, "_selftest_conv_good.json")
+    sidecar = os.path.join(tmpdir, "_selftest_conv_good.json.archive.json")
+    try:
+        msgs = [_mkmsg("system", "s"), _mkmsg("user", "你好"), _mkmsg("assistant", "在")]
+        with open(good, "w", encoding="utf-8") as f:
+            json.dump(msgs, f, ensure_ascii=False)
+        with open(sidecar, "w", encoding="utf-8") as f:   # sidecar 内容是档案条目数组
+            json.dump([{"ts": "x", "messages": msgs, "inserted": "y", "shape": "system"}],
+                      f, ensure_ascii=False)
+
+        loaded, err = tui.read_conversation(good)
+        assert err == "" and loaded == msgs, (err, loaded)
+        loaded2, err2 = tui.read_conversation(sidecar)
+        assert loaded2 is None and "role" in err2, (loaded2, err2)
+        _, err3 = tui.read_conversation(os.path.join(tmpdir, "_selftest_conv_missing.json"))
+        assert err3, "读不存在的文件必须报错而不是返回空"
+    finally:
+        for p in (good, sidecar):
+            if os.path.exists(p):
+                os.remove(p)
+
+
+def test_chat_refuses_corrupted_history():
+    """E2E 护栏：历史结构坏了要在**发请求之前**拒绝，并给出可照做的提示（而不是 422 天书）。"""
+    import types as _t
+    import loop_agent_core.runner as runner_mod
+
+    saved_msgs = list(la.messages)
+    saved_size = la._msg_size
+    saved_create = runner_mod._safe_create
+    calls = []
+
+    def _fake_create(conv, **kw):
+        calls.append(kw)
+        return iter([])
+
+    try:
+        # 模拟"把 sidecar 当会话加载"后的历史
+        la.messages.clear()
+        la.messages.append({"ts": "x", "messages": [_mkmsg("user", "q")], "shape": "system"})
+        la._msg_size = None
+        runner_mod._safe_create = _fake_create
+        events = []
+        out = la.chat("随便问一句", on_event=events.append)
+        assert not calls, "结构坏了就不该发请求"
+        assert "[Internal error]" in out and "role" in out, out
+        errs = [e for e in events if e.get("type") == "error"]
+        assert errs and "/clear" in errs[0]["message"], events
+    finally:
+        runner_mod._safe_create = saved_create
+        la.messages.clear()
+        la.messages.extend(saved_msgs)
+        la._msg_size = saved_size
+
+
 if __name__ == "__main__":
     tests = [
         test_dedup_key_double_condition,
@@ -1041,6 +1133,9 @@ if __name__ == "__main__":
         test_interrupted_compaction_is_not_a_failure,
         test_cross_turn_attempt_cadence,
         test_compact_command_never_wipes_history,
+        test_conversation_problems_detects_bad_shapes,
+        test_sidecar_is_never_listed_or_loaded_as_conversation,
+        test_chat_refuses_corrupted_history,
         test_thin_shell_reexports_contract,
         test_archive_sidecar_adopt_and_persist,
     ]
