@@ -191,6 +191,12 @@ python test_progress.py      # 悬空，跑会 SKIP，可无视
 - 让用户用真实 agent 跑一轮：确认记忆注入、recall/remember 在真实对话中可用。
 - **压缩修复的真实后端复验**（v2.14）：真实 TUI 分别用 DS 与本地后端跑一次长任务，确认面板不再被"压缩失败"刷屏（失败应至多每轮一条且带具体原因）、`/expand` 与 sidecar 正常、本地后端 `api_error.log` 无新增；随后按实测调 `COMPACT_TRIGGER_RATIO` 与 `COMPACT_BLOCK_TOKENS`（都是环境变量，不需要改代码）。单发健康检查：`python tmp/check_compaction_real.py`（取最新会话的一块走真实摘要器，打印保留率与校验结果；`tmp/` 是 gitignore 的临时目录，脚本按仓库惯例不入库）。
 - 杂物可清理：`_verify_fix.py`（DSML 诊断脚本，已无用）、`test_progress.py`（悬空测试）、`tui.py.bak`/`tui.py.backup`/`backup_conflict_files/`/`.DS_Store`/`compile.jpeg`/`seitsuna.png` 等图片。
+- **命令补全（已评估，未做，1~2h）**：输入框目前是**多行 `TextArea`**，而 Textual 8.2.8 的 `Suggester`（`textual.suggester`）**只接在单行 `Input` 上**，多行框没有补全钩子 → 得自己写（Textual 已给 `TextArea.Changed` 消息、`cursor_location`、`replace`、`move_cursor`，不用碰内部）。关键结论与坑：
+  1. **命令只有 9 条**（`/clear /revoke /policy /load /compact /expand /save /quit /help`），补全=前缀匹配；顺带发现 `/help` 只列了 7 条（漏 `/revoke`、`/policy`）→ 建议抽一张 `_COMMANDS` 表做**单一来源**，补全菜单与 `/help` 共用。
+  2. **Tab/Enter/Esc 是 `TextArea._on_key` 自己吞的**（`tab_behavior="focus"` 默认 Tab 切焦点、Enter 插换行）、`↑/↓` 是它的 BINDINGS → 别跟派发顺序较劲，写 `class PromptTextArea(TextArea)` 覆写 `_on_key`：菜单开着才接管这几个键，否则 `await super()._on_key(event)` 原样交回（Tab 切面板、Enter 换行都不受影响）。
+  3. **触发条件要保守**：只在"当前行、光标词以 `/` 开头"时弹（`看看 /lo` 不弹），否则正文里的路径会被干扰。
+  4. **Esc 优先级**：`_agent_busy` 时必须仍是"中断任务"（见 §四.5 与 `action_collapse_panel`），只有空闲且菜单开着才关菜单。**发送始终只走 Ctrl+J**，别让 Enter 变成发送。
+  5. 可选进阶：`/load` 参数补全（复用 `_cmd_load` 的会话列表）、输入历史 `↑/↓` 回顾（往往比命令补全更常用）。测试照 `test_tui_markdown.py` 第 14 节的 pilot 套路写（`/lo` → 浮层含 `/load` → Tab → 输入框变 `/load `；无候选时 Tab 仍切焦点）。
 
 ---
 
