@@ -1251,6 +1251,7 @@ class AgentTUI(App):
         loop_agent_v2.confirm_mod._ask = self._confirm_ask
         self._agent_busy: bool = False
         self._token_total: int = 0
+        self._cache_ratio = None           # 上一次 API 调用的前缀缓存命中率（None=provider 不报）
         self._status: str = "idle"
         self._stream_buffer: str = ""
         self._stream_width: int = 0        # 缓存当前流式消息的面板宽度
@@ -1602,6 +1603,7 @@ class AgentTUI(App):
         self.query_one("#tool-panel", RichLog).clear()
         self._reset_think_rounds()  # 面板已清空 → 轮次徽标一并归零
         self._token_total = 0
+        self._cache_ratio = None
         self._update_footer()
 
     def _try_recover_autosave(self) -> None:
@@ -1678,6 +1680,7 @@ class AgentTUI(App):
             self.query_one("#chat-panel", ChatTranscript).note(
                 "--- Conversation cleared（会话放行已一并撤销）---")
             self._token_total = 0
+            self._cache_ratio = None
             self._reset_think_rounds()  # 思考面板已清空 → 轮次徽标一并归零
             self._update_footer()
             return
@@ -1938,6 +1941,10 @@ class AgentTUI(App):
                 self._token_total += usage.get("total_tokens", 0)
         except Exception:
             pass
+        # 命中率只有 provider 报了 cached_tokens 才有；拿不到就保持上一次的值不动
+        ratio = (e.get("cache") or {}).get("hit_ratio")
+        if isinstance(ratio, (int, float)):
+            self._cache_ratio = ratio
         self._update_footer()
 
     def _note_think_round(self) -> None:
@@ -2122,9 +2129,17 @@ class AgentTUI(App):
             f"⏳ 正在压缩上下文（{e.get('blocks')} 块）…")
 
     def _h_compacted(self, e: dict) -> None:
+        # 前缀稳定块数：摘要链里"逐字相接"的相邻块数（= 可复用前缀缓存的次数）。
+        # 整块丢弃的改动若失效（例如又改回按字符偏移切），这个数会立刻掉到 0。
+        stable = ""
+        blocks = e.get("blocks") or 0
+        if e.get("prefix_stable") is not None and blocks:
+            stable = f"，前缀稳定 {e.get('prefix_stable')}/{max(0, blocks - 1)} 块"
+            if e.get("prefix_dropped"):
+                stable += f"（丢弃 {e.get('prefix_dropped')} 块）"
         self.query_one("#chat-panel", ChatTranscript).note(
             f"📦 上下文已压缩：{e.get('removed')} 条 → {e.get('after')} token"
-            f"（原 {e.get('before')}，{e.get('blocks')} 块）"
+            f"（原 {e.get('before')}，{blocks} 块）{stable}"
             + ("；收益偏低，已改用裁剪兜底" if e.get("low_reclaim") else ""))
 
     def _h_compact_failed(self, e: dict) -> None:
@@ -2215,8 +2230,12 @@ class AgentTUI(App):
         badge = ""
         if "think-panel" in self._collapsed and self._think_round_count:
             badge = f" | 🧠 {self._think_round_count}"
+        # 前缀缓存命中率：provider 不报这个字段时**不显示**（不假装是 0%）
+        cache_show = ""
+        if isinstance(self._cache_ratio, (int, float)):
+            cache_show = f" | 缓存 {self._cache_ratio * 100:.0f}%"
         self.query_one("#footer-bar", Static).update(
-            f" {model_show} | {status} | {tok} tokens{badge} | Get-help: {get_help}"
+            f" {model_show} | {status} | {tok} tokens{cache_show}{badge} | Get-help: {get_help}"
         )
 
     def _update_think_badge(self) -> None:

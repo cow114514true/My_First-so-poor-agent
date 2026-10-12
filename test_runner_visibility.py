@@ -28,6 +28,12 @@ os.environ["FILTERED_LOG"] = _SELFTEST_LOG
 if os.path.exists(_SELFTEST_LOG):  # 每次跑清空；跑完保留，失败时可直接看
     os.remove(_SELFTEST_LOG)
 
+# 前缀缓存遥测落到测试专用文件：别把假 usage 灌进真实 cache_usage.log（TTL/命中率的统计）
+_SELFTEST_CACHELOG = os.path.join(WORK_DIR, "tmp", "_selftest_cache_usage.log")
+os.environ["CACHE_LOG"] = _SELFTEST_CACHELOG
+if os.path.exists(_SELFTEST_CACHELOG):
+    os.remove(_SELFTEST_CACHELOG)
+
 
 # ── 假流式 client ────────────────────────────────────────────────
 class _Delta:
@@ -149,6 +155,79 @@ def test_tui_registers_notice_handler():
     assert hasattr(tui.AgentTUI, "_h_notice")
     src = inspect.getsource(tui.AgentTUI._handle_event)
     assert '"notice": self._h_notice' in src, src
+
+
+# ── 前缀缓存遥测（改动 1）─────────────────────────────────────────
+# 目的：让"为前缀稳定多留 token 到底值不值"变成可量的事。没有 cached_tokens 和
+# 调用间隔，"prefix cache 友好"就只是一句无法证伪的注释。
+def test_cache_stats_reads_every_field_shape():
+    """cached_tokens 的字段名各家不同（DeepSeek / OpenAI 兼容 / dict），都要认。"""
+    import types as _t
+    # DeepSeek 原生字段
+    s = runner._usage_sample(_t.SimpleNamespace(prompt_tokens=1000, completion_tokens=10,
+                                                total_tokens=1010, prompt_cache_hit_tokens=750))
+    assert s["cached_tokens"] == 750 and s["hit_ratio"] == 0.75, s
+    # OpenAI 兼容：塞在 prompt_tokens_details.cached_tokens
+    s = runner._usage_sample(_t.SimpleNamespace(
+        prompt_tokens=200, prompt_tokens_details=_t.SimpleNamespace(cached_tokens=50)))
+    assert s["cached_tokens"] == 50 and s["hit_ratio"] == 0.25, s
+    # dict 形态 + 真·0 命中：必须是 0.0，不能退化成 None
+    s = runner._usage_sample({"prompt_tokens": 100, "prompt_cache_hit_tokens": 0})
+    assert s["cached_tokens"] == 0 and s["hit_ratio"] == 0.0, s
+    # provider 不报这个字段：cached/hit_ratio 都必须是 None（不假装 0%）
+    s = runner._usage_sample(_t.SimpleNamespace(prompt_tokens=10, total_tokens=11))
+    assert s["cached_tokens"] is None and s["hit_ratio"] is None, s
+    # 拿不到 usage 也不能抛
+    assert runner._usage_sample(None)["hit_ratio"] is None
+
+
+def test_cache_gap_is_measured_across_turns():
+    """间隔必须挂在跨轮状态上：挂 conv 会每轮归零，gap 恒为 None，就永远量不出 TTL。"""
+    import types as _t
+    path = os.environ["CACHE_LOG"]
+    before = len([x for x in open(path, encoding="utf-8").read().splitlines() if x.strip()]) \
+        if os.path.exists(path) else 0
+    st = {}
+    first = runner._record_usage(_t.SimpleNamespace(prompt_tokens=5), st, model="m", kind="chat")
+    assert first["gap_s"] is None, first            # 首次调用没有上一次
+    assert isinstance(st.get("_last_call_ts"), dict), st
+    second = runner._record_usage(_t.SimpleNamespace(prompt_tokens=5), st, model="m", kind="summary")
+    # 摘要调用**不能**抹掉聊天侧的间隔：两者是不同的前缀，混记会把 TTL 量短
+    assert second["gap_s"] is None, second
+    third = runner._record_usage(_t.SimpleNamespace(prompt_tokens=5), st, model="m", kind="chat")
+    assert isinstance(third["gap_s"], float) and third["gap_s"] >= 0.0, third
+    assert third["kind"] == "chat", third
+    # 落盘是一行一条 JSON（可 grep、可求和）；用增量断言，不依赖用例执行顺序
+    lines = [json.loads(x) for x in
+             open(path, encoding="utf-8").read().splitlines() if x.strip()]
+    assert len(lines) == before + 3, (before, len(lines))
+    assert [x["kind"] for x in lines[-3:]] == ["chat", "summary", "chat"], lines[-3:]
+
+
+def _usage_tool_chunk(usage):
+    """带 usage 的**工具调用** chunk：choices 非空，所以循环会继续往下走。
+
+    这样能同时走到主循环的 token_usage 与最终流式阶段的 stream_usage 两处接线
+    （只发 usage、没有 choices 的 chunk 会让主循环当场判"乱码"返回，到不了最终阶段）。
+    """
+    c = _tool_call_chunk()
+    c.usage = usage
+    return c
+
+
+def test_usage_events_carry_cache_stats():
+    """真实循环里：token_usage / stream_usage 事件必须带上 cache 统计（TUI 底栏靠它显示）。"""
+    import types as _t
+    usage = _t.SimpleNamespace(prompt_tokens=800, completion_tokens=20, total_tokens=820,
+                               prompt_cache_hit_tokens=600)
+    out, events, conv = _run([[_usage_tool_chunk(usage)]])
+    for etype in ("token_usage", "stream_usage"):
+        evs = [e for e in events if e.get("type") == etype]
+        assert evs, (etype, sorted({e.get("type") for e in events}))
+        cache = evs[0].get("cache")
+        assert cache and cache["hit_ratio"] == 0.75, evs[0]
+        assert evs[0]["usage"] is usage, "原 usage 对象必须原样保留（TUI 累加 total_tokens）"
+    assert conv["size"] >= 800, conv   # 精确计数仍同步进记账（其后追加的消息会再加）
 
 
 def test_edit_hint_never_lists_blank_lines():

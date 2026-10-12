@@ -2,6 +2,7 @@
 API 调用一律用 conv["messages"]（修 worker 子 agent 把主线程历史发给模型的隔离 bug）。"""
 import json
 import os
+import time
 import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -27,6 +28,96 @@ def _dump_filtered(reason, snippet):
             f.write(f"=== {reason} ===\n{snippet}\n\n")
     except Exception:
         pass
+
+
+def _usage_field(usage, name):
+    """usage 可能是 SDK 对象、也可能是 dict；两种都取，取不到返回 None。"""
+    if usage is None:
+        return None
+    v = getattr(usage, name, None)
+    if v is None and isinstance(usage, dict):
+        v = usage.get(name)
+    return v
+
+
+def _cache_hit_tokens(usage):
+    """前缀缓存**命中**的 token 数；取不到返回 None。
+
+    必须是 None 而不是 0：0 和"provider 根本没报这个字段"是两件事，混起来会把
+    "没有统计"误判成"缓存完全没命中"。字段名各家不同是常态，所以逐个探：
+    DeepSeek 用 prompt_cache_hit_tokens，OpenAI 兼容网关塞在
+    prompt_tokens_details.cached_tokens，Anthropic 叫 cache_read_input_tokens。
+    """
+    for name in ("prompt_cache_hit_tokens", "cache_read_input_tokens"):
+        v = _usage_field(usage, name)
+        if isinstance(v, int):
+            return v
+    details = _usage_field(usage, "prompt_tokens_details")
+    if details is not None:
+        for name in ("cached_tokens", "cache_read"):
+            v = getattr(details, name, None)
+            if v is None and isinstance(details, dict):
+                v = details.get(name)
+            if isinstance(v, int):
+                return v
+    return None
+
+
+def _usage_sample(usage, gap_s=None, model="", kind="chat"):
+    """一次 API 调用的用量样本：缓存命中率 + 距上次调用的间隔。
+
+    间隔是**实测 TTL 的原料**：攒够样本后按 gap_s 分桶看 hit_ratio 掉在哪一档，
+    就是这台机器上真实的前缀缓存存活时间。没有它就无从判断"为了让前缀稳定而
+    多留 token"到底值不值。
+    """
+    prompt = _usage_field(usage, "prompt_tokens")
+    cached = _cache_hit_tokens(usage)
+    ratio = None
+    if isinstance(prompt, int) and prompt > 0 and isinstance(cached, int):
+        ratio = round(min(cached, prompt) / prompt, 4)
+    return {"ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "kind": kind,
+            "model": model,
+            "prompt_tokens": prompt,
+            "cached_tokens": cached,
+            "completion_tokens": _usage_field(usage, "completion_tokens"),
+            "total_tokens": _usage_field(usage, "total_tokens"),
+            "hit_ratio": ratio,
+            "gap_s": gap_s}
+
+
+def _dump_cache(sample):
+    """一行 JSON 落进 cache_usage.log（CACHE_LOG 可覆盖，自检套件不污染真实统计）。"""
+    path = os.environ.get("CACHE_LOG") or os.path.join(WORK_DIR, "cache_usage.log")
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _record_usage(usage, st, model="", kind="chat"):
+    """用量记账：算间隔 → 回写 st → 落样本 → 返回样本。
+
+    间隔的载体必须是**跨轮存活**的 st（cstate / 薄壳的 _compact_state）：挂在 conv 上
+    会每轮归零，gap 恒为 None，就永远量不出 TTL。
+
+    间隔**按 kind 分开记**：摘要调用与主对话是两个不同的前缀，共用一根时间戳会让
+    "用户停了 5 分钟"被中间的摘要调用抹成几秒，把 TTL 量短（实测的坑：测出来的存活时间
+    会明显偏保守，从而错误地得出"留前缀没意义"）。
+    """
+    now = time.monotonic()
+    gaps = st.get("_last_call_ts") if isinstance(st, dict) else None
+    if not isinstance(gaps, dict):   # 含旧版本留下的 float 形态：直接换掉
+        gaps = {}
+        if isinstance(st, dict):
+            st["_last_call_ts"] = gaps
+    last = gaps.get(kind)
+    gap = None if last is None else round(now - last, 3)
+    gaps[kind] = now
+    sample = _usage_sample(usage, gap_s=gap, model=str(model or ""), kind=kind)
+    _dump_cache(sample)
+    return sample
 
 
 def _dump_api_error(e, conv, kwargs):
@@ -367,7 +458,9 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 break
             # include_usage：usage 只在最终 chunk（choices=[]）携带，须先于空 choices 分支处理
             if chunk.usage is not None:
-                _emit({"type": "token_usage", "usage": chunk.usage})
+                _emit({"type": "token_usage", "usage": chunk.usage,
+                       "cache": _record_usage(chunk.usage, cstate(conv),
+                                              model=cfg.get("model"))})
                 conv["size"] = chunk.usage.prompt_tokens  # 用 API 精确计数同步记账
                 if not chunk.choices:
                     continue
@@ -513,7 +606,9 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             # include_usage：usage 只在最终 chunk（choices=[]）携带，须先于空 choices 跳过处理
             if chunk.usage is not None:
                 conv["size"] = chunk.usage.prompt_tokens  # 流式结束也用精确计数同步
-                _emit({"type": "stream_usage", "usage": chunk.usage})
+                _emit({"type": "stream_usage", "usage": chunk.usage,
+                       "cache": _record_usage(chunk.usage, cstate(conv),
+                                              model=cfg.get("model"))})
                 if not chunk.choices:
                     continue
             elif not chunk.choices:

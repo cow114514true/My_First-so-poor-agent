@@ -136,7 +136,13 @@ agent/
   1. **起点必须落在某轮的第一个 `user`**，否则该轮的 user 留在上下文而 assistant/tool 被摘要带走，语义断裂；
   2. **末尾必须吸附到 `_find_groups()` 的组边界**，否则当前问题会跟在 assistant 后面。
   这两条一起保证"不切轮次"。`apply_compaction` 的落点也沿用 `context.py:88` 的规避法（段首紧贴 system → 独立 system 消息；否则**并入段后第一条 user 消息**），绝不产生裸 user 消息。
-- **前缀必须有界**：`run_rolling_summary` 用 `bounded_prefix()` 把累计摘要压到预算内（保留尾部）。不做这一步，前缀会随块数线性增长，`COMPACT_BLOCK_TOKENS` 就形同虚设。
+- **前缀必须有界**：`run_rolling_summary` 用 `bounded_prefix_parts(parts, budget)` 把累计摘要压到预算内（保留尾部）。不做这一步，前缀会随块数线性增长，`COMPACT_BLOCK_TOKENS` 就形同虚设。
+- **丢弃粒度必须是整块，不是字符偏移**（BUG 36，v2.19）：前缀缓存命中的是**最长公共 token 前缀**，按字符偏移从头部切会让截断点每块都往后挪 → 相邻两块的前缀第一个 token 就不同 → **必然全 miss**，`build_block_prompt` 里那句"前缀逐字稳定以命中 prefix cache"就成了空话。改按整块丢弃后，没发生丢弃的相邻两块前缀逐字相接，丢弃腾出的余量还能让后续若干块继续相接。返回的 `prefix_stable` / `prefix_miss` / `prefix_dropped` 是**证据**（恒有 `stable + miss == blocks - 1`），随 `compacted` 事件显示到 TUI，并另有 `log_compaction_success()` 往 `tmp/compaction_error.log` 追一条 `result:"ok"` 供事后复查。**别改回字符偏移切**：`test_prefix_stability_invariant` 会红。
+- **前缀稳定只在这三处是纯赚的**（判断任何"缓存友好"改动的准绳）：①摘要**请求**本身与实时会话前缀对齐（窗口不受影响）；②在缓存**本来就已经冷却**时压缩（不压也一样全 miss）；③压缩后的新前缀在**两次压缩之间**保持逐字不变。反过来，在"压缩结果"上追求前缀稳定是自相矛盾——**你能保住的前缀，正好就是你没省下的 token**。
+- **缓存遥测**（BUG 37，v2.19）：每次 API 调用（含摘要调用）由 `runner._record_usage()` 往 `cache_usage.log` 写一行 JSON（`CACHE_LOG` 可覆盖；`tmp/` 与 `*.log` 都已 gitignore），字段 `prompt_tokens`/`cached_tokens`/`hit_ratio`/`gap_s`/`kind`。**取不到 `cached_tokens` 就是 `None`，绝不假装 0**（"没有统计"和"完全没命中"混起来会让结论反向）。间隔**按 kind 分开记**且必须挂在 `cstate` 上（挂 `conv` 每轮归零 → `gap` 恒为 `None`，永远量不出 TTL）。TUI 底栏显示命中率，provider 不报就不显示。
+  - 读法：`gap_s` 分桶看 `hit_ratio` 掉在哪一档，就是本机实际的**前缀缓存 TTL**。这是"为了前缀稳定而多留 token 到底值不值"的唯一判据。
+  - 另一条证据线：`tmp/compaction_error.log` 里 `result:"ok"` 的记录带 `prefix_stable`/`prefix_miss`/`prefix_dropped`，`prefix_stable/(blocks-1)` 就是每次压缩的**结构性**复用率；它应能与 `kind:"summary"` 的 `hit_ratio` 对上（对不上说明有别的因素在破坏前缀，优先查 prompts.py / schemas.py 里有没有动态内容进了 system）。
+  - 字段名按各家探测：DeepSeek `prompt_cache_hit_tokens`（另有 `prompt_cache_miss_tokens`、`prompt_tokens_details.cached_tokens`，且 `prompt_tokens == hit + miss`）、OpenAI 兼容 `prompt_tokens_details.cached_tokens`、Anthropic `cache_read_input_tokens`。本机 openai SDK 2.48.0 的 `CompletionUsage` 是 `extra="allow"`，非标准字段能 `getattr` 到；headroom 包装层是 `yield from stream` 直通，chunk 对象不变（`tmp/_verify_cache_telemetry.py` 在真实包装链上验过）。
 - **失败即整体放弃**：任一块失败/校验不过 → 不 apply、不落盘，回退 L2；绝不留下半折叠状态。
 - **`record_archive` 只能由 `apply_compaction` 内部调一次**（`_prep_context` 里不要再调，否则每次压缩产生两条重复档案）。
 - **频率预算只约束 L1**：`should_compact()` 返回 `interval`/`budget`/`backoff`/`failed` 时必须继续走 `_finalize_prune`，**绝不能因预算而不做 L2**。
@@ -173,13 +179,11 @@ agent/
 ```bash
 python test_code_index.py    # 全过（XML/DSML/上下文/rollback/记忆工具 + 压缩契约）
 python test_multi_agent.py   # 7 项全过（多 agent 隔离/事件/守卫）
-python test_tui_markdown.py  # 108 项全过（含第 14 节：块级选择 j/k/Enter + 真鼠标点标题）
-python test_compaction.py    # 36 项全过（L0 去重/L1 分块摘要/L2 兜底/档案/频率预算/失败退避与诊断/会话文件校验）
-python test_runner_visibility.py  # 6 项全过（回合结束必须"看得见"：notice 事件 + edit_file 候补提示）
+python test_tui_markdown.py  # 110 项全过（含第 14 节：块级选择 j/k/Enter + 真鼠标点标题；底栏缓存命中率）
+python test_compaction.py    # 37 项全过（L0 去重/L1 分块摘要/L2 兜底/档案/频率预算/失败退避与诊断/会话文件校验/前缀稳定性不变量）
+python test_runner_visibility.py  # 9 项全过（回合结束必须"看得见"：notice 事件 + edit_file 候补提示 + 缓存遥测）
 python test_shell_tools.py     # 9 项全过（默认 pwsh / cmd 语法改道 + 教学提示 / 错误非 CLIXML / 退出码回填）
 python run_tests.py          # 10 套件（需要 DS_KEY，config 在 import 时就要建 client）
-                             # 注意：test_tui_markdown.py 现有 3 项红，属**未提交**的
-                             # 思考块折叠 WIP（见 THINKING_PANEL_FOLD_DESIGN.md），与本项无关
 python test_progress.py      # 悬空，跑会 SKIP，可无视
 ```
 
@@ -189,6 +193,18 @@ python test_progress.py      # 悬空，跑会 SKIP，可无视
 
 - **提交记忆功能**（本会话成果尚未 commit）。
 - 让用户用真实 agent 跑一轮：确认记忆注入、recall/remember 在真实对话中可用。
+- **先攒 `cache_usage.log` 再看要不要继续优化前缀**（v2.19 埋点，**下一步应该先做这个**）：
+  真实 TUI 跑几轮长会话（刻意穿插"停 1 分钟 / 停 5 分钟 / 连续快问"三种节奏），然后按 `gap_s`
+  分桶看 `chat` 类的 `hit_ratio`：
+  - 如果 5 分钟档的命中率仍然很高 → 前缀缓存的 TTL 足够长，"让前缀稳定"值得继续投入（下一步是下面的**滞后丢弃**）；
+  - 如果几百秒后命中率就掉到 0 → DeepSeek 的缓存对本机工作节奏没意义，**这条优化线应该直接停掉**，别再花时间；
+  - `kind="summary"` 那一档单独看：它才是"摘要请求有没有复用前缀"的直接读数（`prefix_stable` 是结构性证据，这个是端到端证据，两者要能对上）。
+- **滞后丢弃（hysteresis，未做，等上面的数据）**：现在的整块丢弃在"每块大小均匀"时仍会**每块丢一次**
+  （丢掉一块只腾出一块的余量），也就是稳态下仍然每块 miss。要让"丢弃后连续多块稳定"成为常态，
+  得让前缀长到 ~2× 预算再回落到 ≤ 预算（回退次数从"每块一次"降到"每 ~预算 一次"）。
+  **代价明确**：单次摘要输入上界从 `block_tokens + 预算` 变成 `block_tokens + 2×预算`，
+  与"单次摘要输入不超过 COMPACT_BLOCK_TOKENS"这条硬约束相冲突——要做就得同时改注释与文档上的承诺，
+  别偷偷放宽。做完用 `prefix_stable/(blocks-1)` 前后对比来验收，不要凭感觉。
 - **压缩修复的真实后端复验**（v2.14）：真实 TUI 分别用 DS 与本地后端跑一次长任务，确认面板不再被"压缩失败"刷屏（失败应至多每轮一条且带具体原因）、`/expand` 与 sidecar 正常、本地后端 `api_error.log` 无新增；随后按实测调 `COMPACT_TRIGGER_RATIO` 与 `COMPACT_BLOCK_TOKENS`（都是环境变量，不需要改代码）。单发健康检查：`python tmp/check_compaction_real.py`（取最新会话的一块走真实摘要器，打印保留率与校验结果；`tmp/` 是 gitignore 的临时目录，脚本按仓库惯例不入库）。
 - 杂物可清理：`_verify_fix.py`（DSML 诊断脚本，已无用）、`test_progress.py`（悬空测试）、`tui.py.bak`/`tui.py.backup`/`backup_conflict_files/`/`.DS_Store`/`compile.jpeg`/`seitsuna.png` 等图片。
 - **命令补全（已评估，未做，1~2h）**：输入框目前是**多行 `TextArea`**，而 Textual 8.2.8 的 `Suggester`（`textual.suggester`）**只接在单行 `Input` 上**，多行框没有补全钩子 → 得自己写（Textual 已给 `TextArea.Changed` 消息、`cursor_location`、`replace`、`move_cursor`，不用碰内部）。关键结论与坑：

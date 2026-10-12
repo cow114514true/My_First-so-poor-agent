@@ -627,6 +627,18 @@ async def run() -> None:
         check("折叠时底栏出现 🧠 徽标", "🧠 1" in str(footer.content),
               f"{str(footer.content)[:60]!r}")
 
+        # 前缀缓存命中率（改动 1 的可见部分）：provider 报了才显示，不报就不显示——
+        # 显示成 0% 会把"没有统计"误报成"缓存完全没命中"。
+        app._handle_event({"type": "stream_usage", "usage": None,
+                           "cache": {"hit_ratio": 0.75}})
+        await pilot.pause(0.1)
+        check("底栏显示前缀缓存命中率", "缓存 75%" in str(footer.content),
+              f"{str(footer.content)[:70]!r}")
+        app._handle_event({"type": "token_usage", "usage": None})  # 该次没有 cache 字段
+        await pilot.pause(0.1)
+        check("provider 不报缓存时保留上次值（不假装 0%）",
+              "缓存 75%" in str(footer.content), f"{str(footer.content)[:70]!r}")
+
         # 同一轮内继续出字不该重复计数
         app._handle_event({"type": "thinking_chunk", "content": "同一轮续写", "round": 1})
         app._flush_think()

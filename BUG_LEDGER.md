@@ -445,6 +445,65 @@
 - **回归**：`test_shell_tools.py` 6 → 9 项（默认是 pwsh、cmd 语法改道 + 提示、
   PowerShell 语法不被改道、错误不是 CLIXML、语法错可见、cmdlet 错误 rc≠0、临时脚本清理）。
 
+### Bug 36. "前缀逐字稳定以命中 prefix cache"只是一个注释：按字符偏移切前缀，每次调用都必然 miss
+
+- **现象**：`build_block_prompt` 的布局（固定 system + 前序累计摘要 + 当前块置末尾）是刻意
+  照着 "prefix-aware target-at-end" 写的，注释也写着"前缀逐字稳定以命中 prefix cache"。
+  但 `bounded_prefix()` 超预算时是**从头部按任意字符偏移**截断的（二分找最小切点），
+  而前缀随块数单调增长、预算固定 → **截断点每块都往后挪一格** → 相邻两块的前缀
+  **第一个 token 就不同**，除 `SUMMARIZER_SYSTEM_PROMPT` 外全部 miss。
+  注释描述的性质从来没成立过，也没人发现——因为**根本没有埋点能看出来**。
+- **怎么发现**：用户提出"摘要生成后不是全量替换上下文，而是追加在末尾或替换部分以保持前缀稳定"，
+  逐条核对代码时发现：会话级 `apply_compaction` 的 `start` 一般在索引 1 附近（`compaction_span`
+  只保留 `keep_rounds` 轮），真正逐字不变的只有 `messages[0]` 那条 system；而摘要链这处
+  本该成立的前缀稳定，被 `bounded_prefix` 的字符偏移截断抵消。
+  关键判断依据：**前缀缓存命中的是最长公共 token 前缀，你能保住的前缀正好就是你没省下的 token**
+  —— 缓存保留与窗口腾挪是同一个量的两端，1:1 对换。所以"前缀稳定"的价值只在三处：
+  ①摘要**请求**本身与实时会话前缀对齐（纯赚，窗口不受影响）；②在缓存**本来就已经冷却**时压缩
+  （纯赚，不压也一样全 miss）；③压缩后的新前缀**在两次压缩之间**保持逐字不变。
+  把它用在"压缩结果"上则是自相矛盾。
+- **修复**：
+  - `bounded_prefix()` → `bounded_prefix_parts(parts, budget)`：丢弃粒度改成**整块**
+    （`parts` 本来就是每块摘要的列表）。没发生丢弃的相邻两块前缀逐字相接；丢弃腾出的余量
+    还能让后续若干块继续相接（旧实现做不到：它每次都在挪截断点）。
+    单个块摘要自身超预算时**整块保留**（它已被 `max_tokens_hard` 封顶，而切半块恰好破坏了
+    本函数存在的理由）。
+  - 返回 `prefix_stable` / `prefix_miss` / `prefix_dropped` 三个**证据字段**
+    （恒有 `stable + miss == blocks - 1`，比值就是摘要链的缓存复用率），
+    随 `compacted` 事件一路显示到 TUI（"前缀稳定 3/4 块"）——**没有可观测数字的"优化"等于没做**。
+  - 成功也落盘：`log_compaction_success()` 往**同一个** `tmp/compaction_error.log` 追加一条
+    `result:"ok"`（与失败记录靠该字段区分）。面板提示会随滚动消失，而
+    `prefix_stable/(blocks-1)` 是这次改动的唯一验收指标，必须能事后复查。
+- **回归**：`test_prefix_stability_invariant`（预算充足时逐块相接；超预算时整块保留、
+  绝不出现半块；**丢弃之后的后续小块必须继续逐字相接**）；
+  `test_rolling_summary_calls_and_prefix_stability` 补 `prefix_stable + prefix_miss == blocks - 1`
+  与"预算充足 → `prefix_stable == blocks - 1`"。
+
+### Bug 37. 没有任何前缀缓存埋点 → "为前缀稳定多留 token 值不值"永远无法证伪
+
+- **现象**：整个上下文压缩层建立在"缓存友好"这个前提上，但代码只取了 `usage.prompt_tokens`
+  （`runner.py` 两处），**从没读过缓存命中字段**。缓存存活多久（TTL）——由 provider 决定、
+  且决定"留前缀"这张赌注的赔率——**在当前实现里根本无法测量**。
+- **怎么发现**：讨论 Bug 36 时问"怎么证明这个优化有效"，发现答不上来：没有任何数据。
+- **修复**：`runner._record_usage()` 每次 API 调用记一行到 `cache_usage.log`（`CACHE_LOG` 可覆盖），
+  字段含 `prompt_tokens` / `cached_tokens` / `hit_ratio` / `gap_s`（距上次同类调用）/ `kind`；
+  字段名按各家兼容探测（DeepSeek `prompt_cache_hit_tokens`、OpenAI 兼容
+  `prompt_tokens_details.cached_tokens`、Anthropic `cache_read_input_tokens`）；
+  摘要调用用 `kind="summary"` 分开记。**取不到就是 `None`，绝不假装 0**——
+  "没有统计"与"缓存完全没命中"混起来会让结论反向。TUI 底栏显示命中率（provider 不报就不显示）。
+- **两个实测细节**：
+  1. **间隔必须按 kind 分开记**：摘要调用与主对话是两个不同的前缀，共用一根时间戳会把
+     "用户停了 5 分钟"抹成几秒，把 TTL 量短，从而错误地得出"留前缀没意义"。
+  2. **间隔必须挂跨轮状态**（`cstate`）：挂 `conv` 会每轮归零，`gap` 恒为 `None`，永远量不出 TTL。
+- **验证**：`tmp/_verify_cache_telemetry.py` 在**真实包装链**（headroom `HeadroomClient`
+  → `runner._cache_hit_tokens`）上跑通，`cached_tokens=750`/`hit_ratio=0.75`，且 chunk 对象
+  是**同一个**（`_wrap_stream` 是 `yield from stream` 直通）。字段名与官方文档一致
+  （`usage.prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` / `prompt_tokens_details.cached_tokens`，
+  且 `prompt_tokens == hit + miss`）；本机 openai SDK 2.48.0 的 `CompletionUsage`
+  是 `extra="allow"`，`getattr` 能直接读到非标准字段。
+- **回归**：`test_runner_visibility.py` 6 → 9 项（三种字段形状 + 真 0 命中 + 字段缺失、
+  跨轮间隔与按 kind 隔离、事件必须带 `cache` 统计且原 `usage` 对象不变）。
+
 ---
 
 ## 附：杂项清理清单（非 bug，历史遗留）

@@ -229,6 +229,14 @@ def summarize_block(prefix_digest, block_msgs):
                 continue
             return {"error": f"api_error:{type(e).__name__}:{e}"}
         ch = resp.choices[0]
+        # 摘要调用也记账（kind="summary"）：这正是我们想让它命中前缀缓存的那次调用，
+        # 不量它就永远不知道 build_block_prompt 的 target-at-end 布局有没有起作用。
+        try:
+            from loop_agent_core.runner import _record_usage
+            _record_usage(getattr(resp, "usage", None), _compact_state(),
+                          model=cfg.get("model"), kind="summary")
+        except Exception:
+            pass
         text = (ch.message.content or "").strip()
         if getattr(ch, "finish_reason", None) == "length":
             if text and summary_reject_reason(text) is None:
