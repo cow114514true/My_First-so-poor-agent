@@ -140,18 +140,9 @@ def failure_log_path(path=None):
     return os.path.join(WORK_DIR, "tmp", "compaction_error.log")
 
 
-def log_compaction_failure(reason, detail, path=None):
-    """把失败原因 + 上下文追加进日志。
-
-    TUI 下 stdout 会被界面覆盖，`print` 出来的原始异常等于丢掉（本次定位根因就卡在这里）。
-    失败必须留可复查的证据。
-    """
+def _write_compaction_log(rec, path=None):
+    """一行 JSON 追加进压缩日志（失败与成功共用同一个文件，靠 `result` 区分）。"""
     target = failure_log_path(path)
-    rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "reason": str(reason)}
-    if isinstance(detail, dict):
-        rec.update(detail)
-    else:
-        rec["detail"] = str(detail)
     try:
         os.makedirs(os.path.dirname(target), exist_ok=True)
         with open(target, "a", encoding="utf-8") as f:
@@ -159,6 +150,35 @@ def log_compaction_failure(reason, detail, path=None):
     except OSError:
         pass
     return rec
+
+
+def log_compaction_failure(reason, detail, path=None):
+    """把失败原因 + 上下文追加进日志。
+
+    TUI 下 stdout 会被界面覆盖，`print` 出来的原始异常等于丢掉（本次定位根因就卡在这里）。
+    失败必须留可复查的证据。
+    """
+    rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "reason": str(reason)}
+    if isinstance(detail, dict):
+        rec.update(detail)
+    else:
+        rec["detail"] = str(detail)
+    return _write_compaction_log(rec, path)
+
+
+def log_compaction_success(detail, path=None):
+    """成功压缩的**证据**一条（同文件，靠 `result="ok"` 与失败记录区分）。
+
+    为什么成功也要落盘：`prefix_stable / (blocks - 1)` 是"整块丢弃"改动的唯一验收指标，
+    而 TUI 里那条提示会随滚动消失 —— 与"失败必须落盘"是同一个教训
+    （`failure_hint` 里也写着去这个文件复查）。
+    """
+    rec = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "result": "ok"}
+    if isinstance(detail, dict):
+        rec.update(detail)
+    else:
+        rec["detail"] = str(detail)
+    return _write_compaction_log(rec, path)
 
 
 # ─────────────────────────── L0：重复工具结果去重 ───────────────────────────
@@ -445,27 +465,36 @@ def validate_summary(text):
     return summary_reject_reason(text) is None
 
 
-def bounded_prefix(prefix, budget_tokens):
-    """把累计摘要压到 token 预算内，作为下一块的前缀。
+_PREFIX_SEP = "\n\n---\n\n"       # 累计摘要各块之间的分隔（逐字固定，缓存友好的前提）
+_PREFIX_OMITTED = "…（更早内容已省略）"
+
+
+def bounded_prefix_parts(parts, budget_tokens):
+    """把分块累计摘要压到 token 预算内，返回 (前缀, 被丢弃的块数)。
 
     **必须有界**：否则前缀随块数线性增长（实测 385→770→1155→…），
     "单次摘要输入不超过 COMPACT_BLOCK_TOKENS"这条硬约束就形同虚设。
     保留**尾部**（越近的工作对后续延续越重要），首部只留一个省略标记。
+
+    **丢弃粒度是整块，而不是字符偏移**（2026-10-12 改）：前缀缓存命中的是最长公共
+    token 前缀，按任意字符偏移从头部切会让每次调用的前缀**第一个 token 就变** →
+    相邻两块之间必然全部 miss，`build_block_prompt` 那句"前缀逐字稳定以命中
+    prefix cache"实际落空。改为整块丢弃后，没发生丢弃的相邻两块前缀逐字相接
+    （不变量由 `run_rolling_summary` 计入 prefix_stable，回归用例
+    test_prefix_stability_invariant 守住），只在真的丢块时付一次 miss。
+
+    单个块摘要自身超预算时**整块保留**：它的规模已被 max_tokens_hard 封顶、
+    不会无界增长，而"切半块"恰好破坏了本函数存在的理由。
     """
-    prefix = str(prefix or "")
-    if not prefix:
-        return ""
-    if estimate_tokens(prefix) <= budget_tokens:
-        return prefix
-    # 二分收敛：找最小的切点使尾部不超预算
-    lo, hi = 0, len(prefix)
-    while lo < hi:
-        mid = (lo + hi) // 2
-        if estimate_tokens(prefix[mid:]) <= budget_tokens:
-            hi = mid
-        else:
-            lo = mid + 1
-    return "…（更早内容已省略）\n" + prefix[lo:]
+    kept = [p for p in parts if p]
+    dropped = 0
+    while len(kept) > 1 and estimate_tokens(_PREFIX_SEP.join(kept)) > budget_tokens:
+        kept.pop(0)
+        dropped += 1
+    prefix = _PREFIX_SEP.join(kept)
+    if dropped:
+        prefix = f"{_PREFIX_OMITTED}\n{prefix}"
+    return prefix, dropped
 
 
 def _report(on_error, reason, index):
@@ -483,7 +512,13 @@ def run_rolling_summary(blocks, summarize_fn, prefix_tokens=None, on_error=None)
 
     每次调用的**总输入**受两个预算约束：当前块 ≤ COMPACT_BLOCK_TOKENS，
     前序摘要前缀 ≤ prefix_tokens（默认块上限的 1/4）。返回
-    {"summary": 完整拼接, "digest": 前缀指纹, "blocks": n}。
+    {"summary": 完整拼接, "digest": 前缀指纹, "blocks": n,
+     "prefix_stable": 前缀逐字相接的次数, "prefix_miss": 前缀不接的次数,
+     "prefix_dropped": 累计被整块丢弃的块数}。
+
+    这三个字段是**证据**：恒有 prefix_stable + prefix_miss == blocks - 1，所以
+    prefix_stable/(blocks-1) 就是摘要链的 prefix-cache 复用率。整块丢弃的改动若不生效
+    （例如又有人改回按字符偏移切），prefix_stable 会立刻掉到 0。
 
     `on_error(reason, block_index)` 可选：把**具体**失败原因回传给调用方（事件/日志用）。
     """
@@ -492,6 +527,9 @@ def run_rolling_summary(blocks, summarize_fn, prefix_tokens=None, on_error=None)
                  else max(200, k["block_tokens"] // 4))
     prefix = ""
     parts = []
+    stable = 0   # 相邻块之间前缀逐字相接的次数（前缀缓存可复用）
+    miss = 0     # 前缀没能逐字相接的次数（丢块造成的必然 miss）
+    dropped = 0  # 累计被整块丢弃的块数（丢过的块不会回来，故等于已淘汰的块数）
     for index, block in enumerate(blocks):
         if _interrupted():
             _report(on_error, "interrupted", index)
@@ -515,11 +553,20 @@ def run_rolling_summary(blocks, summarize_fn, prefix_tokens=None, on_error=None)
             return None
         text = text.strip()
         parts.append(text)
-        prefix = bounded_prefix(f"{prefix}\n\n---\n\n{text}" if prefix else text, budget)
+        prev = prefix
+        prefix, d = bounded_prefix_parts(parts, budget)
+        dropped += d
+        if prev:
+            if prefix.startswith(prev):
+                stable += 1
+            else:
+                miss += 1
     if not parts:
         _report(on_error, "no_blocks", 0)
         return None
-    return {"summary": "\n\n---\n\n".join(parts), "digest": _digest(prefix), "blocks": len(parts)}
+    return {"summary": _PREFIX_SEP.join(parts), "digest": _digest(prefix),
+            "blocks": len(parts), "prefix_stable": stable, "prefix_miss": miss,
+            "prefix_dropped": dropped}
 
 
 def render_summary_message(summary_text):

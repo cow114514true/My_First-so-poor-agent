@@ -189,8 +189,8 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
     """
     # 延迟 import：compaction 依赖本模块的 _find_groups（叶子），模块级互相 import 会成环
     from .compaction import (apply_compaction, compaction_span, cstate, dedup_tool_results,
-                             failure_hint, log_compaction_failure, run_rolling_summary,
-                             should_compact, split_blocks)
+                             failure_hint, log_compaction_failure, log_compaction_success,
+                             run_rolling_summary, should_compact, split_blocks)
     k = _compact_k()
     # 记账一律走 cstate：conv 每次 chat() 都是新的，直接写在 conv 上会每轮归零
     st = cstate(conv)
@@ -275,12 +275,23 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
 
     after_size = conv.get("size") or 0
     reclaimed = (before_size - after_size) / max(1, before_size)
+    # 成功也要留证据：prefix_stable/(blocks-1) 是"整块丢弃"的唯一验收指标，
+    # 面板提示会随滚动消失（与"失败必须落盘"同一个教训）。
+    log_compaction_success({
+        "blocks": result["blocks"], "removed": removed,
+        "before": before_size, "after": after_size,
+        "summary_chars": len(result["summary"]),
+        "prefix_stable": result.get("prefix_stable", 0),
+        "prefix_miss": result.get("prefix_miss", 0),
+        "prefix_dropped": result.get("prefix_dropped", 0)})
     if reclaimed < k["min_reclaim"]:
         # 压缩本身也要花钱：收益太低就靠 L2 把上下文真正压到 cap 以内
         new_q, pruned = _finalize_prune(cap, new_q, conv, emit)
         emit({"type": "compacted", "removed": removed + pruned, "before": before_size,
               "after": conv.get("size") or 0, "summary_chars": len(result["summary"]),
-              "blocks": result["blocks"], "low_reclaim": True})
+              "blocks": result["blocks"], "low_reclaim": True,
+              "prefix_stable": result.get("prefix_stable", 0),
+              "prefix_dropped": result.get("prefix_dropped", 0)})
         return new_q, removed + pruned
 
     if (conv.get("size") or 0) > cap:
@@ -288,5 +299,7 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
         removed += pruned
     emit({"type": "compacted", "removed": removed, "before": before_size,
           "after": conv.get("size") or 0, "summary_chars": len(result["summary"]),
-          "blocks": result["blocks"]})
+          "blocks": result["blocks"],
+          "prefix_stable": result.get("prefix_stable", 0),
+          "prefix_dropped": result.get("prefix_dropped", 0)})
     return new_q, removed

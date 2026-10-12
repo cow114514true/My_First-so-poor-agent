@@ -20,6 +20,13 @@ os.environ["COMPACT_ERROR_LOG"] = _SELFTEST_ERRLOG
 if os.path.exists(_SELFTEST_ERRLOG):
     os.remove(_SELFTEST_ERRLOG)
 
+# 前缀缓存遥测同理：本套件里有假 usage 会真的走到 _record_usage，别写进真实 cache_usage.log
+_SELFTEST_CACHELOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "tmp", "_selftest_cache_usage.log")
+os.environ["CACHE_LOG"] = _SELFTEST_CACHELOG
+if os.path.exists(_SELFTEST_CACHELOG):
+    os.remove(_SELFTEST_CACHELOG)
+
 import loop_agent_core.config as config_mod
 import loop_agent_core.compaction as comp
 import loop_agent_v2 as la
@@ -304,26 +311,85 @@ def test_rolling_summary_calls_and_prefix_stability():
     calls = []
 
     def fake(prefix, block):
-        calls.append({"prefix": prefix,
+        # 每块摘要正文**互不相同**（真实摘要必然如此）——否则"整块丢弃后留下的
+        # 恰好是同一段文本"会让前缀逐字相同，把稳定性证据搅浑
+        out = body + f"\n<!--块{len(calls)}-->"
+        calls.append({"prefix": prefix, "out": out,
                       "prefix_tokens": la.estimate_tokens(prefix),
                       "block_tokens": la.estimate_tokens(json.dumps(block, ensure_ascii=False))})
-        return {"summary": body, "digest": comp._digest(prefix + body)}
+        return {"summary": out, "digest": comp._digest(prefix + out)}
 
     res = comp.run_rolling_summary(blocks, fake, prefix_tokens=60)
     assert res is not None
     assert res["blocks"] == len(blocks)
     assert len(calls) == len(blocks), "调用次数必须等于块数"
-    # 当前块输入不超上限；前缀也必须**有界**（无界前缀会把"输入上限"废掉）
+    max_out = max(la.estimate_tokens(c["out"]) for c in calls)
+    # 当前块输入不超上限；前缀也必须**有界**（无界前缀会把"输入上限"废掉）。
+    # 整块丢弃后上界 = 预算 + 最多一个整块 + 省略标记。
     for c in calls:
         assert c["block_tokens"] <= 1000 + 400, ("块输入超限", c["block_tokens"])
-        assert c["prefix_tokens"] <= 60 + 8, ("前缀无界", c["prefix_tokens"])
+        assert c["prefix_tokens"] <= 60 + max_out + 16, ("前缀超出可解释上界", c["prefix_tokens"])
     assert calls[0]["prefix"] == ""
-    assert len(blocks) >= 3, "本用例需要 ≥3 块才能验证前缀截断"
-    assert calls[1]["prefix"] == body, "第 2 块的前缀应是第 1 块的摘要"
-    # 前缀超预算后必须截断并留省略标记，且保留尾部（越近的工作对延续越重要）
-    assert calls[2]["prefix"].startswith("…"), ("前缀未截断", calls[2]["prefix"][:40])
-    assert calls[2]["prefix"].endswith(body), "应保留尾部"
+    assert len(blocks) >= 3, "本用例需要 ≥3 块才能验证前缀丢弃"
+    assert calls[1]["prefix"] == calls[0]["out"], "第 2 块的前缀应是第 1 块的摘要"
+    # 超预算后必须**整块**丢弃并留省略标记，且保留尾部（越近的工作对延续越重要）
+    assert calls[2]["prefix"].startswith(comp._PREFIX_OMITTED), ("前缀未丢弃", calls[2]["prefix"][:40])
+    assert calls[2]["prefix"] == f"{comp._PREFIX_OMITTED}\n{calls[1]['out']}", \
+        ("丢弃粒度必须是整块，不得切半块", calls[2]["prefix"])
+    # 证据字段：恒有 stable + miss == blocks - 1（两者合起来就是相邻对数）
+    assert res["prefix_stable"] + res["prefix_miss"] == len(blocks) - 1, res
+    # 本用例预算只放得下一块 → 每块都触发丢弃，没有任何一步逐字相接
+    assert res["prefix_stable"] == 0, res
+    assert res["prefix_miss"] == len(blocks) - 1, res
+    assert res["prefix_dropped"] >= len(blocks) - 1, res
+
+    # 预算充足：每一步都必须逐字相接 → prefix_stable = 相邻对数，丢弃数 0。
+    # 这条是"整块丢弃"改动的核心可观测结论（旧实现按字符偏移切，这里会是 0）。
+    res2 = comp.run_rolling_summary(blocks, fake, prefix_tokens=10 ** 6)
+    assert res2["prefix_dropped"] == 0, res2
+    assert res2["prefix_stable"] == len(blocks) - 1, res2
+    assert res2["prefix_miss"] == 0, res2
     _env(COMPACT_BLOCK_TOKENS=None, COMPACT_MAX_TOKENS=None)
+
+
+def test_prefix_stability_invariant():
+    """前缀不变量：没发生丢弃时，新前缀必须**逐字**以旧前缀开头（→ prefix cache 可复用）。
+
+    这是"整块丢弃"改动的全部理由。改成按字符偏移从头部切时，前缀的第一个 token
+    每次调用都在挪，相邻块之间**永远**不可能命中缓存；整块丢弃则只在真的丢块时付一次
+    miss，丢弃腾出的余量能让后续若干块继续逐字相接。
+    """
+    big = ("## 用户目标\n" + "甲方" * 200 + "\n## 已完成\n" + "乙方" * 200 +
+           "\n## 关键决策与结论\n" + "丙方" * 200 +
+           "\n## 改动的文件\nf\n## 未决问题与下一步\nx")
+    small = "## 已完成\n补"
+    tb, ts = la.estimate_tokens(big), la.estimate_tokens(small)
+    assert ts + 4 < tb, ("本用例需要明显的大小块差异", tb, ts)
+    budget = tb + 2 * ts + 64  # 放得下一个大块 + 两个小块，放不下两个大块
+
+    # 1) 预算充足：逐块追加，每一步都必须逐字相接
+    parts, prev = [], ""
+    for _ in range(4):
+        parts.append(big)
+        cur, dropped = comp.bounded_prefix_parts(parts, 10 ** 6)
+        assert dropped == 0 and cur.startswith(prev), (dropped, parts)
+        prev = cur
+    assert prev == comp._PREFIX_SEP.join(parts)
+
+    # 2) 超预算：丢弃粒度是**整块**，绝不出现半块
+    cur, dropped = comp.bounded_prefix_parts([big, big], budget)
+    assert dropped == 1, dropped
+    assert cur == f"{comp._PREFIX_OMITTED}\n{big}", "必须整块保留，不得切半块"
+
+    # 3) 关键区别：丢弃腾出的余量让后续小块**继续逐字相接**（旧实现这里必然 miss）
+    parts, prev, stable_steps = [big, big], cur, 0
+    for _ in range(2):
+        parts.append(small)
+        cur, _ = comp.bounded_prefix_parts(parts, budget)
+        if cur.startswith(prev):
+            stable_steps += 1
+        prev = cur
+    assert stable_steps == 2, ("丢弃之后的前缀必须继续逐字相接", stable_steps)
 
 
 def test_rolling_summary_aborts_on_failure():
@@ -533,6 +599,17 @@ def test_prep_context_chains_l0_then_l1():
     assert len(conv.get("_archive") or []) == 1, conv.get("_archive")
     # 最终 size 必须严格小于压缩前（否则 L1 白做）
     assert conv["size"] < deduped["before"]
+    # 成功必须落盘留证据：面板提示会随滚动消失，而 prefix_stable/(blocks-1) 是"整块丢弃"
+    # 的唯一验收指标（用增量断言，不依赖用例执行顺序）
+    log_path = os.environ["COMPACT_ERROR_LOG"]
+    lines = [json.loads(x) for x in open(log_path, encoding="utf-8").read().splitlines()
+             if x.strip()] if os.path.exists(log_path) else []
+    ok = [x for x in lines if x.get("result") == "ok"]
+    assert len(ok) == 1, lines
+    assert ok[0]["prefix_stable"] + ok[0]["prefix_miss"] == ok[0]["blocks"] - 1, ok[0]
+    compacted = next(e for e in events if e["type"] == "compacted")
+    assert compacted["prefix_stable"] == ok[0]["prefix_stable"], (compacted, ok[0])
+    assert compacted["prefix_dropped"] == ok[0]["prefix_dropped"], (compacted, ok[0])
     _env(DEDUP_ENABLED=None, DEDUP_MIN_CHARS=None, COMPACT_ENABLED=None,
          COMPACT_TRIGGER_RATIO=None, COMPACT_BLOCK_TOKENS=None, COMPACT_MIN_RECLAIM=None,
          COMPACT_MAX_TOKENS=None)
@@ -1112,6 +1189,7 @@ if __name__ == "__main__":
         test_span_never_cuts_tool_chain,
         test_split_blocks_respects_group_boundaries_and_limit,
         test_rolling_summary_calls_and_prefix_stability,
+        test_prefix_stability_invariant,
         test_rolling_summary_aborts_on_failure,
         test_worker_session_never_compacts,
         test_validate_summary,
