@@ -184,6 +184,30 @@ def _summary_client():
     return _SUMMARY_CLIENT
 
 
+class _SummaryTransport:
+    """摘要出口的 transport：落到 `_summary_client()`。
+
+    测试用 `la._summary_client = lambda: fake` 注入假后端（test_compaction），
+    所以这里必须每次现取，不能把 client 抓进闭包缓存。
+    """
+    def create(self, kind, cfg, kwargs):
+        kwargs = dict(kwargs)
+        kwargs.pop("model", None)
+        kwargs.pop("stream", None)
+        return _summary_client().chat.completions.create(stream=False, **kwargs)
+
+
+_summary_llm = None
+
+
+def _summary_llm_get():
+    global _summary_llm
+    if _summary_llm is None:
+        from loop_agent_core import llm as _llm_mod
+        _summary_llm = _llm_mod.get(_SummaryTransport())
+    return _summary_llm
+
+
 def _unsupported_param(e):
     """判断异常是不是"后端不认这个参数"（用于摘掉 extra_body 重试一次，而不是直接放弃）。"""
     if getattr(e, "status_code", None) != 400:
@@ -195,9 +219,10 @@ def _unsupported_param(e):
 
 def _summary_call(messages, max_tokens, extra):
     from loop_agent_core.config import cfg
-    return _summary_client().chat.completions.create(
-        model=cfg["model"], messages=messages, stream=False,
-        max_tokens=max_tokens, temperature=0.2, **extra)
+    kwargs = dict(messages=messages, max_tokens=max_tokens, temperature=0.2, **extra)
+    if not kwargs.get("model"):
+        kwargs["model"] = cfg["model"]
+    return _summary_llm_get().create(kind="summary", **kwargs)
 
 
 def summarize_block(prefix_digest, block_msgs):
@@ -362,8 +387,20 @@ def chat(question, on_event=None, _conv=None):
             _session_state["_archive"] = _conv.get("_archive") or _session_state.get("_archive") or []
 
 
+def assert_tools_classified():
+    """启动期工具分类校验：实际注册的工具必须全在 toolclass.TOOL_CLASS 里。
+
+    回放引擎要靠这张表决定"哪些工具能吐回录制结果、哪些必须在 overlay 里真跑"。
+    未登记工具一旦出现，回放要么篡改工作区、要么结果不可复现 —— 所以宁可启动即失败。
+    """
+    from loop_agent_core.toolclass import assert_tool_class_wellformed, assert_all_classified
+    assert_tool_class_wellformed()
+    assert_all_classified(list(TOOL_CALL_MAP) + list(tools or []))
+
+
 # 交互式连续对话
 if __name__ == "__main__":
+    assert_tools_classified()  # 未登记工具直接拒绝启动（见 toolclass.py 注释）
     print(" 多轮对话🤣（输入 'exit' 退出）\n")
     while True:
         question = input("😎 You: ")

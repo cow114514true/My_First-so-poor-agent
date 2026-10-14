@@ -1,4 +1,9 @@
-"""本地视觉模型接口：analyze_image 工具（Qwen VLM via llama.cpp，OpenAI 兼容接口）。"""
+"""本地视觉模型接口：analyze_image 工具（Qwen VLM via llama.cpp，OpenAI 兼容接口）。
+
+请求出口走 loop_agent_core/llm.py 的 `llm.get().create(kind="vision", ...)`：
+视觉调用也必须被 trace 记录 / 可被回放接管，否则回放时截图分析会偷偷真跑。
+`_vision_cfg()` 仍然决定 base_url/model（本地 llama.cpp 或 luna 网关）。
+"""
 import base64
 import os
 
@@ -6,9 +11,55 @@ from openai import OpenAI
 
 from .config import WORK_DIR
 from . import confirm
+from . import llm
 
 _MIME = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp", "bmp": "bmp"}
 DEFAULT_Q = "描述这张图片的内容。"
+_client_cache = None
+
+
+def _is_real_sdk() -> bool:
+    """`OpenAI` 还是真的 openai SDK 吗？测试会把它换成 _FakeOpenAI（见下面 _local_client）。"""
+    return getattr(OpenAI, "__name__", "") == "OpenAI" and "openai" in getattr(OpenAI, "__module__", "")
+
+
+def _local_client():
+    """视觉后端的 OpenAI 客户端（惰性、缓存）。
+
+    `vision.OpenAI` 是测试的替换点（tests/test_vision_tool.py 逐个用例换成 _FakeOpenAI）。
+    被换成假对象时**不缓存**：缓存会把第一个用例的假客户端留给后面所有用例。
+    """
+    global _client_cache
+    cfg = _vision_cfg()
+    if not _is_real_sdk():
+        return OpenAI(api_key=cfg.get("api_key", "sk_local"), base_url=cfg["base_url"])
+    if _client_cache is None:
+        _client_cache = OpenAI(api_key=cfg.get("api_key", "sk_local"), base_url=cfg["base_url"])
+    return _client_cache
+
+
+class _CfgTransport:
+    """视觉出口的 transport：把 llm 网关的调用落到 `_local_client()` 上。
+
+    `_local_client()` 是测试替换 `vision.OpenAI` 的注入点；默认配置里的 base_url/api_key
+    由 `_vision_cfg()` 提供（llm.profile("vision") 不再重复决定）。
+    """
+    def create(self, kind, cfg, kwargs):
+        kwargs = dict(kwargs)
+        kwargs.pop("model", None)
+        return _local_client().chat.completions.create(
+            model=_vision_cfg()["model"], **kwargs)
+
+
+_vision_llm = None
+
+
+def _llm():
+    global _vision_llm
+    if _vision_llm is None:
+        _vision_llm = llm.get(_CfgTransport())
+    return _vision_llm
+
 
 
 def _vision_cfg():
@@ -60,13 +111,15 @@ def analyze_image_mock(path, question=None, purpose=""):
         return f"[Error] Cannot read image: {e}"
     cfg = _vision_cfg()
     try:
-        resp = OpenAI(api_key=cfg.get("api_key", "sk_local"), base_url=cfg["base_url"]).chat.completions.create(
+        resp = _llm().create(
+            kind="vision",
             model=cfg["model"],
             messages=[{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/{mime};base64,{b64}"}},
                 {"type": "text", "text": question or DEFAULT_Q},
             ]}],
             max_tokens=cfg["max_tokens"],
+            stream=False,
         )
     except Exception as e:
         return (f"[Error] Vision request failed: {e}. "

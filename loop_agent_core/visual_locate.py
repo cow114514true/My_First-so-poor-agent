@@ -15,6 +15,8 @@ import re
 from PIL import Image
 from openai import OpenAI
 
+from . import llm
+
 from .browse import (_executor, _get_browser_page, _visible_elements, _take_screenshot,
                      _browser_sessions)
 from .browser_observation import collect_observation
@@ -54,14 +56,15 @@ def _ask_vlm_bbox(b64, target, size, max_tokens=600, attempts=4):
          f"只输出 4 个数字，空格分隔：x1 y1 x2 y2。不要输出任何其它文字。")
     for _ in range(attempts):
         try:
-            msg = OpenAI(api_key=cfg.get("api_key", "sk_local"),
-                         base_url=cfg["base_url"]).chat.completions.create(
+            msg = llm.get().create(
+                kind="vision",
                 model=cfg["model"],
                 messages=[{"role": "user", "content": [
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
                     {"type": "text", "text": q},
                 ]}],
                 max_tokens=max_tokens,
+                stream=False,
             ).choices[0].message
         except Exception as e:
             # 连接失败/后端不可达：重试无意义，抛清晰错误由调用方转成友好提示
