@@ -2,3 +2,5 @@ openai
 playwright
 textual
 pillow
+# trace 的 checkpoint 帧组压缩（§4.7）；缺失时 checkpoint 走 JSON 明文降级
+zstandard
