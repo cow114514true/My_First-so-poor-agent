@@ -13,7 +13,7 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 # 导入期会构造 OpenAI client：给个占位 key，绝不出网（下面 client 全被替换）
 os.environ.setdefault("DS_KEY", "sk-selftest-not-a-real-key")
 

@@ -3,7 +3,7 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import loop_agent_v2 as la
 from loop_agent_core.control import interrupt_event
 from loop_agent_core.shell_tools import exec_shell_win_mock

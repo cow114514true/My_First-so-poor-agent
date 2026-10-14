@@ -1,7 +1,7 @@
 """One-shot vision test for the local llama.cpp server.
 
 Usage:
-    python test_vision.py 图片.png ["你想问什么"]
+    python tests/test_vision.py 图片.png ["你想问什么"]
 
 Defaults to asking the model to describe the image.
 Requires start_local_llm.bat to be running first.
@@ -9,6 +9,10 @@ Requires start_local_llm.bat to be running first.
 import sys
 import os
 import base64
+
+# 本文件在 tests/ 下；直跑时仓库根不在 sys.path 里，故显式补上（本脚本只发 HTTP，无仓库内导入，
+# 留着是为了与其余套件的直跑口径一致）。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from openai import OpenAI
 

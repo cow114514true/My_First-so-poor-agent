@@ -3,7 +3,7 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import loop_agent_v2 as la
 import loop_agent_core.confirm as confirm
 
@@ -172,7 +172,14 @@ def test_parse_qwen3_toolcalls():
 def test_store_tool_args():
     big = json.dumps({"path": "tui.py", "content": "x" * 5000}, ensure_ascii=False)
     comp = la._store_tool_args("write_file", big)
-    assert len(comp) < 300 and "omitted 5000 chars" in comp
+    # 占位必须是**可复原**的：长度 + 内容哈希，回放侧才能证明参数与录制一致
+    assert len(comp) < 300
+    d = json.loads(comp)
+    assert d["path"] == "tui.py"
+    assert d["content"]["$omitted"]["len"] == 5000
+    import hashlib
+    assert d["content"]["$omitted"]["sha256"] == hashlib.sha256(
+        ("x" * 5000).encode("utf-8")).hexdigest()
     small = json.dumps({"path": "a", "content": "hi"}, ensure_ascii=False)
     assert la._store_tool_args("write_file", small) == small  # 小参数不动
     assert la._store_tool_args("read_file", big) == big  # 非 write_file 不动

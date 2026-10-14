@@ -6,7 +6,7 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 纯逻辑测试不触网，但 config.py 在 import 时就要建 OpenAI client。
 # 显式声明占位凭据（绝不用真实 key），避免测试依赖外部环境变量。
@@ -14,14 +14,14 @@ os.environ.setdefault("DS_KEY", "sk-selftest-not-a-real-key")
 
 # 失败日志必须重定向到测试专用文件：否则本套件里刻意制造的失败会灌进真实诊断日志
 # tmp/compaction_error.log，污染下次排查（实测灌了 34 行假失败）。
-_SELFTEST_ERRLOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+_SELFTEST_ERRLOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "tmp", "_selftest_compaction_error.log")
 os.environ["COMPACT_ERROR_LOG"] = _SELFTEST_ERRLOG
 if os.path.exists(_SELFTEST_ERRLOG):
     os.remove(_SELFTEST_ERRLOG)
 
 # 前缀缓存遥测同理：本套件里有假 usage 会真的走到 _record_usage，别写进真实 cache_usage.log
-_SELFTEST_CACHELOG = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+_SELFTEST_CACHELOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                  "tmp", "_selftest_cache_usage.log")
 os.environ["CACHE_LOG"] = _SELFTEST_CACHELOG
 if os.path.exists(_SELFTEST_CACHELOG):

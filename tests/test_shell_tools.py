@@ -1,5 +1,11 @@
 """exec_shell_win 分支自检：默认 pwsh、cmd 兼容层、UTF-8 不乱、管道提示。"""
 import json
+import os
+import sys
+
+# 本文件在 tests/ 下；直跑时仓库根不在 sys.path 里，故显式补上。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from loop_agent_core.shell_tools import effective_shell, exec_shell_win_mock
 from loop_agent_core.validation import validate_tool_result
 

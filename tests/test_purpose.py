@@ -5,6 +5,12 @@
 2) 新 4 参 `_ask` 能收到模型自述的 purpose 字符串；
 3) 模型未提供 purpose 时传空串（由界面显式标"未说明"，而不是静默省略）。
 """
+import os
+import sys
+
+# 本文件在 tests/ 下；直跑时仓库根不在 sys.path 里，故显式补上。
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from loop_agent_core import confirm
 
 # 显式固定策略：环境里若设了 AGENT_CONFIRM_POLICY=allow_all/deny_all，request() 会在

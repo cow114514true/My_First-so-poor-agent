@@ -29,11 +29,11 @@ import time
 
 os.environ.setdefault("OPENAI_API_KEY", "sk-dummy-for-tests")
 os.environ.setdefault("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 上一次运行留下的 autosave 会在启动时弹出恢复对话框，盖住屏幕把后面的鼠标
 # 命中测试全部带偏。测试自己造干净环境。
-_SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversations")
+_SAVE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "conversations")
 for _f in glob.glob(os.path.join(_SAVE_DIR, ".autosave*.json")):
     try:
         os.remove(_f)
