@@ -22,9 +22,12 @@
 │                          #   memory/tavily_tool/vision/visual_locate/confirm/control/debuglog/
 │                          #   compaction）
 ├── tui.py                 # Textual TUI 界面（三面板图形交互）
+├── tests/                 # 自检套件（run_tests.py 的 SUITES 是清单权威）
+├── run_tests.py           # 一键跑全部自检套件（退出码可接 CI）
 ├── BUG_LEDGER.md          # 开发以来全部 bug 记录（现象/根因/修复/验证）
 ├── profile.json           # 浏览器登录状态（运行 Get_State.py 后生成）
 ├── conversations/         # 自动保存的对话历史（JSON 格式）
+├── archive/               # 本地杂物归档（不入库；不含产品功能，见 SECURITY_AUDIT_REPORT.md）
 └── README.md
 ```
 
@@ -438,6 +441,23 @@ system_prompt = """You are a helpful, self-critical assistant.
 | `PRUNE_CAP_DS` | 32000 | DeepSeek 后端对话裁剪阈值（65536 窗口的一半） |
 | `HEADROOM_ENABLED` | 1 | headroom-ai 上下文优化开关（1=启用，0=关闭） |
 | `HEADROOM_MODE` | audit | headroom 模式：`audit` 只记录分析不改请求，`optimize` 才真正压缩上下文 |
+
+## 自检（测试）
+
+测试套件在 `tests/` 下，清单的唯一权威是 `run_tests.py` 的 `SUITES`（新增套件必须加进去，否则不会被跑到）。
+
+```bash
+# 前置：config.py 在 import 时构造 client，缺 key 会 OpenAIError（不真的调 API，给假值即可）
+set DS_KEY=sk-dummy            # cmd
+$env:DS_KEY="sk-dummy"         # PowerShell
+
+python run_tests.py            # 全部套件；退出码非 0 = 有失败，可直接接 CI / pre-commit
+python run_tests.py --all      # 同上
+python tests/test_compaction.py  # 单个套件也能直跑
+```
+
+- 纯逻辑、不触网、不需要本地 llama.cpp 服务；用 monkeypatch / 假 client 驱动真实代码路径。
+- `tests/test_vision.py` 不在 `SUITES` 里，是**手动**用的视觉连通性脚本（需先跑 `start_local_llm.bat` 选 3.5）。
 
 ## 注意事项
 
