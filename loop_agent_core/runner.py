@@ -1,22 +1,181 @@
 """主循环与工具执行：_chat 实现。依赖经参数注入（工具表/delegate/默认事件），不碰薄壳可变全局。
 API 调用一律用 conv["messages"]（修 worker 子 agent 把主线程历史发给模型的隔离 bug）。"""
+import hashlib
 import json
 import os
 import time
 import types
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from .config import _is_local_backend, client, cfg, WORK_DIR
+from .config import _is_local_backend, cfg, WORK_DIR
+from . import llm
+from .trace import TURN_END_REASONS
+
+# 模块级 client：OpenAI 兼容外观，实现是 llm 网关（见 loop_agent_core/llm.py）。
+# 保留这个名字是因为它是**测试的注入点**（tests/test_runner_visibility.py 整体替换
+# runner.client 来驱动真循环），也是历史上 `from .config import client` 的下游契约。
+client = llm.get()
 from .compaction import cstate, next_turn
 from .control import interrupt_event
 from .context import (_append_msg, _prep_context, _prune_cap, _prune_messages,
                       _rollback_tool_round, conversation_problems)
 from .events import _default_on_event
+from .llm import _usage_dict
 from .schemas import tools
 from .tokens import estimate_tokens
 from .validation import validate_tool_result
 from .xmlutil import (_is_garbage_content, _parse_xml_tool_calls, _strip_dsml,
                       _strip_toolcall_xml, _XML_TOOLCALL_RE)
+
+
+def _digest_text(text, n=16):
+    """文本指纹：trace 里存**摘要**而不是全文（全文在 llm_end 的 messages 里）。"""
+    import hashlib
+    s = str(text or "")
+    return hashlib.sha1(s.encode("utf-8", "replace")).hexdigest()[:n]
+
+
+def _tool_args_dict(tool):
+    """从 tool_call 取出参数字典（坏 JSON 也不炸：回放要的是"当时喂了什么"）。"""
+    try:
+        return json.loads(tool.function.arguments)
+    except (ValueError, TypeError, AttributeError):
+        return {"_raw": str(getattr(getattr(tool, "function", None), "arguments", ""))[:4000]}
+
+
+def _tool_error_code(result):
+    """工具结果的错误码：None 表示正常返回。"""
+    s = str(result or "")
+    if s.startswith("[Denied"):
+        return "denied"
+    if not s.startswith("[Error]"):
+        return None
+    code = s[len("[Error]"):].strip().split(":", 1)[0].strip()
+    return (code or "unknown")[:60]
+
+
+def _tool_class(name):
+    """工具的副作用类别（A/B/C）。未登记工具返回 "?" —— 只用于记录，
+    真正的拒绝发生在回放引擎里（那里必须 fail-closed）。"""
+    from .toolclass import TOOL_CLASS
+    entry = TOOL_CLASS.get(name)
+    return entry["class"] if entry else "?"
+
+
+def _trace_ev(etype, **fields):
+    """发一条 trace 事件（无活跃 trace 时是空操作）。供模块级函数使用。"""
+    from . import trace
+    return trace.emit_event({"type": etype, **fields})
+
+
+def _limits(site=""):
+    """记一条 limits（按 site+值去重，重复调用是空操作）。"""
+    try:
+        from . import trace
+        return trace.emit_limits(site=site)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _rewrite_scope(name):
+    """路径重写的适用面（structured / best_effort / None），仅记录用。"""
+    from .toolclass import rewrite_scope_of
+    try:
+        return rewrite_scope_of(name)
+    except Exception:  # noqa: BLE001 —— 只影响 trace 字段，不该拖垮工具轮
+        return None
+
+
+# ── 回放钩子（§4.5 / §8.3 的 L1 子集）──────────────────────────────
+# 回放时工具结果从 cassette 回吐，**不真执行**：真执行会写工作区、打网络，那样跑出来的
+# 就不是"同一段历史再跑一遍"，而是"在另一台机器上重做一遍"——失败复现与否都不再说明问题。
+def _replay_prefetch(use_tool_calls):
+    """回放中：为每个工具取录制结果（返回 {call_id: result_full}）。
+
+    只把 `result_full` 交回给主循环，让**主循环自己再截断一次**——这正是 §4.5 要检验的
+    那一步：现在的预算算出来的 `result_stored` 必须和录制时的那一份一样。
+    """
+    try:
+        from . import replay
+    except Exception:  # noqa: BLE001
+        return {}
+    if replay.active_session() is None:
+        return {}
+    out = {}
+    for tool in use_tool_calls:
+        rec = replay.tool_result_for(tool.function.name, tool.id)
+        if rec is None:
+            raise replay.ReplayToolMissing(
+                f"回放时遇到没有录制结果的工具调用：{tool.function.name}({tool.id})")
+        full = rec.get("result_full")
+        out[tool.id] = str(full if full is not None else (rec.get("result_stored") or ""))
+    return out
+
+
+def _replay_verify_result(tool, result_full, stored):
+    """回放中对账：`truncate(result_full, 现在的预算)` 是否等于录制的 result_stored。"""
+    try:
+        from . import replay
+    except Exception:  # noqa: BLE001
+        return
+    session = replay.active_session()
+    if session is None:
+        return
+    rec = session.cassette.tool_result(tool.id) or {}
+    limits_recorded = session.cassette.limits_for(rec.get("request_index"))
+    replay.attribute_truncation(result_full, stored, rec, trace_limits(), limits_recorded,
+                                report=session.report)
+
+
+def trace_limits():
+    """当前生效的 limits 载荷（回放对账用）。"""
+    try:
+        from . import trace
+        return trace.limits_payload()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# 本地 Qwen 经常整轮只输出 thinking（reasoning_content）而 content 为空、也没工具调用 →
+# 不是垃圾，是回合没走完。注入提示让模型继续，而不是掐断整回合。
+_EMPTY_NUDGE = ("[Self-check] 你刚才只输出了思考过程，没有调用工具也没有给出回答。"
+                "请继续：调用下一步需要的工具，或直接给出最终回答。")
+# nudge 耗尽仍卡 → 准确说明是思考循环，不是乱码
+# （不要再写死"换用 DeepSeek 后端"：实测云端后端同样会卡在只输出思考，
+#   而这条文案正好在 DeepSeek 会话里出现，等于给了反向建议。）
+_STUCK_MSG = ("[模型陷入思考循环：连续多轮只输出思考、没有工具调用或回答。"
+              "本轮已中止，任务可能未完成——请重试、把要求说得更具体，或新开一个会话。]")
+# 与 _STUCK_MSG 同因的**可见**提示：历史里存的那条消息以前只 return、不上屏，
+# 用户看到的就是"agent 静默停止工作"。
+_STUCK_NOTICE = "模型连续多轮只输出思考、没有工具调用也没有回答，已中止本轮（任务可能未完成）。"
+
+# 工具轮次接近上限时注入收尾提示，不依赖模型自觉
+_WRAPUP_NUDGE = ("[System] 已使用 {used}/{max} 轮工具调用。"
+                 "如果核心需求已经实现，请现在输出完成报告（做了什么、改了什么、如何验证），"
+                 "不要再继续探索或调用工具。仅当确有未完成的关键步骤时才继续。")
+
+
+# ── notice 的稳定语义码（断言靠它，不靠文案）─────────────────────────
+# 面板文案改一个字就会让断言全红——所以断言只认 code；文案随便改。
+# 词表见 TRACE_REPLAY_BUILD.md §5.2，改名要走 cassette 格式迁移。
+NOTICE_CODES = {
+    "interrupted": ("warn", "interrupted",
+                    "已中断（Esc）：本回合没有给出回答（此前已执行的工具结果仍保留在历史里）。"),
+    "interrupted_partial": ("info", "interrupted_partial",
+                            "已中断（Esc）：已保留本回合已生成的部分内容。"),
+    "interrupted_empty": ("warn", "interrupted",
+                          "已中断（Esc）：本回合没有给出回答。"),
+    "stuck": ("warn", "stuck", _STUCK_NOTICE),
+    "garbled": ("warn", "garbled", "模型输出被判为乱码，已中止本轮。请换个说法重试。"),
+    "empty_nudge": ("info", "empty_nudge",
+                    "模型这一轮只输出了思考过程，已要求它继续（{n}/3）。"),
+    "wrapup_nudge": ("info", "wrapup_nudge",
+                     "已用 {n}/{m} 轮工具调用，已要求模型收尾并给结论。"),
+    "xml_toolcall_retry": ("info", "xml_toolcall_retry",
+                           "模型把工具调用写进了思考但没能解析出来，正在重试。"),
+    "fallback": ("warn", "fallback",
+                 "模型多轮都没有产出可用的正文，已中止本轮。请换个说法重试。"),
+}
 
 
 def _dump_filtered(reason, snippet):
@@ -146,25 +305,6 @@ def _dump_api_error(e, conv, kwargs):
         pass
 
 
-# 本地 Qwen 经常整轮只输出 thinking（reasoning_content）而 content 为空、也没工具调用 →
-# 不是垃圾，是回合没走完。注入提示让模型继续，而不是掐断整回合。
-_EMPTY_NUDGE = ("[Self-check] 你刚才只输出了思考过程，没有调用工具也没有给出回答。"
-                "请继续：调用下一步需要的工具，或直接给出最终回答。")
-# nudge 耗尽仍卡 → 准确说明是思考循环，不是乱码
-# （不要再写死"换用 DeepSeek 后端"：实测云端后端同样会卡在只输出思考，
-#   而这条文案正好在 DeepSeek 会话里出现，等于给了反向建议。）
-_STUCK_MSG = ("[模型陷入思考循环：连续多轮只输出思考、没有工具调用或回答。"
-              "本轮已中止，任务可能未完成——请重试、把要求说得更具体，或新开一个会话。]")
-# 与 _STUCK_MSG 同因的**可见**提示：历史里存的那条消息以前只 return、不上屏，
-# 用户看到的就是"agent 静默停止工作"。
-_STUCK_NOTICE = "模型连续多轮只输出思考、没有工具调用也没有回答，已中止本轮（任务可能未完成）。"
-
-# 工具轮次接近上限时注入收尾提示，不依赖模型自觉
-_WRAPUP_NUDGE = ("[System] 已使用 {used}/{max} 轮工具调用。"
-                 "如果核心需求已经实现，请现在输出完成报告（做了什么、改了什么、如何验证），"
-                 "不要再继续探索或调用工具。仅当确有未完成的关键步骤时才继续。")
-
-
 def _inject_user_nudge(text, conv):
     """注入一条 user 消息：若末条已是 user 则合并（避免连续 user 违反 API 交替协议），否则追加。"""
     msgs = conv["messages"]
@@ -184,13 +324,27 @@ def _xml_to_tool_calls(xml_calls):
     ]
 
 
+_STORE_ARGS_THRESHOLD = 500  # write_file 参数超过这个长度才在 conv 里换成 $omitted 占位
+
+
 def _store_tool_args(name, arguments):
-    """写入 messages 的工具参数压缩：write_file 的 content 只留占位，避免整份文件内容撑爆本地窗口。"""
-    if name == "write_file" and isinstance(arguments, str) and len(arguments) > 500:
+    """写入 messages 的工具参数压缩：write_file 的 content 只留占位，避免整份文件内容撑爆本地窗口。
+
+    占位必须是**可复原**的：回放时 conv 里那条 assistant 消息只剩占位，若占位里不带
+    原始长度与哈希，就永远无法证明"这一轮发出去的参数"和录制时是同一条——回放只能
+    相信它。所以这里存 `{"$omitted": {"len": N, "sha256": ...}}`，原文另存
+    trace 里的 tool_call.arguments_raw，回放侧用两者互相校验（§4.5）。
+    """
+    if name == "write_file" and isinstance(arguments, str) and len(arguments) > _STORE_ARGS_THRESHOLD:
         try:
             d = json.loads(arguments)
             if isinstance(d, dict) and isinstance(d.get("content"), str):
-                d["content"] = f"[omitted {len(d['content'])} chars]"
+                body = d["content"]
+                d["content"] = {"$omitted": {
+                    "len": len(body),
+                    "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                }}
+                _limits("store_tool_args")
                 return json.dumps(d, ensure_ascii=False)
         except (json.JSONDecodeError, TypeError):
             pass
@@ -236,23 +390,95 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
     delegate_fn 由薄壳注入（运行时查壳命名空间，保留 monkeypatch 语义）。"""
     if interrupt_event.is_set():
         # 中断：回滚本工具轮（assistant tool_calls 与其 tool 结果），保持历史一致
-        _rollback_tool_round(conv)
+        from . import trace
+        trace.emit_event({"type": "interrupt", "cause": "user_esc", "phase": "pre_round"})
+        _rollback_tool_round(conv, cause="interrupt")
         return
 
     results = {}  # call_id -> result
+    _dur = {}  # call_id -> 执行耗时（ms）；trace 用，取不到就 None
     worker_meta = {}  # call_id -> task（结算阶段补发 worker_done）
+    _worker_t0 = {}
+
+    def _trace_call(tool):
+        """记下工具的**发起**（含完整入参）：回放按这份入参决定吐结果还是重跑。
+
+        `arguments_raw` 必须是**原始完整**参数：会话历史里的 assistant tool_calls 会被
+        `_store_tool_args` 换成占位符（write_file 的大正文尤其），回放时正是靠这一份把
+        真实入参还原回来（§4.5 两通道）。
+        """
+        from . import trace
+        name = tool.function.name
+        raw = str(getattr(tool.function, "arguments", "") or "")
+        trace.emit_record({"type": "tool_call", "name": name, "tool_name": name,
+                           "call_id": tool.id,
+                           "class": _tool_class(name), "tool_class": _tool_class(name),
+                           "rewrite": _rewrite_scope(name),
+                           "arguments_raw": raw,
+                           "arguments": _tool_args_dict(tool),
+                           "args_digest": _digest_text(raw)})
+
+    def _trace_result(tool, result, stored, cap, duration_ms=None, from_replay=False):
+        """记下工具的**结果**：result_full 是喂给模型之外的那一份，result_stored 才是进
+        上下文的那一份（可能被 cap 截断）。
+
+        两通道分开记（§4.5）：回放要能重算 `truncate(result_full, limits_now)` 并与
+        `result_stored` 比对——只记一份的话，截断预算被改过就再也查不出差异从哪来。
+        """
+        from . import trace
+        name = tool.function.name
+        code = _tool_error_code(result)
+        text = str(result if result is not None else "")
+        stored_text = str(stored if stored is not None else "")
+        trace.emit_record({"type": "tool_result", "name": name, "tool_name": name,
+                           "call_id": tool.id,
+                           "class": _tool_class(name), "tool_class": _tool_class(name),
+                           "error": bool(code), "error_code": code,
+                           "result_full": text,
+                           "result_full_chars": len(text),
+                           "result_full_digest": _digest_text(text),
+                           "result_stored": stored_text,
+                           "result_stored_chars": len(stored_text),
+                           "result_stored_digest": _digest_text(stored_text),
+                           "duration_ms": duration_ms,
+                           "from_replay": bool(from_replay),
+                           "truncation": {"cap": cap, "raw_len": len(text),
+                                          "stored_len": len(stored_text),
+                                          "truncated": len(stored_text) < len(text),
+                                          "recorded_at": trace.trace_epoch()["iso"]},
+                           # 显示通道：仍是截断后的前 2000 字符（trace 不该被一条结果撑爆）
+                           "result_digest": _digest_text(text),
+                           "result_chars": len(text),
+                           "result": text[:2000]})
+        if code:
+            # 工具失败在断言面里必须有自己的 id（§3.4）：只靠 tool_result.error=True
+            # 没法区分"哪个工具的哪种失败"，L3 也就无法声明"我要复现的是哪一个失败"。
+            trace.emit_record({"type": "tool_error", "name": name, "tool_name": name,
+                               "call_id": tool.id, "code": code,
+                               "tool_class": _tool_class(name),
+                               "message": text[:500]})
+
+    for _tool in use_tool_calls:
+        _trace_call(_tool)
 
     # ── 1) 并发执行阶段（只收集结果）────────────────────────
+    # 回放：先把录制结果取回来；取回来的工具不再进入执行阶段（上面 prefetch 会抛
+    # ReplayToolMissing，不允许"没录到就现跑一个"来蒙混过关）。
+    _replay_results = _replay_prefetch(use_tool_calls)
     # 同步工具：线程池并发。worker 内禁用的工具不执行，结算阶段给错误。
     # 每个工具设结果超时（browser/ds_web 无内部兜底时会卡死线程），超时不阻塞主循环；
     # executor 用 shutdown(wait=False) 防 with 退出 join 死等（后台线程自然结束）。
     sync = [t for t in use_tool_calls
-            if t.function.name != "delegate_task"
+            if t.id not in _replay_results
+            and t.function.name != "delegate_task"
             and not (is_worker and t.function.name in _WORKER_FORBIDDEN)]
     if sync:
         ex = ThreadPoolExecutor(max_workers=_SYNC_MAX)
         try:
-            fut = {ex.submit(_call_tool, t, tool_call_map): t for t in sync}
+            fut, _t0 = {}, {}
+            for t in sync:
+                _t0[t.id] = time.time()
+                fut[ex.submit(_call_tool, t, tool_call_map)] = t
             for f in as_completed(fut):
                 t = fut[f]
                 try:
@@ -262,13 +488,16 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
                 except Exception as e:
                     cid, res = t.id, f"[Error] Tool execution failed: {e}"
                 results[cid] = res
+                _dur[t.id] = int((time.time() - _t0[t.id]) * 1000)
         finally:
             ex.shutdown(wait=False)
 
     # delegate_task：子 agent 异步队列（仅主 agent 可委托，受控并发）。
     if not is_worker:
-        delegated = [t for t in use_tool_calls if t.function.name == "delegate_task"]
+        delegated = [t for t in use_tool_calls
+                     if t.function.name == "delegate_task" and t.id not in _replay_results]
         if delegated:
+            from . import trace
             ex = ThreadPoolExecutor(max_workers=_worker_pool_size())
             try:
                 futs = []
@@ -280,6 +509,10 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
                         continue
                     worker_meta[t.id] = task
                     emit({"type": "worker_start", "task": task[:200]})  # 主线程发，worker 跑起来前先上屏
+                    _worker_t0[t.id] = time.time()
+                    trace.emit_event({"type": "worker_dispatch", "call_id": t.id,
+                                      "task_digest": _digest_text(task),
+                                      "task_chars": len(task)})
                     futs.append((t, ex.submit(_run_worker, task, delegate_fn)))
                 for t, f in futs:
                     try:
@@ -288,14 +521,27 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
                         results[t.id] = f"[Error] Sub-agent timed out after {_WORKER_TIMEOUT}s"
                     except Exception as e:
                         results[t.id] = f"[Error] Sub-agent execution failed: {e}"
+                    _dur[t.id] = int((time.time() - _worker_t0.get(t.id, time.time())) * 1000)
+                    trace.emit_event({"type": "worker_settle", "call_id": t.id,
+                                      "result_digest": _digest_text(results[t.id]),
+                                      "result_chars": len(str(results[t.id])),
+                                      "duration_ms": _dur[t.id]})
             finally:
                 ex.shutdown(wait=False)
+
+    # 回放结果并进 results；_dur 记 0（没有真实耗时，记个假的更糟）
+    if _replay_results:
+        results.update(_replay_results)
+        for _cid in _replay_results:
+            _dur.setdefault(_cid, 0)
 
     # ── 2) 结算阶段：按原调用顺序，逐分支与旧逻辑一致 ─────────
     critiques = []
     for tool in use_tool_calls:
         if interrupt_event.is_set():
-            _rollback_tool_round(conv)
+            from . import trace
+            trace.emit_event({"type": "interrupt", "cause": "user_esc", "phase": "during_tools"})
+            _rollback_tool_round(conv, cause="interrupt")
             return
         tool_name = tool.function.name
 
@@ -303,6 +549,7 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
             # worker 内禁止委托/记忆工具：发事件 + 落库后 continue（跳过自检）
             err = f"[Error] {tool_name} 在 sub-agent 内不可用。将你的结果返回给主 agent 处理。"
             emit({"type": "tool_result", "tool_name": tool_name, "result": err, "call_id": tool.id})
+            _trace_result(tool, err, err, 0, from_replay=False)
             _append_msg({"role": "tool", "tool_call_id": tool.id, "content": err}, conv)
             continue
 
@@ -314,14 +561,21 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
             emit({"type": "worker_done", "task": worker_meta[tool.id][:200], "result": str(tool_result)[:300]})
 
         emit({"type": "tool_result", "tool_name": tool_name, "result": str(tool_result), "call_id": tool.id})
-        # 落库进上下文的结果按预算截断（本地窗口小）；显示仍走上面的完整事件
+        # 落库进上下文的结果按预算截断（本地窗口小）；显示仍走上面的完整事件。
+        # 必须在发 trace 之前算出来：trace 记的 result_stored 就是这一份（§4.5）。
         stored = str(tool_result)
         # 本地 2500 只能装 ~14 个元素清单，投币按钮排第 43 位看不到 → 提到 6000
         # （16K 窗口 ≈ 3000 token 元素清单，18% 预算，可接受；能覆盖完整操作栏）
         cap = 6000 if _is_local_backend() else 10000
+        _limits("tool_result_cap")
         if len(stored) > cap:
             total = len(stored)
             stored = stored[:cap] + f"\n...(stored truncated, {total} chars total; re-read via read_file if needed)"
+        _trace_result(tool, tool_result, stored, cap, duration_ms=_dur.get(tool.id),
+                      from_replay=tool.id in _replay_results)
+        # 回放对账（§4.5）：现在的预算算出来的 stored 必须等于录制的那一份
+        if tool.id in _replay_results:
+            _replay_verify_result(tool, str(tool_result), stored)
         _append_msg({"role": "tool", "tool_call_id": tool.id, "content": stored}, conv)
 
         try:
@@ -330,6 +584,11 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
             is_valid, critique = True, ""  # 自检不该有权限中断整批工具执行
         if not is_valid:
             emit({"type": "self_check", "tool_name": tool_name, "critique": critique})
+            # 自检结论进 trace：它是"这一轮结果为什么被质疑"的唯一记录，只发屏幕事件
+            # 的话，回放里就只剩一个"模型绕开了这个结果"而看不出原因。
+            _trace_ev("self_check", tool_name=tool_name, call_id=tool.id,
+                      content=critique, critique=critique,
+                      critique_digest=_digest_text(critique))
             critiques.append((tool_name, critique))
 
     # 合并所有自检为一条 user 消息，避免多 tool 失败时连续 user 消息触发 API 400
@@ -365,7 +624,12 @@ def _stream_strip_xml(buf, emit_fn):
 
 
 def _safe_create(conv, **kwargs):
-    """create() 包装：API 400 时回滚最后一轮工具调用（避免合成 tool_call_id 污染历史后持续 400），再上抛。"""
+    """create() 包装：API 400 时回滚最后一轮工具调用（避免合成 tool_call_id 污染历史后持续 400），再上抛。
+
+    出口是模块级 `client`——一个 OpenAI 兼容外观，实际实现是后端无关的 llm 网关
+    （loop_agent_core/llm.py）。这样回放引擎只需替换网关 transport 就能接管**所有**
+    模型调用（含摘要/视觉），且测试仍可整体替换 `runner.client`。
+    """
     try:
         return client.chat.completions.create(**kwargs)
     except Exception as e:
@@ -383,13 +647,18 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     summarize_fn(prefix, block_msgs) 由薄壳注入，用于 L1 分块滚动摘要；
     为 None（或非主会话）时只做 L0 去重 + L2 硬裁剪。
     """
+    # run 起点：清掉上一轮遗留的进程级打印状态（否则它会渗进 checkpoint 的 D 组，
+    # 让"同一段历史录两次"产出不同的快照）。见 events.reset_streaming_flag。
+    from .events import reset_streaming_flag
+    reset_streaming_flag()
+
     def _emit(event):
         if on_event:
             on_event(event)
         else:
             default_on_event(event)
 
-    def _notice(level, message):
+    def _notice(level, message, code=""):
         """把"这个回合是怎么结束的"发到面板上（level: info / warn）。
 
         此前 4 类终局消息（思考循环 / 乱码过滤 / 中断 / 兜底）只在函数末尾 return，
@@ -397,8 +666,105 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         "agent 静默停止工作"（实测 2026-10-11 20:52 那次：3 轮只出思考 + 1 次中止，
         4 次 API 调用对用户完全不可见）。注入的 nudge 同理，必须显式说明，
         否则用户不知道模型被"催"过几次。
+
+        `code` 是**给机器看**的稳定语义标签（notice:<level>:<code>），
+        回放按它做断言；面板文案是给人看的，两者不能互相绑死（文案会改，断言不会）。
         """
-        _emit({"type": "notice", "level": level, "message": message})
+        ev = {"type": "notice", "level": level, "message": message}
+        if code:
+            ev["code"] = code
+        _emit(ev)
+
+    def _trace(etype, **fields):
+        """只进 trace、不上屏的事实（终局原因、回放对账所需的摘要）。"""
+        from . import trace
+        trace.emit_event({"type": etype, **fields})
+
+    _final = {}  # {"reason": ...}：确保一轮只写一条 turn_end
+
+    def _checkpoint(kind, q_idx=None):
+        """采集一份 checkpoint。pre_request 必须发生在 llm_request 之前。
+
+        post_turn 只在**本回合已经采过** pre_request 时才补：否则会在会话刚开头
+        （还没发出任何请求）凭空写一份"轮末"快照，回放的 request_index → checkpoint
+        映射上就多出一个永远对不上的条目。
+        """
+        from . import checkpoint
+        if kind == "post_turn" and "request_index" not in _final:
+            return None
+        snap = checkpoint.capture(conv, q_idx, kind=kind)
+        if snap is not None and kind == "pre_request":
+            _final["request_index"] = snap.get("request_index")
+        return snap
+
+    def _noticec(key, **fmt):
+        """按词表发带 code 的 notice。
+
+        level 与 code 成对定义（§5.2 词表），文案模板也放一起：断言只认 code，
+        但人在面板上看到的那句话必须仍然是原来那句——两件事不能互相绑死，
+        也不能因为"加了 code"就把文案丢掉。
+        """
+        level, code, template = NOTICE_CODES[key]
+        text = template.format(**fmt) if fmt else template
+        ev = {"type": "notice", "level": level, "message": text, "code": code}
+        _emit(ev)
+        # trace 侧单独落一条：notice 是 L3 断言的主要来源（notice:<level>:<code>），
+        # 不能只活在屏幕事件里——没有回调方时那些断言就无从谈起。
+        _trace("notice", level=level, code=code, message=text)
+
+    def _turn_end(reason, answer=""):
+        """回合结束的唯一出口记录：回放按 reason 走不同断言，缺它整条回放链就断了。
+
+        幂等：先到的调用赢。这样"正常 return 路径"和"异常兜底路径"可以都调用它，
+        而不会在 trace 里留下两条 turn_end（回放会以为跑了两轮）。
+        """
+        if _final.get("reason"):
+            return
+        if reason not in TURN_END_REASONS:
+            # 词表外的 reason 会让回放的 reason→断言映射落空。宁可当场炸，
+            # 也不要写出一条"回放不知道该怎么判"的终局记录。
+            raise ValueError(f"turn_end.reason 不在词表内：{reason!r}（允许：{TURN_END_REASONS}）")
+        _final["reason"] = reason
+        is_garbage = str(answer).startswith("[Response filtered")
+        # 先写 turn_end 再补 post_turn 快照：快照的 request_index 取的是"下一个请求号"，
+        # 反过来的话 turn_end 会拿到一个比刚才那条 post_turn 更小的号，校验会判成回退。
+        _trace("turn_end", reason=reason, answer_chars=len(str(answer or "")),
+               answer_digest=_digest_text(answer),
+               outcome="filtered" if is_garbage else "answered")
+        _checkpoint("post_turn")
+
+    def _finish(reason, answer):
+        """终局：先落 turn_end（事实），再原样返回答案（不改调用方语义）。"""
+        _turn_end(reason, answer)
+        return answer
+
+    def _model_call(conv, **kwargs):
+        """一次模型调用。失败时上抛，但**先**把 api_error 事实和 turn_end 记进 trace。
+
+        记在这里而不是让异常一路冒到调用者：调用者拿到的还是同一个异常（行为不变），
+        但 trace 里留下了"这一轮是因为什么死的"——否则回放只能看到一串没有结尾的事件。
+        """
+        try:
+            return _safe_create(conv, **kwargs)
+        except Exception as exc:  # noqa: BLE001 —— 原样重抛，只加记录
+            from . import trace
+            _body = f"{type(exc).__name__}: {str(exc)[:800]}"
+            _trace("api_error", status=getattr(exc, "status_code", None),
+                   body_digest=_digest_text(_body),
+                   exception_id=trace.exception_id(exc),
+                   exc_type=type(exc).__name__,
+                   func=trace.exception_site(exc),
+                   error=_body)
+            _turn_end("api_error")
+            raise
+
+    # ── trace 上下文：本回合的 turn 号 + 会话标识 ───────────────
+    # 在写任何事件之前绑定：后面 llm/tool/turn_end 事件都按这个 turn 归组，
+    # 序列对不上时回放就能明确报"是这一轮的哪个位置开始分叉"。
+    from . import trace
+    trace.begin_turn(trace.current_context().turn,
+                     session=str(conv.get("_session_id") or "main"))
+    _turn_started = time.time()
 
     # 初始化消息 token 记账（首次）
     conv["_empty_retries"] = 0  # thinking-only 回合的重试计数（有界，防死循环）
@@ -411,6 +777,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         _msg = ("会话历史结构已损坏（" + "；".join(_problems) + "），已拒绝发送。"
                 "请 /load 一个有效会话，或 /clear 重置后重来。")
         _emit({"type": "error", "message": _msg})
+        _turn_end("api_error", _msg)
         return "[Internal error] " + _msg
     # 三层压缩（L0/L1）只在主会话启用；worker 会话生命周期短，本轮不压。
     # L2 硬裁剪对两者都生效（worker 原先也走 _prune_messages）。
@@ -441,14 +808,17 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # 循环处理工具调用
     while tool_round < MAX_TOOL_ROUNDS:
         tool_round += 1
+        trace.set_tool_round(tool_round)
         if interrupt_event.is_set():  # 用户已按 Esc 中断
-            _notice("warn", "已中断（Esc）：本回合没有给出回答（此前已执行的工具结果仍保留在历史里）。")
+            _noticec("interrupted")
+            _turn_end("interrupted")
             return "[Interrupted by user]"
         # 每次 API 调用前整理上下文：L0 去重 → L1 分块摘要 → L2 硬裁剪
         q_idx, pruned = _prep_context(_prune_cap(), q_idx, conv, active_summarize, _emit)
+        _checkpoint("pre_request", q_idx)
         # 流式调用：思考/正文边生成边上屏，工具调用在流结束时统一解析
-        response = _safe_create(conv, model=cfg["model"], messages=conv["messages"], stream=True,
-                                tools=tools, stream_options={"include_usage": True}, **cfg["extra_kwargs"])
+        response = _model_call(conv, model=cfg["model"], messages=conv["messages"], stream=True,
+                               tools=tools, stream_options={"include_usage": True}, **cfg["extra_kwargs"])
 
         content, reasoning = "", ""
         _cbuf, _rbuf = "", ""
@@ -461,6 +831,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 _emit({"type": "token_usage", "usage": chunk.usage,
                        "cache": _record_usage(chunk.usage, cstate(conv),
                                               model=cfg.get("model"))})
+                _trace("token_usage", usage=_usage_dict(chunk.usage))
                 conv["size"] = chunk.usage.prompt_tokens  # 用 API 精确计数同步记账
                 if not chunk.choices:
                     continue
@@ -500,9 +871,10 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             partial = _strip_toolcall_xml(content).strip()
             if partial and not _is_garbage_content(partial):
                 _append_msg({"role": "assistant", "content": partial}, conv)
-                _notice("info", "已中断（Esc）：已保留本回合已生成的部分内容。")
+                _noticec("interrupted_partial")
             else:
-                _notice("warn", "已中断（Esc）：本回合没有给出回答。")
+                _noticec("interrupted_empty")
+            _turn_end("interrupted")
             return "[Interrupted by user]"
 
         # 组装工具调用：优先 OpenAI JSON tool_calls，其次本地模型的 XML（在 reasoning/content 里）。
@@ -523,31 +895,39 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 cleaned = _strip_toolcall_xml(content).strip()
                 if cleaned and not _is_garbage_content(cleaned):
                     _append_msg({"role": "assistant", "content": cleaned}, conv)
+                    _turn_end("answer", cleaned)
                     return cleaned
                 if "<tool_call" in (reasoning + content):
                     # 模型想调工具但 XML 没解析出来（常见于工具调用写在 thinking 里）→ 重试，别掐断回合
                     if not _warned_xml:
                         _warned_xml = True
-                        _notice("info", "模型把工具调用写进了思考但没能解析出来，正在重试。")
+                        _noticec("xml_toolcall_retry")
+                    _trace("xml_toolcall_retry", round=tool_round,
+                           count=int(conv.get("_xml_retries", 0)) + 1)
+                    conv["_xml_retries"] = int(conv.get("_xml_retries", 0)) + 1
                     continue
                 if reasoning.strip() and not cleaned:
                     # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
                     conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
                     if conv["_empty_retries"] <= 3:
+                        _trace("thinking_only_retry", round=tool_round,
+                               count=conv["_empty_retries"])
                         _inject_user_nudge(_EMPTY_NUDGE, conv)
-                        _notice("info", f"模型这一轮只输出了思考过程，已要求它继续（{conv['_empty_retries']}/3）。")
+                        _noticec("empty_nudge", n=conv["_empty_retries"])
+                        _trace("nudge_injected", kind="empty", attempt=conv["_empty_retries"])
                         continue
                     msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
-                    _notice("warn", _STUCK_NOTICE)
+                    _noticec("stuck")
                     # 留痕：notice 会随滚动消失，这条能事后 grep（debug_filtered.txt）
                     _dump_filtered("turn_end:stuck",
                                    f"round={tool_round} retries={conv['_empty_retries']} "
                                    f"reasoning={reasoning[:200]}")
                 else:
                     msg = "[Response filtered: detected garbled output. Please rephrase your request.]"
-                    _notice("warn", "模型输出被判为乱码，已中止本轮。请换个说法重试。")
+                    _noticec("garbled")
                 _dump_filtered("main_no_toolcall", f"reasoning={reasoning[:400]} content={content[:400]}")
                 _append_msg({"role": "assistant", "content": msg}, conv)
+                _turn_end("stuck" if msg == _STUCK_MSG else "garbled", msg)
                 return msg
 
         # 有工具调用
@@ -580,7 +960,8 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         # 工具轮次逼近上限时注入收尾提示（合并到末条 user 或追加，不破坏交替协议）
         if tool_round == MAX_TOOL_ROUNDS - 4:
             _inject_user_nudge(_WRAPUP_NUDGE.format(used=tool_round, max=MAX_TOOL_ROUNDS), conv)
-            _notice("info", f"已用 {tool_round}/{MAX_TOOL_ROUNDS} 轮工具调用，已要求模型收尾并给结论。")
+            _noticec("wrapup_nudge", n=tool_round, m=MAX_TOOL_ROUNDS)
+            _trace("nudge_injected", kind="wrapup", attempt=tool_round)
         # 继续循环，让助手处理工具结果
 
     # 主循环已实时输出正文；若工具轮次耗尽仍无正文，交给下面的最终流式阶段
@@ -589,12 +970,15 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # 最终流式阶段循环直到给出正文答案；期间遇到工具调用（content 或 reasoning 里的 <tool_call>）
     # 就执行并重试。上限固定 12，够写完多文件又不至于死循环拖太久。
     for final_round in range(12):
+        trace.set_tool_round(MAX_TOOL_ROUNDS + final_round + 1)  # 收尾轮并入同一轮号空间
         if interrupt_event.is_set():  # 用户已按 Esc 中断
-            _notice("warn", "已中断（Esc）：本回合没有给出回答（此前已执行的工具结果仍保留在历史里）。")
+            _noticec("interrupted")
+            _turn_end("interrupted")
             return "[Interrupted by user]"
         q_idx, pruned = _prep_context(_prune_cap(), q_idx, conv, active_summarize, _emit)
-        response_stream = _safe_create(conv, model=cfg["model"], messages=conv["messages"], stream=True,
-                                       tools=tools, stream_options={"include_usage": True}, **cfg["extra_kwargs"])
+        _checkpoint("pre_request", q_idx)
+        response_stream = _model_call(conv, model=cfg["model"], messages=conv["messages"], stream=True,
+                                      tools=tools, stream_options={"include_usage": True}, **cfg["extra_kwargs"])
 
         full_response = ""
         full_thinking = ""  # 原始 reasoning（未剥 XML），用于识别藏在思考里的工具调用
@@ -609,6 +993,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 _emit({"type": "stream_usage", "usage": chunk.usage,
                        "cache": _record_usage(chunk.usage, cstate(conv),
                                               model=cfg.get("model"))})
+                _trace("token_usage", usage=_usage_dict(chunk.usage))
                 if not chunk.choices:
                     continue
             elif not chunk.choices:
@@ -638,9 +1023,10 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             partial = _strip_toolcall_xml(full_response).strip()
             if partial and not _is_garbage_content(partial):
                 _append_msg({"role": "assistant", "content": partial}, conv)
-                _notice("info", "已中断（Esc）：已保留本回合已生成的部分内容。")
+                _noticec("interrupted_partial")
             else:
-                _notice("warn", "已中断（Esc）：本回合没有给出回答。")
+                _noticec("interrupted_empty")
+            _turn_end("interrupted")
             return "[Interrupted by user]"
 
         # 模型还没读完/还在发工具调用（本地模型常把 <tool_call> 写在 reasoning 里）→ 执行后重试。
@@ -665,7 +1051,8 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                     # 同样在逼近上限时注入收尾提示
                     if final_round == 8:  # 12 轮中的第 9 轮（0-indexed）
                         _inject_user_nudge(_WRAPUP_NUDGE.format(used=final_round + 1, max=12), conv)
-                        _notice("info", f"已用 {final_round + 1}/12 轮工具调用，已要求模型收尾并给结论。")
+                        _noticec("wrapup_nudge", n=final_round + 1, m=12)
+                        _trace("nudge_injected", kind="wrapup", attempt=final_round + 1)
                 continue  # 模型还会再请求，直到给出正文
 
         # 正常答案：剥 XML + 垃圾检测后保存
@@ -675,26 +1062,33 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
                 conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
                 if conv["_empty_retries"] <= 3:
+                    _trace("thinking_only_retry", round=final_round,
+                           count=conv["_empty_retries"])
                     _inject_user_nudge(_EMPTY_NUDGE, conv)
-                    _notice("info", f"模型这一轮只输出了思考过程，已要求它继续（{conv['_empty_retries']}/3）。")
+                    _noticec("empty_nudge", n=conv["_empty_retries"])
+                    _trace("nudge_injected", kind="empty", attempt=conv["_empty_retries"])
                     continue
                 msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
-                _notice("warn", _STUCK_NOTICE)
+                _noticec("stuck")
                 _dump_filtered("turn_end:stuck",
                                f"final_round={final_round} retries={conv['_empty_retries']} "
                                f"thinking={full_thinking[:200]}")
             else:
                 msg = "[Response filtered: detected garbled output. Please rephrase your request.]"
-                _notice("warn", "模型输出被判为乱码，已中止本轮。请换个说法重试。")
+                _noticec("garbled")
             _dump_filtered("final_stage", f"thinking={full_thinking[:400]} response={full_response[:400]}")
             _append_msg({"role": "assistant", "content": msg}, conv)
+            _turn_end("stuck" if msg == _STUCK_MSG else "garbled", msg)
             return msg
         else:
             _append_msg({"role": "assistant", "content": save_response}, conv)
+            _turn_end("answer", save_response)
             return save_response
 
     # 多次重试仍无正文（极端情况），兜底
-    _notice("warn", "模型多轮都没有产出可用的正文，已中止本轮。请换个说法重试。")
+    _noticec("fallback")
     _dump_filtered("fallback", f"thinking={full_thinking[:400]} response={full_response[:400]}")
-    _append_msg({"role": "assistant", "content": "[Response filtered: detected garbled output. Please rephrase your request.]"}, conv)
-    return "[Response filtered: detected garbled output. Please rephrase your request.]"
+    _final_answer = "[Response filtered: detected garbled output. Please rephrase your request.]"
+    _append_msg({"role": "assistant", "content": _final_answer}, conv)
+    _turn_end("fallback", _final_answer)
+    return _final_answer

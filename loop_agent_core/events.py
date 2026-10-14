@@ -2,6 +2,19 @@
 _headless_streaming = False
 
 
+def reset_streaming_flag():
+    """新一轮开始前复位（由主循环在 run 起点调用）。
+
+    这个标志是"这一轮响应有没有已经打过 `🤖: ` 前缀"的记账，语义上属于**单轮**：
+    正常情况下它由 stream_usage / response_done 收尾清掉，但一轮异常收尾（中断、
+    抛错）就会把它留在 True。它是**进程级**的，所以残留会一路渗进 checkpoint 的
+    D 组（进程状态快照）——同一段历史在同一进程里录两次，D 组对不上，
+    回放看起来像"环境变了"。run 起点复位是唯一能保证"录制只看历史、不看上一个 run"的位置。
+    """
+    global _headless_streaming
+    _headless_streaming = False
+
+
 def _default_on_event(event):
     """headless 模式下复刻原有 print 行为。"""
     global _headless_streaming

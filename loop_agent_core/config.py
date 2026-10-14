@@ -87,7 +87,20 @@ def _compact_k():
         "max_backoff": _envi("COMPACT_MAX_BACKOFF", 32),
         "archive_max_chars": _envi("COMPACT_ARCHIVE_MAX_CHARS", 200000),
     }
+    try:
+        from . import trace
+        # limits 事件在这里发（§4.3）：压缩旋钮是"上下文里到底存了什么"的主要决定者，
+        # 回放重算 result_stored / 摘要块时用的就是这些值。
+        trace.emit_limits(site="compact_k")
+    except Exception:  # noqa: BLE001
+        pass
     return _compact_k_cache
+
+
+def reset_compact_k_cache() -> None:
+    """清掉压缩旋钮缓存（测试改环境变量后必须调，否则读到的还是上一个用例的值）。"""
+    global _compact_k_cache
+    _compact_k_cache = None
 
 
 def _backend_config():
@@ -111,6 +124,10 @@ def _backend_config():
         }
     else:
         return {
+            # DS_KEY 缺失不在这里报错，而是在模块末尾构造 OpenAI() 时抛
+            # OpenAIError: Missing credentials —— 于是"只想 import 模块跑纯逻辑自检"
+            # 也会失败。跑 run_tests.py / tests/ 下任意套件前先给个假值即可（不触网）：
+            #   set DS_KEY=sk-dummy   /   $env:DS_KEY="sk-dummy"
             "api_key": os.environ.get("DS_KEY"),
             "base_url": os.environ.get("LLM_BASE_URL", "https://api.deepseek.com"),
             "model": "deepseek-v4-flash",
@@ -133,22 +150,50 @@ def _maybe_wrap_headroom(raw_client):
     if os.environ.get("HEADROOM_ENABLED", "1") != "1":
         return raw_client
     try:
-        from headroom.client import HeadroomClient
+        from headroom.client import HeadroomClient, HeadroomConfig, HeadroomMode
         from headroom.providers import OpenAICompatibleProvider
         mode = os.environ.get("HEADROOM_MODE", "audit")
         provider = OpenAICompatibleProvider(base_url=cfg["base_url"], api_key=cfg["api_key"],
                                             default_model=cfg["model"])
         # Windows 下默认 sqlite:///<tempdir> 会解析出畸形路径（\\C:\...），显式给正斜杠绝对路径。
         # 用 JSONL 而非 SQLite：JSONL 纯文件追加无线程约束，避免 worker 线程跨线程复用连接报错。
+        # 可用 HEADROOM_STORE_URL 整体覆盖（测试要隔离 headroom 落盘，不能污染真实会话）。
         db_path = os.path.join(WORK_DIR, "tmp", "headroom.jsonl").replace(os.sep, "/")
+        store_url = os.environ.get("HEADROOM_STORE_URL") or f"jsonl://{db_path}"
+        try:
+            from . import trace
+            extensions = trace.headroom_extensions()
+        except Exception:  # noqa: BLE001
+            extensions = []
+        hcfg = HeadroomConfig(pipeline_extensions=extensions)
+        # HeadroomClient 只要收到 config，就**完全忽略** default_mode/store_url 这两个
+        # 形参（源码里 `self._default_mode = config.default_mode` 无条件覆盖）。所以
+        # 必须写进 config，否则 HEADROOM_MODE=optimize 会被静默降级成 audit：
+        # 看上去在跑优化，实际一次压缩都没做，回放时才发现请求侧什么都没有。
+        hcfg.default_mode = HeadroomMode(mode)
+        hcfg.store_url = store_url
         wrapped = HeadroomClient(original_client=raw_client, provider=provider,
-                                 default_mode=mode, store_url=f"jsonl://{db_path}",
-                                 model_context_limits={cfg["model"]: cfg["ctx"]})
+                                 default_mode=mode, store_url=store_url,
+                                 model_context_limits={cfg["model"]: cfg["ctx"]},
+                                 config=hcfg)
+        # §2：包裹层的**包裹对象是传输层**，由 llm 网关取走并套在 chat 出口上。
+        # 挂成模块级而不是让 llm 自己造：上下文限制/模式/store_url 只能有一处真相，
+        # 两处各造一份会让"回放时 headroom 行为不一致"这种问题无处可查。
+        global _HEADROOM_LAYER
+        _HEADROOM_LAYER = wrapped
         print(f"[headroom] wrapped client: mode={mode}, model={cfg['model']}", flush=True)
         return wrapped
     except Exception as e:
         print(f"[headroom] init failed ({e!r}), using raw client", flush=True)
         return raw_client
+
+
+_HEADROOM_LAYER = None
+
+
+def headroom_layer():
+    """当前会话的 headroom 包裹层（None = 未启用/装不上）。供 llm 网关的传输层使用。"""
+    return _HEADROOM_LAYER
 
 
 cfg = _backend_config()

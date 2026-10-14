@@ -13,9 +13,18 @@ def _prune_cap():
     if _is_local_backend():
         env = os.environ.get("PRUNE_CAP_LOCAL")
         if env:
-            return int(env)
-        return max(1024, cfg["ctx"] // 2)
-    return int(os.environ.get("PRUNE_CAP_DS", "32000"))
+            cap = int(env)
+        else:
+            cap = max(1024, cfg["ctx"] // 2)
+    else:
+        cap = int(os.environ.get("PRUNE_CAP_DS", "32000"))
+    try:
+        # prune_cap 决定 L2 硬裁剪的边界，回放重算"上下文该被裁成什么样"要用它（§4.5）。
+        from . import trace
+        trace.emit_limits(site="prune_cap")
+    except Exception:  # noqa: BLE001
+        pass
+    return cap
 
 
 def _append_msg(msg, conv):
@@ -92,14 +101,28 @@ def _prune_messages(cap, q_idx, conv):
     return new_q, removed
 
 
-def _rollback_tool_round(conv):
+def _rollback_tool_round(conv, cause="interrupt"):
     """丢弃最后一轮工具调用（assistant+TC 及其 tool 消息），让会话回到 API 接受的状态。
-    找不到可回滚的轮次时返回 False。"""
+    找不到可回滚的轮次时返回 False。
+
+    `cause` 走 trace（§4.3 tool_round_rollback）：`interrupt` 是用户按了 Esc，
+    `api_400` 是模型端拒了这轮结构。两者在回放里是不同的失败模式——前者是"人停了"，
+    后者是"这个 tool_calls 结构在该模型上本来就不可用"，归成一条就再也分不出来。
+    """
     msgs = conv["messages"]
     for i in range(len(msgs) - 1, -1, -1):
         if msgs[i].get("role") == "assistant" and msgs[i].get("tool_calls"):
+            dropped = msgs[i:]
+            dropped_calls = len(msgs[i].get("tool_calls") or [])
             del msgs[i:]
             conv["size"] = estimate_tokens(json.dumps(msgs, ensure_ascii=False))
+            try:
+                from . import trace
+                trace.emit_event({"type": "tool_round_rollback", "cause": cause,
+                                  "dropped_messages": len(dropped),
+                                  "dropped_tool_calls": dropped_calls})
+            except Exception:  # noqa: BLE001 —— 记账不该影响回滚本身
+                pass
             return True
     return False
 
@@ -173,7 +196,26 @@ def _finalize_prune(cap, q_idx, conv, emit):
     new_q, removed = _prune_messages(cap, q_idx, conv)
     if removed:
         emit({"type": "pruned", "removed": removed})
+        _trace_prune("L2", removed, cap=cap)
     return new_q, removed
+
+
+def _trace_prune(layer, removed, reclaimed=0, cap=None, **extra):
+    """记一条 `prune` 事件（§4.3）：L0 去重 / L1 摘要 / L2 硬裁剪。
+
+    三层的"丢了多少"必须落在同一张表里，否则回放时看到一个变小的上下文却无法判断
+    是哪一层造成的——而三层的可复现条件完全不同（L0 无成本可无条件重放、L1 要摘要器、
+    L2 只依赖 cap）。
+    """
+    from . import trace
+    trace.emit_event({"type": "prune", "layer": layer, "removed": removed,
+                      "reclaimed_tokens": reclaimed, "cap": cap, **extra})
+
+
+def _trace_compaction(decision, **fields):
+    """记一条 `compaction` 事件（§4.3）：attempted / skipped / failed。"""
+    from . import trace
+    trace.emit_event({"type": "compaction", "decision": decision, **fields})
 
 
 def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
@@ -200,6 +242,8 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
     if replaced:
         emit({"type": "deduped", "replaced": replaced, "saved": st.get("_dedup_saved") or 0,
               "before": size_before_dedup, "after": conv.get("size")})
+        _trace_prune("L0", replaced, reclaimed=st.get("_dedup_saved") or 0, cap=cap,
+                     before=size_before_dedup, after=conv.get("size"))
 
     if summarize_fn is None:
         return _finalize_prune(cap, q_idx, conv, emit)
@@ -207,6 +251,9 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
     ok, reason = should_compact(conv, force=force)
     if not ok:
         if reason in ("interval", "budget", "backoff", "failed"):
+            _trace_compaction("skipped", reason=reason,
+                              fails=st.get("_compact_fails") or 0,
+                              size=conv.get("size"))
             _notice_once(conv, f"skip_{reason}", emit,
                          {"type": "compact_skipped", "reason": reason,
                           "retry_in_turns": max(0, (st.get("_compact_retry_turn") or 0)
@@ -223,12 +270,14 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
 
     span = compaction_span(conv, q_idx)
     if span is None:
+        _trace_compaction("skipped", reason="no_span", size=conv.get("size"))
         _notice_once(conv, "skip_no_span", emit, {"type": "compact_skipped", "reason": "no_span"})
         return _finalize_prune(cap, q_idx, conv, emit)
 
     start, end = span
     groups = [g for g in _find_groups(q_idx, conv) if start <= g[0] and g[1] <= end]
     if not groups:
+        _trace_compaction("skipped", reason="no_span", size=conv.get("size"))
         _notice_once(conv, "skip_no_span", emit, {"type": "compact_skipped", "reason": "no_span"})
         return _finalize_prune(cap, q_idx, conv, emit)
     span_msgs = [[conv["messages"][i] for i in range(g[0], g[1])] for g in groups]
@@ -236,6 +285,7 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
     before_size = conv.get("size")
 
     err = {}
+    _trace_compaction("attempted", blocks=len(blocks), before=before_size, cap=cap)
     emit({"type": "compacting", "before": before_size, "blocks": len(blocks)})
     result = run_rolling_summary(
         blocks, summarize_fn,
@@ -247,6 +297,7 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
             # 用户按 Esc：不是摘要器的错，不能计入失败退避
             # （否则按三次 Esc 就把 L1 停用了）；但本轮内也不再重试
             st["_compact_retry_turn"] = turn + 1
+            _trace_compaction("skipped", reason="interrupted", blocks=len(blocks))
             _notice_once(conv, "skip_interrupted", emit,
                          {"type": "compact_skipped", "reason": "interrupted"})
             return _finalize_prune(cap, q_idx, conv, emit)
@@ -255,6 +306,8 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
         backoff = min(k["min_rounds"] * (2 ** (fails - 1)), k["max_backoff"])
         st["_compact_retry_turn"] = turn + backoff
         disabled = fails >= k["max_fails"]
+        _trace_compaction("failed", reason=why, block=err.get("block"), blocks=len(blocks),
+                          fails=fails, disabled=disabled, before=before_size, cap=cap)
         log_compaction_failure(why, {"turn": turn, "fails": fails, "block": err.get("block"),
                                      "blocks": len(blocks), "before": before_size,
                                      "disabled": disabled})
@@ -287,6 +340,8 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
     if reclaimed < k["min_reclaim"]:
         # 压缩本身也要花钱：收益太低就靠 L2 把上下文真正压到 cap 以内
         new_q, pruned = _finalize_prune(cap, new_q, conv, emit)
+        _trace_prune("L1", removed + pruned, reclaimed=int((before_size or 0) - (conv.get("size") or 0)),
+                     cap=cap, blocks=result["blocks"], low_reclaim=True)
         emit({"type": "compacted", "removed": removed + pruned, "before": before_size,
               "after": conv.get("size") or 0, "summary_chars": len(result["summary"]),
               "blocks": result["blocks"], "low_reclaim": True,
@@ -297,6 +352,8 @@ def _prep_context(cap, q_idx, conv, summarize_fn, emit, force=False):
     if (conv.get("size") or 0) > cap:
         new_q, pruned = _finalize_prune(cap, new_q, conv, emit)
         removed += pruned
+    _trace_prune("L1", removed, reclaimed=int((before_size or 0) - (conv.get("size") or 0)),
+                 cap=cap, blocks=result["blocks"])
     emit({"type": "compacted", "removed": removed, "before": before_size,
           "after": conv.get("size") or 0, "summary_chars": len(result["summary"]),
           "blocks": result["blocks"],
