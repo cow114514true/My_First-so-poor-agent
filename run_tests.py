@@ -25,6 +25,8 @@ SUITES = [
     "test_purpose.py",
     "test_compaction.py",
     "test_runner_visibility.py",
+    "test_trace.py",
+    "test_replay.py",
 ]
 
 
