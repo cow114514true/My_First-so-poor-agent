@@ -1,0 +1,70 @@
+{
+ "by_request": {
+  "1": [
+   "pre_request@1#0.1~0"
+  ],
+  "2": [
+   "pre_request@2#0.2~1"
+  ],
+  "3": [
+   "pre_request@3#0.3~2"
+  ],
+  "4": [
+   "pre_request@4#0.4~3"
+  ]
+ },
+ "frames": [
+  {
+   "file": "g00000.zst",
+   "group_id": 0,
+   "requests": [
+    1,
+    4
+   ]
+  }
+ ],
+ "group_requests": 5,
+ "snapshots": {
+  "pre_request@1#0.1~0": {
+   "comp_len": 530,
+   "frame": 0,
+   "key": "pre_request@1#0.1~0",
+   "kind": "pre_request",
+   "messages_hash": "14ddd1f43c8b45064ffd316759c40c564b758a57af7c4b0fbce5960c6c90c42e",
+   "offset": 0,
+   "raw_len": 996,
+   "request_index": 1
+  },
+  "pre_request@2#0.2~1": {
+   "comp_len": 703,
+   "frame": 0,
+   "key": "pre_request@2#0.2~1",
+   "kind": "pre_request",
+   "messages_hash": "d95c0c26a351918b3a6e94847d155e718dbcaeeaff891fdfa584be6d446063a0",
+   "offset": 530,
+   "raw_len": 1167,
+   "request_index": 2
+  },
+  "pre_request@3#0.3~2": {
+   "comp_len": 714,
+   "frame": 0,
+   "key": "pre_request@3#0.3~2",
+   "kind": "pre_request",
+   "messages_hash": "bfaf8eae4f235dbcad3978db34b1b6ab9ac94798006254d14240d9ee78a2219b",
+   "offset": 1233,
+   "raw_len": 1337,
+   "request_index": 3
+  },
+  "pre_request@4#0.4~3": {
+   "comp_len": 707,
+   "frame": 0,
+   "key": "pre_request@4#0.4~3",
+   "kind": "pre_request",
+   "messages_hash": "a10b4a3fca999bca6128998c2e4eed61dd2fc34eec49b7f7d42c1a7ab0ad0101",
+   "offset": 1947,
+   "raw_len": 1507,
+   "request_index": 4
+  }
+ },
+ "version": 1
+}

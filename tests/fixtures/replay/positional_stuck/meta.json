@@ -1,0 +1,40 @@
+{
+  "cassette_format": 1,
+  "canon_version": 1,
+  "workspace_root": "C:\\Users\\刘畅\\source\\repos\\myCode\\agent",
+  "playback_mode": "positional",
+  "completeness": {
+    "llm": "full",
+    "tools": "full"
+  },
+  "degraded_reasons": [],
+  "headroom": {
+    "version": "0.34.0",
+    "mode": "audit",
+    "model_context_limits": {
+      "ctx": 65536
+    }
+  },
+  "trace_epoch": {
+    "iso": "2026-10-14T14:29:10",
+    "injected_date_str": "2026-10-14"
+  },
+  "derived_from": "tests/fixtures/replay/_regenerate.py",
+  "expected_assertion": "turn_end:reason=stuck",
+  "session_id": "positional_stuck-656868",
+  "model": "deepseek-v4-flash",
+  "backend": "fake",
+  "extracted_at": "2026-10-14T14:29:10",
+  "assertion_ids": [
+    "notice:info:empty_nudge",
+    "notice:info:empty_nudge",
+    "notice:info:empty_nudge",
+    "notice:warn:stuck",
+    "turn_end:reason=stuck"
+  ],
+  "checkpoint_count": 4,
+  "replay_check": {
+    "reproduced": true,
+    "reason": null
+  }
+}
