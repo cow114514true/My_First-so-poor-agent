@@ -170,10 +170,42 @@ def test_request_index_is_monotonic_across_tool_rounds():
     ri = [e["request_index"] for e in _reqs(r["stored"])]
     assert ri == sorted(set(ri)) and len(ri) == len(set(ri)), f"request_index 重复：{ri}"
     assert ri[0] >= 1, ri
-    # 4 次只会思考的重试 → 4 个请求，序号 1..4
-    assert ri == [1, 2, 3, 4], ri
+    # 预算 3 次：3 个请求（序号 1..3）。旧行为发 4 个——那是 `+= 1` 在判断**之前**
+    # 导致"计到 4 才落在 `<= 3` 之外"，而第 4 次请求已经发出去了。
+    assert ri == [1, 2, 3], ri
     turn = [e["turn"] for e in r["stored"] if e["type"] == "turn_end"]
     assert turn == [0], turn
+    # 预算用尽之后那条 notice 不能退回 request_index=0：轮级事件挂的还是最后一次请求
+    stuck = [e for e in r["stored"]
+             if e["type"] == "notice" and e.get("code") == "stuck"]
+    assert len(stuck) == 1, stuck
+    assert stuck[0]["request_index"] == 3, stuck[0]
+
+
+def test_thinking_only_keeps_user_text_and_bounds_requests():
+    """thinking-only 重试：nudge 独立成条、用户原话不被改写、请求数不越预算。
+
+    两条都曾被写死成"期望值"过：nudge 直接 `text + "\\n\\n" + 原话` 拼进末条 user
+    （`conv` 里从此重建不出用户到底说了什么），以及计数先加后判多花一次往返。
+    实测现场见 `tmp/_probe_stuck/`。
+    """
+    r = _run([_thinking_batch], question="想个办法", name="thinkingonly")
+    evs = r["stored"]
+    reqs = _reqs(evs)
+    assert len(reqs) == 3, len(reqs)
+    assert len([e for e in evs if e["type"] == "thinking_only_retry"]) == 3
+    assert len([e for e in evs if e["type"] == "nudge_injected"]) == 3
+    assert trace.validate_events(evs) == [], trace.validate_events(evs)
+
+    final = reqs[-1]["messages"]
+    assert final[1] == {"role": "user", "content": "想个办法"}, final[1]
+    assert all(str(m.get("content", "")).startswith("[Self-check]")
+               for m in final[2:] if m["role"] == "user"), final
+    think = [m for m in final if m["role"] == "assistant"]
+    assert think and all(m["content"].startswith("reasoning:: 我再想想")
+                         for m in think), think
+    # 用户原话只在第 1 条 user 里，未被 nudge 拼长
+    assert sum(1 for m in final if "想个办法" in str(m.get("content", ""))) == 1
 
 
 def test_turn_end_reason_in_vocab():
@@ -199,11 +231,11 @@ def test_llm_request_and_response_pair_up():
     r = _run([_thinking_batch], name="pair")
     evs = r["stored"]
     reqs, resps = _reqs(evs), [e for e in evs if e["type"] == "llm_end"]
-    assert len(reqs) == len(resps) == 4, (len(reqs), len(resps))
+    assert len(reqs) == len(resps) == 3, (len(reqs), len(resps))
     assert [e["request_index"] for e in reqs] == [e["request_index"] for e in resps]
     assert all(e.get("finish_reason") is not None for e in resps), resps
     usage = [e for e in evs if e["type"] == "token_usage"]
-    assert len(usage) == 4, len(usage)
+    assert len(usage) == 3, len(usage)
     assert usage[0]["usage"]["prompt_tokens"] == 100
 
 
