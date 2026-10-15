@@ -835,7 +835,9 @@ def test_overlay_does_not_touch_repo():
     assert os.path.exists(copied), f"overlay 里没有写入落点：{copied}"
     text = rep.text()
     assert "overlay" in text and "真执行" in text, f"报告没有 overlay 段：\n{text}"
-    shutil.rmtree(rep.overlay.root, ignore_errors=True)
+    # 清掉本次用的整个 overlay 根：`rep.overlay.root` 只是它下面的一个会话目录
+    # （`overlay_root/<sid>`），只删那一层会在 tmp/overlay/ 里留下一串空目录。
+    shutil.rmtree(ov_root, ignore_errors=True)
     os.remove(real_path)
 
 
@@ -863,7 +865,8 @@ def test_l2_isolation_records_but_does_not_apply():
         with open(real_path, encoding="utf-8") as f:
             assert f.read() == "原始内容\n", "真实工作区文件被回放改写了"
     finally:
-        shutil.rmtree(rep.overlay.root, ignore_errors=True)
+        # 连同 overlay 根一起清（只删 `rep.overlay.root` 会留下 tmp/overlay/l2-iso2/ 空壳）
+        shutil.rmtree(os.path.dirname(rep.overlay.root), ignore_errors=True)
         os.remove(real_path)
 
 
@@ -984,19 +987,26 @@ def test_runner_keeps_logical_args_in_history():
         f.write("历史\n")
     rec = _record_write("l2hist", "tmp/_l2_hist.txt", "历史\n")
     cass, _ = _extract(rec, "l2hist", workspace_root=ROOT)
-    rep = _replay_class(cass, name="hist")
-    ov_root = _L2_SEEN["overlay_root"]
-    calls = [e for e in trace.read_events(_LAST_RUN["dir"]) if e.get("type") == "tool_call"]
-    written = [e for e in calls if e.get("overlay")]
-    if os.environ.get("L2_DEBUG"):
-        print("[L2_DEBUG] run_dir=", _LAST_RUN["dir"])
-        print("[L2_DEBUG] tool_calls=", json.dumps(calls, ensure_ascii=False)[:1500])
-    assert written, "回放 trace 里没有带 overlay 标记的 tool_call"
-    ev = written[0]
-    assert ev["arguments"]["path"] == "tmp/_l2_hist.txt", \
-        f"trace 里的逻辑入参被改写了：{ev['arguments']}"
-    assert ev["overlay"]["written"]["path"].startswith(ov_root), ev["overlay"]
-    os.remove(real_path)
+    try:
+        _replay_class(cass, name="hist")
+        ov_root = _L2_SEEN["overlay_root"]
+        calls = [e for e in trace.read_events(_LAST_RUN["dir"]) if e.get("type") == "tool_call"]
+        written = [e for e in calls if e.get("overlay")]
+        if os.environ.get("L2_DEBUG"):
+            print("[L2_DEBUG] run_dir=", _LAST_RUN["dir"])
+            print("[L2_DEBUG] tool_calls=", json.dumps(calls, ensure_ascii=False)[:1500])
+        assert written, "回放 trace 里没有带 overlay 标记的 tool_call"
+        ev = written[0]
+        assert ev["arguments"]["path"] == "tmp/_l2_hist.txt", \
+            f"trace 里的逻辑入参被改写了：{ev['arguments']}"
+        assert ev["overlay"]["written"]["path"].startswith(ov_root), ev["overlay"]
+    finally:
+        # 回放自身把 overlay 的会话目录清掉了，但它的**父目录**（本次 overlay 根）是这次
+        # 调用建的：不删的话 tmp/overlay/ 下会攒下一串空目录。
+        _ov_root = _L2_SEEN.get("overlay_root")
+        if _ov_root:
+            shutil.rmtree(_ov_root, ignore_errors=True)
+        os.remove(real_path)
 
 
 def test_cli_replay_overlay_flags():
