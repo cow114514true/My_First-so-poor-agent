@@ -361,6 +361,63 @@ cassette 收录范围：assert 级事件 + 复现数据 + 寻址数据 + 元信�
 - 忽略规则：`.gitignore:27` 的 `tmp/` 已覆盖该目录。
 - CI 检查：提交内容中出现 `tmp/traces/**` 路径即失败。CI 只保留 L2 导出物。
 
+### 4.10 生产怎么开录
+
+§4.1-§4.9 定的是 L0 trace 的**格式**，本节定的是**谁在什么时候开录、什么时候收尾**。在此之前写入器只被测试、迁移器与回放器调用过，生产入口从不建档——机制全绿，而真实会话一条事件都不落盘。
+
+**开关（单一判据）**
+
+- 判据是 `TRACE_ENABLED`，取值 `1` / `true` / `yes` / `on` / `strict`，读它的函数是 `loop_agent_core.trace.tracing_enabled()`（`trace.py:339`）。不存在第二套开关。
+- 判定只在**会话起点求值一次**，决定「这次会话录不录」。进了 `SessionRecording.start()` 之后再改环境变量也不改主意：半路开关会让 trace 同时缺前半段和后半段，比不录更难查。
+- 档位仍由 `TRACE_LEVEL` 决定（默认 `assert`）。录制壳传 `level=None` 让档位落回 `TRACE_LEVEL`，不在这里钉死第二个档位入口。
+- 开关关着时**一根文件都不产生**——不是「建一个空目录」。`session_recording()` 返回一个未激活的壳，`start()` / `finish()` 都是空操作。
+
+**会话边界取在哪**
+
+入口是 `loop_agent_core.trace.SessionRecording`：
+
+```
+def session_recording(session_id=None, **kw) -> SessionRecording   # trace.py:1058
+def SessionRecording.start()                                        # trace.py:1002
+def SessionRecording.finish(reason=None) -> dict | None             # trace.py:1020
+```
+
+一次会话 = 一次**进程级入口**运行，不是一次 `chat()` 调用：
+
+| 入口 | 边界 | 位置 |
+|---|---|---|
+| TUI | `AgentTUI.run()` 的整个生命周期 | `tui.py:1275-1290` |
+| CLI | `if __name__ == "__main__"` 的输入循环 | `loop_agent_v2.py:402-418` |
+
+为什么不用 `chat()` 当边界：`chat()` 的一次调用是一个用户轮，而 `messages` 是**进程级**的——一次 TUI 运行就是一段连续对话，`/clear` 与 `/load` 换的是对话内容、不是换一份 trace 文件。更要紧的是 trace 的 `request_index` 要跨轮只增（回放按它定位请求），按问题开档会让每个问题都从 0 重新数，checkpoint 键位互相覆盖。
+
+**收尾时机**
+
+- 收尾走 `with`（即 `try/finally`）：正常退出、异常退出、Ctrl-C 都补 `run_end` 与 `trace.idx.json`（`close_writer()` 补 `run_end`，`write_index()` 写索引，都在 `finish()` 里）。
+- `finish()` 幂等，且**收尾失败不外抛**：录制是诊断设施，不能成为「会话挂掉」的原因。失败只追加一行到 `<run_dir>/error.log`。
+- 退出理由映射：`KeyboardInterrupt → interrupted`、其余异常 `→ exception`、正常结束 `→ normal`。
+- CLI 的 `EOFError`（管道读尽）在 `with` **内部**接住，算正常收尾；`KeyboardInterrupt` 不接，让它穿出 `with`，`__exit__` 才能记成 `interrupted`。
+
+**TUI 的线程边界（不接这里等于没接）**
+
+写入器存在 `contextvars` 里，而 TUI 的 agent 跑在 `threading.Thread` 里，`threading.Thread` **不传播 contextvars**。所以开线程的地方必须显式 `contextvars.copy_context()`，用 `ctx.run(...)` 启动（`tui.py:1825-1831`）。不拷的话 `trace.current_writer()` 在子线程里恒为 `None`：目录建了、`run_start` 写了，而 `llm_request` / `tool_call` / `turn_end` 一条都落不下来。
+
+**目录与 manifest**
+
+- 目录 `tmp/traces/<session_id>/`，根取 `trace.trace_root()`（`TRACE_DIR` 可覆盖），不另造路径。`session_id` 缺省由 `new_run_id(entry)` 生成。
+- `meta.json` 记真 `session_id` / `backend`（`MODEL_BACKEND`，默认 `deepseek`）/ `model`（`config.cfg["model"]`）/ `trace_level`，另加 `entry`（`tui` / `cli`）。`backend` / `model` 取不到时退化成空串或默认值，不为一个元数据字段让会话起不来。
+- 薄壳给 `conv` 打的 `_session_id` 取自 `trace.current_session_id()`，于是 `turn_start` / `turn_end` 的 `session` 与 `run_start` 的 `session` 是同一个值。
+
+**失败保留 / 正常清理**
+
+- 会话收尾时扫一遍断言 id（§3.4 词表，`assertion_id()` / `assertion_ids()`），判据是 `is_failure_assertion()`：`tool_error:*`、`exception:*`，以及 `turn_end:reason=<非 answer/interrupted>`（`stuck` / `garbled` / `rounds_exhausted` / `api_error` / `fallback`）。另补一条 `run_end:reason=exception`——会话是从入口崩出去的，可能里面一条断言都没有。
+- 结论写进 `meta.json` 的 `retention`：有失败断言记 `failure`（另记 `failure_assertions` 列表与 `end_reason`），否则记 `normal`。`notice` 不进失败口径：它是诊断通道（提示 / 降级 / 跳过压缩），不代表「这次会话坏了」。
+- 默认**都留着**，清理是显式动作：`python -m tools.trace clean --older-than 30d` 只清 `retention=normal` 的会话；失败现场要再带 `--include-failures` 才动。判据只**加字段、不动事件流**，所以标错也不会污染录像本身。
+
+**遥测隔离**
+
+录制侧不碰 `HEADROOM_STORE_URL`，正常行为继续写 `tmp/headroom.jsonl`；只有回放时才把它指向 `tmp/traces/<sid>/headroom.jsonl`（§3.2、§9 #32）。
+
 ---
 
 ## 5. 阶段 2：迁移旧会话
@@ -692,6 +749,7 @@ python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>
 | 35 | `test_overlay_recursive_rewrite` | `grep` / `glob` / `shell_cmd` 的重写目标为 overlay 根 |
 | 36 | `test_delegate_task_stub` | `delegate_task` 回放返回录制的 `result_full` |
 | 37 | `test_l3_one_assertion_per_fixture` | 单个 fixture 只带一个 `expected_assertion`；多失败导出多个 fixture |
+| 38 | `test_cli_entry_records_trace` | 真实入口（TUI / CLI）在 `TRACE_ENABLED=1` 下留下 `tmp/traces/<sid>/`：`validate_events` 零问题、`run_start` 首条、`run_end` 末条、`meta.json` 有 `session_id` / `backend` / `model` / `trace_level`；开关关闭时一个字节都不产生；`clean` 默认不删 `retention=failure` 的现场（§4.10） |
 
 ---
 
@@ -706,3 +764,4 @@ python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>
 | 5 | L3 导出粒度 | 一个 fixture 一个失败轮次、一个 `expected_assertion`（§7.4） |
 | 6 | 脱敏口径 | L1 抹密钥类，写入时始终开启（不是选项）；入库判据是「bug 与正文无关」（换掉输入仍复现），靠**录制源头用合成输入**保证，不靠事后抹正文——事后抹会改掉请求指纹，回放找不到那个请求；必须原样重放的现场不入库（§8.4） |
 | 7 | L3 谓词与报告口径 | 三态 `FAIL` / `PASS` / `UNRESOLVED`：判等照抄回放器的 `exp in assertion_ids`；「换了个失败」判 `PASS` 并记 `substituted_assertion`；`UNRESOLVED` 只有超时与确定性护栏两个来源、按 delta debugging 原义当 `PASS`，超时是独立状态；不引入概率判据。报告另加 `unconsumed` / `critical_elements` / `substituted_assertion` 三栏。本轮只实现阶段 1（轮级），阶段 2 留 `history_group_units()` 接口（§7.1、§7.2、§7.3） |
+| 8 | 生产开录的开关、边界与保留策略 | 开关是单一判据 `TRACE_ENABLED`（`1` / `true` / `yes` / `on` / `strict`），只在会话起点求值一次，中途不改主意；档位仍归 `TRACE_LEVEL`；一次会话 = 一次进程级入口运行（TUI 取 `AgentTUI.run()`、CLI 取 `__main__` 输入循环），不取 `chat()`——`request_index` 要跨轮只增；收尾走 `try/finally` 且不外抛；失败现场（`tool_error:*` / `exception:*` / `turn_end:reason=<非 answer/interrupted>`）记 `retention=failure` 默认保留，正常会话记 `normal` 由 `python -m tools.trace clean --older-than 30d` 清，清失败现场要显式 `--include-failures`（§4.10、§4.9） |
