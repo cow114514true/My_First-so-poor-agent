@@ -699,6 +699,20 @@ def _runtime_meta() -> dict:
     return out
 
 
+def _decode(raw) -> str:
+    """子进程输出（bytes，编码随系统代码页）转成能写进 error.log 的一行。"""
+    if not raw:
+        return ""
+    if isinstance(raw, bytes):
+        for enc in ("utf-8", "mbcs", "gbk", "latin-1"):
+            try:
+                return raw.decode(enc).strip()
+            except (UnicodeDecodeError, LookupError):
+                continue
+        return repr(raw)
+    return str(raw).strip()
+
+
 def harden_dir(path) -> bool:
     """把 trace 目录收紧到"只有当前用户能读"（§4.1）。
 
@@ -706,11 +720,23 @@ def harden_dir(path) -> bool:
     文件内容与命令。POSIX 用 0o700；Windows 没有 mode 位，用 icacls 去掉继承并只授权
     当前用户。两者都是**尽力而为**：加固失败只写 error.log，不能让"跑一次 agent"因为
     权限收紧失败而失败（失败本身会让人干脆关掉 tracing）。
+
+    Windows 上收紧权限**只**走 icacls，建目录绝不用 `mode=0o700`：Python 会把 0o700
+    翻译成一条"只有属主"的 Windows DACL，而受限/沙箱进程的访问令牌对不上这条 DACL，
+    结果是**自己刚建的目录自己都进不去**（实测 `os.makedirs(d, mode=0o700)` 之后立刻
+    `os.listdir(d)` 就是 `PermissionError: [WinError 5]`，且此后 icacls 也无法读取该目录、
+    error.log 都写不进去——整个 trace 目录彻底废掉）。建目录用不带 mode 的 makedirs，
+    权限收敛交给 icacls；任何一步失败都只记 error.log 并把目录留在**可用**状态。
+
+    `icacls` 的非零退出**必须**当成失败：在受限环境里它会打印 "Access is denied."
+    却仍以 0 退出（实测），只看 `check=False` 就会把"根本没加固"报成加固成功。
+    收紧后额外自查一次——当前用户必须仍能列出该目录，列不出说明权限已被收紧到自己
+    都进不去，立刻尽力改回来，绝不把这种目录留给后续写入。
     """
     if os.environ.get("TRACE_NO_ACL") == "1":
         return False
     try:
-        os.makedirs(path, mode=0o700, exist_ok=True)
+        os.makedirs(path, exist_ok=True)
     except OSError:
         return False
     if os.name != "nt":
@@ -725,11 +751,40 @@ def harden_dir(path) -> bool:
         if not user:
             return False
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
-                       capture_output=True, timeout=15, check=False, creationflags=flags)
+        proc = subprocess.run(["icacls", path, "/inheritance:r", "/grant:r", f"{user}:(OI)(CI)F"],
+                              capture_output=True, timeout=15, check=False, creationflags=flags)
+        if proc.returncode != 0:
+            log_problem(path, f"[trace] icacls 收紧权限失败（退出码 {proc.returncode}）："
+                              f"{_decode(proc.stderr) or _decode(proc.stdout)}")
+            return False
+        try:
+            os.listdir(path)  # 收紧后自己必须还进得去
+        except OSError as e:
+            _restore_inherited(path, flags)
+            log_problem(path, f"[trace] 收紧权限后目录已不可读（{e}），已回退继承")
+            return False
         return True
-    except Exception:  # noqa: BLE001
+    except Exception as e:  # noqa: BLE001
+        log_problem(path, f"[trace] 收紧权限异常：{e}")
         return False
+
+
+def _restore_inherited(path, flags) -> None:
+    """让目录重新继承父目录的权限（收紧把自己锁在外面时的最后手段）。
+
+    `/reset` 会把继承 ACE 重新带回来，但父目录如果本身还带着 LOW 强制标签之类的
+    约束，单靠它未必够；因此再补一次显式的当前用户完全控制授权。两步都是尽力而为。
+    """
+    import subprocess
+    for args in (["icacls", path, "/reset"],
+                 ["icacls", path, "/grant", f"{os.environ.get('USERNAME') or ''}:(OI)(CI)F"]):
+        if not args[2]:
+            continue
+        try:
+            subprocess.run(args, capture_output=True, timeout=15, check=False,
+                           creationflags=flags)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def dir_size(path) -> int:
