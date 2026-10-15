@@ -75,8 +75,8 @@ def test_units_never_cover_control_flow():
     for i in turn.indices:
         assert cas.events[i].get("type") in shrink_mod.DELETABLE_TYPES, \
             f"#{i} {cas.events[i].get('type')} 是控制流，不该进删除单元"
-    assert len(turn.children) == 4, [c.name for c in turn.children]
-    # 4 条响应全部可删、且互不重叠
+    assert len(turn.children) == 3, [c.name for c in turn.children]
+    # 3 条响应全部可删、且互不重叠
     seen = set()
     for kid in turn.children:
         assert not (set(kid.indices) & seen), "响应包互相重叠"
@@ -199,19 +199,31 @@ def test_shrink_guard():
     assert reduced["valid"] is True, reduced
     assert reduced["reduced"] == ["b"], reduced
     assert (reduced["response_count_before"], reduced["response_count_after"]) == (3, 2)
+    # 指纹全同也要报得出差值：集合差会认为"删了一个还剩三个，什么都没少"
+    same = shrink_mod.spine_report(("a", "a", "a", "a"), ("a", "a", "a"))
+    assert same["reduced"] == ["a"], same
+    assert same["response_count_after"] == 3, same
 
-    # 真 fixture 上的响应脊：4 条
+    # 真 fixture 上的响应脊：3 条（预算 3 次 thinking-only 重试，不再有第 4 次请求）
     cas = _stuck_cassette()
     spine = shrink_mod.positional_spine(list(cas.events))
-    assert len(spine) == 4, spine
+    assert len(spine) == 3, spine
     # 收缩报告里带着守卫这一栏（本轮未启用，说明为什么）
     out = os.path.join(_SELFTEST, "guard", "cass")
     report = shrink_mod.shrink_cassette(_fixture("positional_stuck"), out,
                                         max_replays=40, runs=1, timeout=600, force=True)
     guard = report["guard"]
     assert guard["enabled"] is False and guard["stage2_hook"] == "history_group_units()"
-    assert guard["response_count_before"] == 4 and guard["response_count_after"] == 4
-    assert isinstance(guard["reduced"], list)
+    assert guard["response_count_before"] == 3, guard
+    # 守卫报告必须与这次收缩**如实对应**：它记的减少量 = 真实减少量，
+    # 且减少的条数要和 `deleted_units` 里的响应单元数对得上。
+    assert guard["response_count_after"] == 3 - len(
+        [u for u in report["deleted_units"] if u.startswith("response ")]), report["deleted_units"]
+    assert len(guard["reduced"]) == guard["response_count_before"] - guard["response_count_after"], guard
+    assert guard["valid"] is True, guard
+    # 三次 thinking-only 重试的响应内容指纹完全相同（实测全是 2313f7b88d64d166），
+    # 所以差值必须按位置+内容一起对齐算；用集合差会得出"删了一个还剩两个，什么都没少"。
+    assert len(set(spine)) == 1, spine
     assert shrink_mod.history_group_units(cas) == []
 
 
@@ -294,8 +306,8 @@ def test_shrink_positional_stuck_end_to_end():
     assert report["converged"] is True, report
     assert report["verify"]["status"] == shrink_mod.FAIL, report["verify"]
     assert report["expected_assertion"] == STUCK
-    assert report["calls_before"] == report["response_count_before"] == 4
-    assert report["calls_after"] == report["response_count_after"] <= 4
+    assert report["calls_before"] == report["response_count_before"] == 3
+    assert report["calls_after"] == report["response_count_after"] <= 3
     assert report["result"] == "1-minimal"
     assert report["deleted_events"] >= 0
     meta = json.load(open(os.path.join(out, cassette_mod.CASSETTE_META), encoding="utf-8"))

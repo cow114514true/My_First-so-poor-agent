@@ -279,10 +279,42 @@ def spine_guard(cand_spine, spine) -> tuple:
 
 
 def spine_report(spine_before, spine_after) -> dict:
-    """阶段 2 守卫的报告面（#31）：减少要记，新增/重排要判无效。"""
+    """阶段 2 守卫的报告面（#31）：减少要记，新增/重排要判无效。
+
+    差值按**位置对齐**算，不能用集合差：内容指纹相同的响应是常态（实测
+    `positional_stuck` 里 4 次 thinking-only 重试的指纹全是 `2313f7b88d64d166`），
+    集合差会认为"删掉一个还剩下三个，说明什么都没少"，`reduced` 恒为空——
+    报告就变成了"看着在测，实际什么都没记"。
+    """
     ok, note = spine_guard(spine_after, spine_before)
-    kept = set(spine_after)
-    reduced = [s for s in spine_before if s not in kept]
+    # 差值 = 源序列里没被候选保留下来的那些。**不能只按位置、也不能只按内容**：
+    #   · 内容集合差：四次 thinking-only 重试的指纹完全相同（实测全是
+    #     `2313f7b88d64d166`），删掉一个还剩三个，"什么都没少"——报告形同虚设；
+    #   · 纯位置对齐：中间插进/挪走一条就整体错位，把没删的也报成删了。
+    # 所以先用公共前缀吃掉"指纹相同但确实是同一条"的部分，剩下的再按内容对齐。
+    head = 0
+    while (head < len(spine_before) and head < len(spine_after)
+           and spine_before[head] == spine_after[head]):
+        head += 1
+    before_tail, after_tail = spine_before[head:], spine_after[head:]
+    n, m = len(before_tail), len(after_tail)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            dp[i][j] = (dp[i + 1][j + 1] + 1 if before_tail[i] == after_tail[j]
+                        else max(dp[i + 1][j], dp[i][j + 1]))
+    kept = [True] * head + [False] * n
+    i = j = 0
+    while i < n and j < m:
+        if before_tail[i] == after_tail[j]:
+            kept[head + i] = True
+            i += 1
+            j += 1
+        elif dp[i + 1][j] >= dp[i][j + 1]:
+            i += 1
+        else:
+            j += 1
+    reduced = [s for k, s in enumerate(spine_before) if not kept[k]]
     return {"enabled": True, "valid": ok, "note": note,
             "response_count_before": len(spine_before),
             "response_count_after": len(spine_after),
