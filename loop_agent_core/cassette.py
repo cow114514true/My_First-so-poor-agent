@@ -201,7 +201,14 @@ def completeness(events: list) -> dict:
     else:
         llm = "full"
     if not calls:
-        tools = "full" if reqs else "missing"
+        # tools 轴只问"记下来的调用有没有配齐结果"，不问"到底有没有记到东西"。
+        # 一次都没有调用时，没有结果可缺，所以是 full——**不是 missing**。
+        # 原先写成 `"full" if reqs else "missing"` 是把"没记到工具"和"工具结果丢了"
+        # 混成一件事：旧会话迁移出来的 trace 一条 `llm_request` 都没有（那时根本不写），
+        # 于是每一份快照的 tools 轴都被报成 missing——实测 108 份里 7 份是这种空会话，
+        # 报 missing 会让人以为"工具面也丢了"，而其实它们从来没调用过工具。
+        # "这条会话有没有 LLM 面"由 llm 轴回答，不要让 tools 轴代答。
+        tools = "full"
     elif missing_tools:
         tools = "partial"
     else:

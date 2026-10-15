@@ -337,6 +337,80 @@ def test_duplicate_call_ids_are_disambiguated():
     assert res[0]["result_full"] == res[1]["result_full"] == "R1", res
 
 
+def test_zero_call_session_reports_full_not_missing():
+    """没调用过工具的会话，tools 轴必须是 `full`——"没记到"不等于"结果丢了"。
+
+    `cassette.completeness()` 原先把 tools 轴写成 `"full" if reqs else "missing"`：
+    旧会话迁移出来的 trace 一条 `llm_request` 都没有（那时根本不写这个事件），
+    于是**每一份**快照的 tools 轴都被报成 missing。实测 108 份里有 7 份是
+    `system/user/assistant` 的空会话——它们从来没调用过工具，报 missing 会让人
+    以为"工具面也丢了"。谁回答"有没有 LLM 面"是 llm 轴的事。
+    """
+    from loop_agent_core import cassette as cas_mod
+    comp = cas_mod.completeness([
+        {"type": "run_start"}, {"type": "notice", "code": "x"},
+    ])
+    assert comp["llm"] == "missing", comp
+    assert comp["tools"] == "full", comp
+    # 有调用、有结果 → full；有调用、没结果 → partial。这两格不能被上面那条改坏。
+    with_call = cas_mod.completeness([
+        {"type": "tool_call", "call_id": "a"}, {"type": "tool_result", "call_id": "a"},
+    ])
+    assert with_call["tools"] == "full", with_call
+    missing_result = cas_mod.completeness([{"type": "tool_call", "call_id": "a"}])
+    assert missing_result["tools"] == "partial", missing_result
+
+
+def test_migration_report_tools_axis_agrees_with_cassette():
+    """迁移报告与 `Cassette` 对 tools 轴必须给出同一个答案。
+
+    两处口径曾经不一致：报告按"用户轮内的 tool 消息"数结果，而 `Cassette` 按全局
+    call_id 认领。历史里 assistant 的调用与它的结果**可能跨过下一轮的 user 消息**
+    （实测 `chat_20260808_173056` 第 3 轮的头一条结果属于第 2 轮的调用），于是报告说
+    partial、cassette 说 full——一个查无实据的降级。全量曾出现 69 份这种不一致。
+    """
+    from loop_agent_core import trace as trace_mod, cassette as cas_mod
+    src = _trimmed_session("agree", turns=2)
+    rep = mig.migrate_one(src, out_root=_SELFTEST)
+    assert rep.get("cassette_dir"), rep.get("cassette_error") or "没抽出 cassette"
+    cas = cas_mod.Cassette(rep["cassette_dir"])
+    events = trace_mod.read_events(os.path.join(_SELFTEST, rep["session"]))
+    assert cas.completeness["tools"] == cas_mod.completeness(events)["tools"]
+    assert rep["cassette_completeness"]["tools"] == cas.completeness["tools"], rep
+
+
+def test_late_tool_result_belongs_to_its_own_turn():
+    """结果落在下一轮里，也要算回发起它的那一轮。
+
+    手写复现 `chat_20260808_173056` 的形状：第 2 轮的 assistant 发了 2 条调用，但
+    第 2 条结果排在了下一条 user 消息之后。按轮切分时它落在第 3 轮，逐轮数会把
+    第 2 轮误判成"结果丢了一条"。
+    """
+    msgs = [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "A", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path": "a.py"}'}},
+            {"id": "B", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path": "b.py"}'}},
+        ]},
+        {"role": "tool", "tool_call_id": "A", "content": "RA"},
+        {"role": "user", "content": "u2"},
+        {"role": "tool", "tool_call_id": "B", "content": "RB"},  # 迟到的结果
+        {"role": "assistant", "content": "答"},
+    ]
+    result_ids = mig._result_ids_for(msgs)
+    assert result_ids == {"A", "B"}, result_ids
+    turns = mig.split_turns(msgs)
+    assert len(turns) == 2, [t["index"] for t in turns]
+    cls = mig.classify_turn(turns[0], result_ids)
+    assert cls["n_tool_calls"] == 2, cls
+    # 只看本轮 messages 会数出 1，从而误报 partial
+    assert cls["n_results"] == 2, cls
+
+
+
 # ── 运行器 ──────────────────────────────────────────────────────
 def _run_all():
     tests = [(k, v) for k, v in sorted(globals().items())

@@ -23,12 +23,24 @@ chunk、没有 `finish_reason`、没有 `limits` 记录。所以迁出来的每�
 | `body_ok` | 完全可回放 | LLM 侧可回放，B 类降级 stub | LLM 侧可回放，B 类不可回放 |
 | `body_missing` | 可重建调用序列 | 可分析 | 不可用 |
 
-实测口径（本仓库 111 份会话，见 `--matrix` 输出）：`body_ok` 一格都没有——旧格式
-根本不存请求体，这条轴不是"退化"而是"从来不存在"。`args_ok` 则几乎是全部：那 111 份
-会话是**在 `_store_tool_args` 开始抹参数之前/之外**存的，1107 个调用的 `arguments`
-逐个验过都是原始串。真正的降级来自第三处、也是报告里最该看的一栏：**工具名失配**
-（`browse_web` 9 次，当前 `TOOL_CLASS` 里没有它），回放侧对这些调用只能
-`ReplayToolMissing`。
+实测口径（本仓库 108 份会话，见 `python -m tools.trace_migrate matrix --out <dir>`）：
+`body_ok` 一格都没有——旧格式根本不存请求体，这条轴不是"退化"而是"从来不存在"。
+`args_ok` 则是绝大部分：那 108 份会话是**在 `_store_tool_args` 开始抹参数之前/之外**
+存的，1107 个调用的 `arguments` 逐个验过都是原始串（`args_omitted` 那 6 轮的降级
+来自另一处，见下）。真正的降级来自**工具名失配**：`browse_web` 8 次，当前
+`TOOL_CLASS` 里没有它，回放侧对这些调用只能 `ReplayToolMissing`。
+
+全量实数（`conversations/chat_*.json`，108 份）：
+
+```
+会话 108（失败 0）｜用户轮 417｜工具调用 1107
+矩阵 missing/ok 409 ｜ missing/partial 2 ｜ missing/omitted 6 ｜ body_ok 两格 0
+降级工具归因：browse_web×8（全部是"工具名已不存在"）
+```
+
+产物落在 `tmp/` 下（`tmp/` 已在 .gitignore:36 覆盖），因为它是**可再生的派生数据**：
+本仓库的 `conversations/` 本身也不入库（.gitignore:27），迁移物一旦入库就会和工作区
+实际语料脱节。要复现上面这张表，重跑那条命令即可；`--quiet` 只安静不改变产物。
 
 为什么 `write_file` 的"省略"不是 redaction（§9 的反例警示）：`_store_tool_args` 的占位
 是**不可逆的数据丢失**，不是脱敏。所以本模块把它当降级如实记账，绝不"补个空的继续跑"。
@@ -201,7 +213,25 @@ def split_turns(messages: list) -> list:
     return turns
 
 
-def classify_turn(turn: dict) -> dict:
+def _result_ids_for(messages) -> "set[str]":
+    """整个会话里所有 tool 消息的 `tool_call_id` 集合。
+
+    为什么要看全局而不是只看本轮的 `tool` 消息：历史里 assistant 的调用与它的结果
+    **可能跨过下一轮的 user 消息**（实测 `chat_20260808_173056` 第 3 轮的前 1 条结果
+    属于第 2 轮的调用）。按轮切分时那条结果就落在了后面一轮里，逐轮数会把前一轮
+    误判成"结果丢了"。而 `Cassette` 是按全局 call_id 认领的，两边口径必须一致，
+    否则迁移报告说 partial、cassette 说 full，报表就不能用了。
+    """
+    seen = set()
+    for m in messages:
+        if isinstance(m, dict) and m.get("role") == "tool":
+            cid = m.get("tool_call_id")
+            if cid:
+                seen.add(cid)
+    return seen
+
+
+def classify_turn(turn: dict, result_ids=None) -> dict:
     """判定一个用户轮的矩阵格 + 降级原因。
 
     `body` 轴 = 该轮内**全部** LLM 请求体 + 流式 chunk + `finish_reason` 都在（§5.2）。
@@ -258,25 +288,40 @@ def classify_turn(turn: dict) -> dict:
             "degraded_tools": sorted(set(degraded_tools)),
             "omitted_tools": sorted(set(omitted_tools)),
             "unregistered_tools": sorted(set(unregistered)),
-            "n_tool_calls": n, "n_results": _count_results(turn)}
+            "n_tool_calls": n,
+            "n_results": _count_calls_with_results(turn, result_ids)}
 
 
-def _count_results(turn: dict) -> int:
-    """这一轮里真的落了结果的工具调用数（按 `tool_call_id` 认领）。
+def _count_calls_with_results(turn: dict, result_ids=None) -> int:
+    """这一轮里**逐个调用**数：有几条调用真正落了结果。
 
     数量对不上就是"结果丢了"，与"参数丢了"是两回事：前者是回放时没有东西可吐，
     后者是吐得出但可能吐错。cassette 的 `completeness.tools` 只关心前者。
+
+    两个口径细节，都是被真实语料逼出来的（不是防御性编程）：
+
+    1. 认领范围是**整个会话**的 `tool` 消息，不是本轮的。历史里 assistant 的调用与
+       它的结果可能跨过下一轮的 user 消息（实测 `chat_20260808_173056` 第 3 轮的头
+       一条结果属于第 2 轮的调用）。只看本轮会把前一轮误判成"结果丢了"，而
+       `Cassette` 是按全局 call_id 认领的——两边口径不一致，报表就不能用。
+    2. 按**消歧前**的 id 比对（`call_id.split("#")[0]`，和第 373 行事件派发同一口径）。
+       旧语料会复用 call_id，`_stable_call_ids` 给第 2 个重名调用加了 `#2` 后缀，
+       而会话文件里的结果消息仍写着原 id；拿带后缀的 id 去比会数不到，实测会让
+       61 份会话的 `completeness.tools` 被误报成 `partial`。
     """
-    called = {((tc.get("id")) or "") for tc in turn["tools"]}
-    called.discard("")
-    seen = set()
-    for m in turn["messages"]:
-        if m.get("role") != "tool":
-            continue
-        cid = m.get("tool_call_id")
-        if cid:
-            seen.add(cid)
-    return len(called & seen)
+    if result_ids is None:
+        result_ids = set()
+        for m in turn["messages"]:
+            if m.get("role") == "tool":
+                cid = m.get("tool_call_id")
+                if cid:
+                    result_ids.add(cid)
+    n = 0
+    for tc in turn["tools"]:
+        base = (tc.get("id") or "").split("#")[0]
+        if base and base in result_ids:
+            n += 1
+    return n
 
 
 def _stable_call_ids(messages: list) -> dict:
@@ -462,6 +507,7 @@ def migrate_one(path: str, *, out_root: str, interrupted: bool = False,
 
     # 矩阵与明细
     turns = split_turns(messages)
+    result_ids = _result_ids_for(messages)
     matrix = {}
     degraded = {}
     omitted = {}
@@ -469,7 +515,7 @@ def migrate_one(path: str, *, out_root: str, interrupted: bool = False,
     n_calls = 0
     n_results = 0
     for turn in turns:
-        cls = classify_turn(turn)
+        cls = classify_turn(turn, result_ids)
         report["per_turn"].append(cls)
         key = f"{cls['body']}/{cls['args']}"
         matrix[key] = matrix.get(key, 0) + 1
