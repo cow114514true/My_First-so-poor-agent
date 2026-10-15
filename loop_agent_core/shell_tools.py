@@ -342,7 +342,10 @@ def search_code_mock(pattern, path=".", glob="*.py", output_mode="content"):
     file_count = 0
 
     for fp in files:
-        if any(d in fp.parts for d in skip_dirs):
+        # 只看**相对搜索根**的目录段：用绝对路径段（`fp.parts`）判的话，被搜目录本身
+        # 位于 `<WORK_DIR>/tmp/...` 时（回放 overlay 就在这里）整棵树会被自己的 skip 规则吃掉，
+        # 结果是"搜了但一个文件都没匹配"，而现场看起来完全正常。
+        if any(d in fp.relative_to(root).parts[:-1] for d in skip_dirs):
             continue
         file_count += 1
         if file_count > max_files:
@@ -407,11 +410,14 @@ def code_index_mock(path=".", glob="*.py"):
     file_count, total_funcs = 0, 0
 
     for fp in files:
-        if any(d in fp.parts for d in skip_dirs):
+        _rel_parts = fp.relative_to(root).parts[:-1]
+        if any(d in _rel_parts for d in skip_dirs):
             continue
         file_count += 1
         if file_count > max_files:
-            rest = sum(1 for f in files if not any(d in f.parts for d in skip_dirs)) - max_files + 1
+            rest = sum(1 for f in files
+                       if not any(d in f.relative_to(root).parts[:-1] for d in skip_dirs)) \
+                - max_files + 1
             lines_out.append(f"\n... (truncated, ~{rest} more files — narrow path or glob)")
             break
         try:

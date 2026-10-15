@@ -9,16 +9,30 @@ from .tokens import _read_budget, estimate_tokens
 from . import confirm
 
 
+def _extra_roots():
+    """回放时额外放行的根（当前只有 overlay，§8.2.1）。非回放返回 ()。"""
+    try:
+        from .overlay import active_overlay
+        ov = active_overlay()
+    except Exception:  # noqa: BLE001 —— 沙箱的基本边界不该依赖 overlay 模块可用
+        return ()
+    return (ov,) if ov is not None else ()
+
+
 def _resolve_path(path):
-    """解析路径，限定在 WORK_DIR 内。越界则抛异常。"""
+    """解析路径，限定在 WORK_DIR 内（回放时 overlay 也算合法根）。越界则抛异常。"""
     if os.path.isabs(path):
         resolved = os.path.abspath(path)
     else:
         resolved = os.path.abspath(os.path.join(WORK_DIR, path))
-    # 规范化后检查是否在 WORK_DIR 内
-    if os.path.commonpath([resolved, WORK_DIR]) != os.path.abspath(WORK_DIR):
-        raise ValueError(f"Access denied: '{path}' resolves outside working directory '{WORK_DIR}'")
-    return resolved
+    if os.path.commonpath([resolved, WORK_DIR]) == os.path.abspath(WORK_DIR):
+        return resolved
+    # overlay 是回放里唯一额外放行的根：正向重写正是把路径搬到那里（§8.2.1）。
+    # 这不是"放松沙箱"——overlay 根自己也被校验过必须落在 WORK_DIR 之内。
+    for ov in _extra_roots():
+        if ov.permits(resolved):
+            return resolved
+    raise ValueError(f"Access denied: '{path}' resolves outside working directory '{WORK_DIR}'")
 
 
 # 单次工具结果里 diff 段的字符上限：够看清一处改动的上下文，又不撑爆本地模型窗口。

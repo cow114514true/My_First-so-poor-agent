@@ -19,6 +19,7 @@ import os
 import shutil
 import sys
 import time
+from types import SimpleNamespace
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -489,7 +490,32 @@ def test_delegate_task_stub():
     assert rec and rec["result_full"] == "子 agent 的录制结论", "delegate_task 没有整体 stub"
 
 
-def test_trace_dir_under_tmp():
+def test_get_date_returns_injected_epoch_date():
+    """§8.3 特例：回放时 `get_date` 吐 `trace_epoch.injected_date_str`，而不是录制那天的日期。"""
+    epoch = trace.trace_epoch()
+    entries = [
+        {"type": "llm_request", "request_index": 0, "kind": "chat", "model": "m",
+         "params": {}, "messages": [{"role": "user", "content": "今天几号"}], "stream": True},
+        {"type": "tool_call", "call_id": "d1", "tool_name": "get_date", "class": "A",
+         "arguments_raw": "{}", "request_index": 0},
+        {"type": "tool_result", "call_id": "d1", "tool_name": "get_date", "class": "A",
+         "result_full": "1999-01-01", "result_stored": "1999-01-01"},
+        {"type": "turn_end", "reason": "answer", "request_index": 0},
+    ]
+    cass = _synth_cassette("epochdate", entries)
+    cas = cassette_mod.Cassette(cass, check_env=False)
+    box = replay.ReplayToolBox(cas, exec_date=True)          # ① CLI 默认打开注入
+    d = box.decision("get_date", "d1")
+    assert isinstance(d, str) and d == epoch["injected_date_str"], \
+        f"get_date 没有注入 trace_epoch 的日期：{d!r}"
+    assert box.injected_date() == epoch["injected_date_str"], box.injected_date()
+    # 关掉注入 → 退回录制结果（仍是吐文本，不真跑工具）
+    box2 = replay.ReplayToolBox(cas, policy="class", exec_date=False)
+    d2 = box2.decision("get_date", "d1")
+    assert d2 == "1999-01-01", d2
+
+
+
     rec = _record(_TOOL_BATCH, name="under")
     assert os.path.commonpath([os.path.abspath(rec["dir"]), os.path.abspath(ROOT)]) == os.path.abspath(ROOT)
     rel = os.path.relpath(rec["dir"], ROOT).replace("\\", "/")
@@ -658,6 +684,360 @@ def test_replay_does_not_touch_workspace():
     after = _snap()
     assert before == after, \
         f"回放动了工作区：{sorted(set(before.items()) ^ set(after.items()))[:3]}"
+
+
+# ── L2 overlay 与工具策略（§8）─────────────────────────────────────
+# 注意：`Overlay.root` 是 `overlay_root/<session_id>`（见 `overlay.overlay_root`），
+# 不是 `overlay_root` 本身。断言里要判"落没落在 overlay 里"，一律取
+# `rep.overlay.root`，别拿传进去的那个父目录去拼文件路径。
+_L2_SEEN = {}
+
+
+class _L2Fn:
+    """带标记的 B 类工具：标记证明"真的被执行了"，返回值与录制期同形。"""
+
+    def __init__(self, marker):
+        self.marker = marker
+
+    def __call__(self, path, content, purpose="", **kw):
+        from loop_agent_core import confirm
+        from loop_agent_core.file_tools import write_file_mock
+        resolved = os.path.abspath(path if os.path.isabs(path) else os.path.join(ROOT, path))
+        _L2_SEEN.setdefault("calls", []).append(resolved)
+        if not confirm.request("write_file", resolved, purpose):
+            return "[Denied by user]"
+        res = write_file_mock(resolved, content, purpose)
+        size = len(content.encode("utf-8"))
+        out = f"{self.marker} {size} bytes to {resolved}"
+        if os.environ.get("L2_DEBUG"):
+            print(f"[L2_DEBUG] marker path={path!r} resolved={resolved!r} "
+                  f"written={os.path.exists(resolved)} real={res!r}")
+        return out
+
+
+def _write_batch(rel, content):
+    """一个 write_file 工具轮 + 一轮收尾。"""
+    args = json.dumps({"path": rel, "content": content}, ensure_ascii=False)
+    return [[_Chunk(_Delta(tool_calls=[_ToolCall(0, "w1", "write_file", args)])),
+             _Chunk(_Delta(), finish_reason="tool_calls"),
+             _Chunk(usage=True, no_choices=True)],
+            [_Chunk(_Delta(content="写好了"), finish_reason="stop"),
+             _Chunk(usage=True, no_choices=True)]]
+
+
+def _record_write(name, rel, content, marker="[LIVE]"):
+    from loop_agent_core import confirm
+    _L2_SEEN.clear()
+    prev_policy = confirm.get_policy()
+    prev_tool = la.TOOL_CALL_MAP.get("write_file")
+    confirm.set_policy("allow_all")
+    la.TOOL_CALL_MAP["write_file"] = _L2Fn(marker)
+    try:
+        rec = _record(_write_batch(rel, content), question="写个文件", name=name)
+    finally:
+        confirm.set_policy(prev_policy)
+        if prev_tool is not None:
+            la.TOOL_CALL_MAP["write_file"] = prev_tool
+    rec["calls"] = list(_L2_SEEN.get("calls") or [])
+    return rec
+
+
+def _replay_class(cass_dir, name="l2-rep", *, overlay_read=False, keep=False):
+    """L2 回放：`tool_policy="class"`，B 类入 overlay 真执行。
+
+    `keep=True` 让 overlay 在这次回放后**留一会儿**（`keep_overlay`），用完自己删：
+    overlay 按设计是"本次回放的副作用现场"，跑完就清（§8.1），要在里面取样就得先留住它。
+    """
+    from loop_agent_core import confirm
+    run_dir = _fresh_dir(_TRACE_ROOT, name)
+    _LAST_RUN["dir"] = run_dir
+    run_dir_clean = os.path.abspath(cass_dir.rstrip("\\/")) + ".check"
+    shutil.rmtree(run_dir_clean, ignore_errors=True)
+    _L2_SEEN.clear()
+    prev_policy = confirm.get_policy()
+    prev_tool = la.TOOL_CALL_MAP.get("write_file")
+    ov_root = os.path.join(ROOT, "tmp", "overlay", f"l2-{name}")
+    shutil.rmtree(ov_root, ignore_errors=True)
+    confirm.set_policy("allow_all")
+    la.TOOL_CALL_MAP["write_file"] = _L2Fn("[LIVE]")
+    try:
+        rep = replay.run_replay(cass_dir, question=None, conv=_new_conv(os.path.basename(run_dir)),
+                                run_dir=run_dir, tool_policy="class", check_env=False,
+                                overlay_root=ov_root, overlay_read=overlay_read,
+                                keep_overlay=keep)
+    finally:
+        confirm.set_policy(prev_policy)
+        if prev_tool is not None:
+            la.TOOL_CALL_MAP["write_file"] = prev_tool
+    _L2_SEEN["overlay_root"] = ov_root
+    if os.environ.get("L2_DEBUG"):
+        ov_ = rep.overlay
+        print("[L2_DEBUG] root=", ov_root)
+        print("[L2_DEBUG] overlay.root=", getattr(ov_, "root", None))
+        print("[L2_DEBUG] touched=", getattr(ov_, "touched", None))
+        print("[L2_DEBUG] copied=", getattr(ov_, "copied", None))
+        print("[L2_DEBUG] missing=", getattr(ov_, "missing", None))
+        print("[L2_DEBUG] live=", getattr(ov_, "live_calls", None))
+        print("[L2_DEBUG] seen=", _L2_SEEN.get("calls"))
+        print("[L2_DEBUG] tree=", [os.path.join(dp, f) for dp, _d, fn in os.walk(ov_root)
+                                    for f in fn])
+    return rep
+
+
+def test_overlay_does_not_touch_repo():
+    """§9 #26：L2 的 B 类真执行只写 overlay——真实 WORK_DIR 文件 mtime/sha256 一字不动。"""
+    import hashlib
+
+    def _dig(p):
+        st = os.stat(p)
+        with open(p, "rb") as f:
+            return st.st_mtime_ns, hashlib.sha256(f.read()).hexdigest()
+
+    content = "第一次写入\n"
+    real_path = os.path.join(ROOT, "tmp", "_l2_real.txt")
+    os.makedirs(os.path.dirname(real_path), exist_ok=True)
+    with open(real_path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+    rel = "tmp/_l2_real.txt"
+    rec = _record_write("l2rec", rel, content)
+    assert rec["calls"], "录制期没有真的调用 write_file（用例失去意义）"
+    before = _dig(real_path)
+
+    cass, meta = _extract(rec, "l2rec", workspace_root=ROOT)
+    ov_root = os.path.join(ROOT, "tmp", "overlay", "l2-iso")
+    shutil.rmtree(ov_root, ignore_errors=True)
+    from loop_agent_core import confirm
+    prev_policy = confirm.get_policy()
+    prev_tool = la.TOOL_CALL_MAP.get("write_file")
+    confirm.set_policy("allow_all")
+    la.TOOL_CALL_MAP["write_file"] = _L2Fn("[LIVE]")
+    _L2_SEEN.clear()
+    try:
+        rep = replay.run_replay(cass, conv=_new_conv("l2iso"),
+                                run_dir=_fresh_dir(_TRACE_ROOT, "l2iso-rep"),
+                                tool_policy="class", check_env=False, overlay_root=ov_root,
+                                keep_overlay=True)
+    finally:
+        confirm.set_policy(prev_policy)
+        if prev_tool is not None:
+            la.TOOL_CALL_MAP["write_file"] = prev_tool
+
+    after = _dig(real_path)
+    assert before == after, f"L2 回放动了真实工作区文件：{real_path}"
+    live = _L2_SEEN.get("calls") or []
+    assert live, "L2 回放没有真执行 B 类工具（§8.3 的 B 类必须真跑）"
+    assert all(p.startswith(rep.overlay.root) for p in live), \
+        f"B 类真执行没有落在 overlay 里：{live}"
+    assert rep.overlay is not None and rep.overlay.live_calls, "报告里没有真执行记录"
+    # 真执行确实在副本上落了盘：overlay 里那份是"这次回放写出来的"
+    copied = os.path.join(rep.overlay.root, rel)
+    assert os.path.exists(copied), f"overlay 里没有写入落点：{copied}"
+    text = rep.text()
+    assert "overlay" in text and "真执行" in text, f"报告没有 overlay 段：\n{text}"
+    shutil.rmtree(rep.overlay.root, ignore_errors=True)
+    os.remove(real_path)
+
+
+def test_l2_isolation_records_but_does_not_apply():
+    """L2 真执行的写入确实落在 overlay 副本上：overlay 里是新内容，工作区还是旧的。"""
+    real_path = os.path.join(ROOT, "tmp", "_l2_iso.txt")
+    os.makedirs(os.path.dirname(real_path), exist_ok=True)
+    with open(real_path, "w", encoding="utf-8") as f:
+        f.write("原始内容\n")
+    rec = _record_write("l2iso2", "tmp/_l2_iso.txt", "原始内容\n")
+    cass, _ = _extract(rec, "l2iso2", workspace_root=ROOT)
+
+    rep = _replay_class(cass, name="iso2", keep=True)
+    assert rep.overlay is not None, "policy=class 没有建 overlay"
+    try:
+        # 报告里写明"真执行"，且执行时看到的是 overlay 路径而不是工作区路径
+        assert [n for _cid, n in rep.overlay.live_calls] == ["write_file"], rep.overlay.live_calls
+        seen = _L2_SEEN.get("calls") or []
+        assert seen, "回放没有真执行 B 类工具"
+        assert all(p.startswith(rep.overlay.root) for p in seen), seen
+        copied = os.path.join(rep.overlay.root, "tmp", "_l2_iso.txt")
+        assert os.path.exists(copied), f"overlay 里没有这个被触碰的文件：{copied}"
+        with open(copied, encoding="utf-8") as f:
+            assert f.read() == "原始内容\n", "overlay 副本内容与工作区不一致"
+        with open(real_path, encoding="utf-8") as f:
+            assert f.read() == "原始内容\n", "真实工作区文件被回放改写了"
+    finally:
+        shutil.rmtree(rep.overlay.root, ignore_errors=True)
+        os.remove(real_path)
+
+
+def test_overlay_recursive_rewrite():
+    """§9 #35：search_code / code_index 的目标被重写成 overlay 根，且真扫的是副本。"""
+    from loop_agent_core import overlay as ov_mod
+
+    ov = ov_mod.Overlay("rewrite", root=os.path.join(ROOT, "tmp", "overlay"))
+    try:
+        assert ov.root.startswith(os.path.abspath(os.path.join(ROOT, "tmp"))), ov.root
+        for name in ("search_code", "code_index"):
+            new, note = ov.rewrite_args(name, {"path": ".", "pattern": "x", "glob": "*.py"})
+            assert new["path"] == ov.root, f"{name} 没有把目标重写成 overlay 根：{new['path']}"
+            assert note and note.startswith("structured:"), f"{name} 没有给出重写说明：{note}"
+        # 已经指向 overlay 的路径不该被重复改写
+        again, _ = ov.rewrite_args("search_code", {"path": ov.root})
+        assert again["path"] == ov.root, "overlay 内的路径被二次改写"
+        # 命令串走 best_effort：WORK_DIR 子串替换 + 在 overlay 里起跑
+        cmd = f"Get-ChildItem {ROOT}\\tmp"
+        rewritten, note = ov.rewrite_args("exec_shell_win", {"shell_cmd": cmd})
+        assert ov.root in rewritten["shell_cmd"], rewritten["shell_cmd"]
+        assert rewritten["shell_cmd"].startswith("Set-Location"), rewritten["shell_cmd"]
+        assert note == "best_effort:shell_cmd", note
+    finally:
+        ov.cleanup()
+
+
+def test_overlay_path_mapping_round_trip():
+    """§8.2.2：overlay 路径 ↔ 逻辑路径双向映射，以及工具出参里的反向替换。"""
+    from loop_agent_core import overlay as ov_mod
+
+    ov = ov_mod.Overlay("map", root=os.path.join(ROOT, "tmp", "overlay"))
+    try:
+        logical = os.path.join(ROOT, "tmp", "a", "b.py")
+        inside = ov.to_overlay(logical)
+        assert inside.startswith(ov.root), inside
+        assert ov.to_logical(inside) == logical, ov.to_logical(inside)
+        # 出参里的 overlay 路径必须换回逻辑路径（写进会话历史前）
+        text = f"Written 12 bytes to {inside}\n"
+        assert ov.reverse_text(text) == f"Written 12 bytes to {logical}\n"
+        # 斜杠写法也要换回去
+        assert ov.reverse_text(inside.replace("\\", "/")) == logical
+        # WORK_DIR 之外的路径不参与映射，原样返回
+        outside = os.path.abspath(os.path.join(ROOT, "..", "outside.py"))
+        assert ov.to_overlay(outside) == outside
+        assert ov.to_logical(outside) == outside
+    finally:
+        ov.cleanup()
+
+
+def test_overlay_permits_only_its_own_root():
+    """overlay 是路径沙箱里**额外**的一个合法根，不放松任何其它路径（§8.2 的接缝）。"""
+    from loop_agent_core import overlay as ov_mod
+
+    ov = ov_mod.Overlay("permit", root=os.path.join(ROOT, "tmp", "overlay"))
+    try:
+        assert ov.permits(os.path.join(ov.root, "tmp", "x.py"))
+        assert not ov.permits(os.path.join(ROOT, "loop_agent_v2.py"))
+        assert not ov.permits(os.path.abspath(os.path.join(ROOT, "..")))
+    finally:
+        ov.cleanup()
+    try:
+        ov_mod.Overlay("escape", root=os.path.abspath(os.path.join(ROOT, "..", "overlay")))
+    except ValueError as exc:
+        assert "WORK_DIR" in str(exc), exc
+        return
+    raise AssertionError("overlay 根落在 WORK_DIR 之外竟然被接受了")
+
+
+def test_overlay_read_prefers_overlay_after_b_write():
+    """§8.2.3 跨类污染：B 类写过之后，A 类在该路径上读到的是 overlay 里那一份。
+
+    这条用例用的是 overlay 自己的判据（`read_from_overlay` 开关 + 记账），不经过模型——
+    "读到新内容"这件事不需要一次 LLM 往返来证明，而它正是判定回放有没有走偏的关键。
+    """
+    from loop_agent_core import overlay as ov_mod
+
+    rel = "tmp/_l2_xread.txt"
+    path = os.path.join(ROOT, rel)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("旧内容\n")
+    ov = ov_mod.Overlay("xread", root=os.path.join(ROOT, "tmp", "overlay"),
+                        read_from_overlay=True)
+    try:
+        # 建副本（§8.1）→ B 类在副本上写下新内容 → A 类要读到的是新的那一份
+        ov.prepare()
+        inner = os.path.normpath(os.path.join(ov.root, rel))
+        os.makedirs(os.path.dirname(inner), exist_ok=True)
+        with open(inner, "w", encoding="utf-8") as f:
+            f.write("新内容\n")
+        ov.note_written(rel)
+        assert ov.modified(rel) == inner, ov.modified(rel)
+        assert ov.read_from_overlay
+        prev_active = replay.ReplaySession._active
+        replay.ReplaySession._active = SimpleNamespace(overlay=ov)
+        try:
+            hit = ov_mod.overlay_result_for("read_file", {"path": rel})
+            assert hit and hit.startswith(ov.root), f"没有重读 overlay：{hit!r}"
+            # 写目录、读目录里的文件 → 同样指到 overlay 里那一份
+            ov.note_written("tmp")
+            assert ov.modified(rel) == inner, "写了目录之后没有向上找到副本"
+            # 关掉开关 → 不重读，交给录制结果
+            ov.read_from_overlay = False
+            assert ov_mod.overlay_result_for("read_file", {"path": rel}) is None
+        finally:
+            replay.ReplaySession._active = prev_active
+    finally:
+        ov.cleanup()
+        os.remove(path)
+
+
+def test_runner_keeps_logical_args_in_history():
+    """§8.2.1：重写只发生在执行用的副本上——会话历史里那条 tool_call 仍是逻辑路径。"""
+    real_path = os.path.join(ROOT, "tmp", "_l2_hist.txt")
+    os.makedirs(os.path.dirname(real_path), exist_ok=True)
+    with open(real_path, "w", encoding="utf-8") as f:
+        f.write("历史\n")
+    rec = _record_write("l2hist", "tmp/_l2_hist.txt", "历史\n")
+    cass, _ = _extract(rec, "l2hist", workspace_root=ROOT)
+    rep = _replay_class(cass, name="hist")
+    ov_root = _L2_SEEN["overlay_root"]
+    calls = [e for e in trace.read_events(_LAST_RUN["dir"]) if e.get("type") == "tool_call"]
+    written = [e for e in calls if e.get("overlay")]
+    if os.environ.get("L2_DEBUG"):
+        print("[L2_DEBUG] run_dir=", _LAST_RUN["dir"])
+        print("[L2_DEBUG] tool_calls=", json.dumps(calls, ensure_ascii=False)[:1500])
+    assert written, "回放 trace 里没有带 overlay 标记的 tool_call"
+    ev = written[0]
+    assert ev["arguments"]["path"] == "tmp/_l2_hist.txt", \
+        f"trace 里的逻辑入参被改写了：{ev['arguments']}"
+    assert ev["overlay"]["written"]["path"].startswith(ov_root), ev["overlay"]
+    os.remove(real_path)
+
+
+def test_cli_replay_overlay_flags():
+    """CLI 是 L2 的入口：`--tool-policy class --overlay-root … --keep-overlay` 真的接上了。"""
+    from tools import trace as trace_cli
+
+    real_path = os.path.join(ROOT, "tmp", "_l2_cli.txt")
+    os.makedirs(os.path.dirname(real_path), exist_ok=True)
+    with open(real_path, "w", encoding="utf-8") as f:
+        f.write("CLI 前的旧内容\n")
+    rec = _record_write("l2cli", "tmp/_l2_cli.txt", "CLI 前的旧内容\n")
+    # 这条 cassette 不是 positional（`expected_assertion` 留空），CLI 会把"未声明目标断言"判成
+    # 返回码 2——那是判分口径，不是回放失败。所以这里只认"回放没崩 + overlay 行为对"。
+    cass, _ = _extract(rec, "l2cli", workspace_root=ROOT)
+
+    from loop_agent_core import confirm
+    ov_root = os.path.join(ROOT, "tmp", "overlay", "l2-cli")
+    shutil.rmtree(ov_root, ignore_errors=True)
+    prev_policy = confirm.get_policy()
+    prev_tool = la.TOOL_CALL_MAP.get("write_file")
+    confirm.set_policy("allow_all")
+    _L2_SEEN.clear()
+    la.TOOL_CALL_MAP["write_file"] = _L2Fn("[CLI]")
+    try:
+        rc = trace_cli.main(["replay", cass, "--tool-policy", "class",
+                             "--overlay-root", ov_root, "--keep-overlay",
+                             "--overlay-read"])
+    finally:
+        confirm.set_policy(prev_policy)
+        if prev_tool is not None:
+            la.TOOL_CALL_MAP["write_file"] = prev_tool
+
+    assert rc in (0, 2), f"CLI 回放异常退出：{rc}"
+    live = _L2_SEEN.get("calls") or []
+    assert live, "CLI 的 tool_policy=class 没有真执行 B 类工具"
+    assert all(p.startswith(ov_root) for p in live), f"CLI 真执行没落在 overlay 里：{live}"
+    with open(real_path, encoding="utf-8") as f:
+        assert f.read() == "CLI 前的旧内容\n", "CLI 回放改写了真实工作区文件"
+    assert os.path.isdir(ov_root), f"--keep-overlay 没有留下 overlay：{ov_root}"
+    shutil.rmtree(ov_root, ignore_errors=True)
+    os.remove(real_path)
 
 
 def test_headroom_store_isolation():

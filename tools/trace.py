@@ -317,7 +317,9 @@ def cmd_extract(args) -> int:
 def cmd_replay(args) -> int:
     report = replay_mod.run_replay(
         args.cassette_dir, question=args.question, mode=args.mode, strict=args.strict,
-        window=args.window, tool_policy=args.tool_policy)
+        window=args.window, tool_policy=args.tool_policy,
+        overlay_root=args.overlay_root, overlay_read=args.overlay_read,
+        exec_c=args.exec_c, keep_overlay=args.keep_overlay, exec_date=args.exec_date)
     print(report.text())
     if args.expected_assertion and report.expected_assertion != args.expected_assertion:
         print(f"✗ cassette 声明的目标断言 {report.expected_assertion!r} 与命令行给的 "
@@ -447,7 +449,19 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--expected-assertion", default=None)
     q.add_argument("--max-skips", type=int, default=None)
     q.add_argument("--tool-policy", choices=("cassette", "class"), default="cassette")
-    q.set_defaults(func=cmd_replay)
+    # L2（§8）只在 --tool-policy class 下生效；这些开关默认全关，回放的默认行为
+    # 保持 L1：只吐录制结果、一个字节都不写到工作区。
+    q.add_argument("--overlay-root", default=None,
+                   help="overlay 根目录（默认 tmp/overlay；必须落在 WORK_DIR 之内）")
+    q.add_argument("--overlay-read", action="store_true",
+                   help="A 类读被本次回放写过的路径时，读 overlay 而非录制结果（§8.2.3）")
+    q.add_argument("--exec-c", action="store_true",
+                   help="C 类也真执行（默认只吐录制结果；开了就不是离线回放了）")
+    q.add_argument("--keep-overlay", action="store_true",
+                   help="回放结束保留 overlay 目录，便于人工核对")
+    q.add_argument("--no-exec-date", dest="exec_date", action="store_false",
+                   help="get_date 不注入 trace_epoch 的日期，改吐录制结果")
+    q.set_defaults(func=cmd_replay, exec_date=True)
 
     q = sub.add_parser("clean", help="清理过期会话")
     q.add_argument("--older-than", default="30d")

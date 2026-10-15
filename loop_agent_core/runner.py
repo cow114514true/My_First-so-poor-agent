@@ -1,5 +1,6 @@
 """主循环与工具执行：_chat 实现。依赖经参数注入（工具表/delegate/默认事件），不碰薄壳可变全局。
 API 调用一律用 conv["messages"]（修 worker 子 agent 把主线程历史发给模型的隔离 bug）。"""
+import copy
 import hashlib
 import json
 import os
@@ -86,14 +87,33 @@ def _rewrite_scope(name):
         return None
 
 
-# ── 回放钩子（§4.5 / §8.3 的 L1 子集）──────────────────────────────
-# 回放时工具结果从 cassette 回吐，**不真执行**：真执行会写工作区、打网络，那样跑出来的
-# 就不是"同一段历史再跑一遍"，而是"在另一台机器上重做一遍"——失败复现与否都不再说明问题。
-def _replay_prefetch(use_tool_calls):
-    """回放中：为每个工具取录制结果（返回 {call_id: result_full}）。
+# ── 回放钩子（§4.5 / §8.2 / §8.3）──────────────────────────────────
+# L1（`policy="cassette"`）：工具结果从 cassette 回吐，**不真执行**——真执行会写工作区、
+# 打网络，那样跑出来的就不是"同一段历史再跑一遍"，而是"在另一台机器上重做一遍"，
+# 失败复现与否都不再说明问题。
+# L2（`policy="class"`）：B 类在 overlay 里真执行（§8.3）。隔离与路径映射都在
+# `loop_agent_core/overlay.py`，这里只负责在**入参层**（§8.2.1）与**结算层**（§8.2.2）接上。
+def _active_overlay():
+    """当前回放的活动 overlay（非回放 / L1 回放返回 None）。"""
+    try:
+        from . import overlay as ov_mod
+        return ov_mod.active_overlay()
+    except Exception:  # noqa: BLE001
+        return None
 
-    只把 `result_full` 交回给主循环，让**主循环自己再截断一次**——这正是 §4.5 要检验的
-    那一步：现在的预算算出来的 `result_stored` 必须和录制时的那一份一样。
+
+def _replay_plan(use_tool_calls):
+    """回放中：为每个工具取一次供给决定。
+
+    返回 `{call_id: LiveCall | str}`；非回放 / 无活页返回 `{}`。
+
+    `str` 是**录制结果**，而且是 `result_full`——只把完整的那一份交回主循环，让主循环
+    自己再截断一次，这正是 §4.5 要检验的那一步：现在的预算算出来的 `result_stored`
+    必须和录制时的那一份一样。
+
+    **重写也在这里做完**（`_replay_args_json`），而不是等到执行分支：`tool_call` 事件在
+    执行之前就发出去，重写晚于它的话，"这次到底把路径改成了什么"就没有地方挂了——
+    事件里只会留下一个 `written: null`，看起来像"重写没发生"，实际只是记账晚了一步。
     """
     try:
         from . import replay
@@ -103,23 +123,99 @@ def _replay_prefetch(use_tool_calls):
         return {}
     out = {}
     for tool in use_tool_calls:
-        rec = replay.tool_result_for(tool.function.name, tool.id)
-        if rec is None:
-            raise replay.ReplayToolMissing(
-                f"回放时遇到没有录制结果的工具调用：{tool.function.name}({tool.id})")
-        full = rec.get("result_full")
-        out[tool.id] = str(full if full is not None else (rec.get("result_stored") or ""))
+        name = tool.function.name
+        raw = str(getattr(tool.function, "arguments", "") or "")
+        d = replay.decision_for(name, tool.id)
+        if d is None:  # 理论上不可达：上面刚判过有活页
+            continue
+        if isinstance(d, replay.LiveCall):
+            # 记下**逻辑**入参：真执行时送给工具的是另一份（overlay 路径），但断言面
+            # 与屏幕事件看到的调用必须是模型当初发起的那个，否则回放会把历史改写掉。
+            d.args = _tool_args_dict(tool)
+            # 跨类重读（下面 `hit` 命中）时入参已经指到 overlay 里了，不需要再重写。
+            if d.run_arguments is None:
+                d.run_arguments = _replay_args_json(name, raw, d)
+            out[tool.id] = d
+            continue
+        # 跨类污染（§8.2.3）：这个路径本次回放里已经被 B 类工具写过，录制的旧内容是
+        # 写之前的，照吐就等于"读了但没看见自己刚写的东西"。改成真读 overlay 里那一份。
+        hit = _overlay_read(name, _tool_args_dict(tool))
+        if hit is not None:
+            live = replay.LiveCall(name=name, call_id=tool.id,
+                                   cls=replay.class_of(name),
+                                   kind="live", args=_tool_args_dict(tool))
+            live.rewritten = {"path": hit}
+            live.rewrite = "overlay:read"
+            live.run_arguments = _replay_args_json(name, raw, live)
+            out[tool.id] = live
+            continue
+        out[tool.id] = d
     return out
 
 
-def _replay_verify_result(tool, result_full, stored):
-    """回放中对账：`truncate(result_full, 现在的预算)` 是否等于录制的 result_stored。"""
+def _overlay_read(name, args):
+    """A 类要读的路径若已被本次回放写过 → overlay 内的真实文件路径，否则 None。"""
+    try:
+        from . import overlay as ov_mod
+        return ov_mod.overlay_result_for(name, args or {})
+    except Exception:  # noqa: BLE001 —— 读不到就退回落录播，不该让整轮工具失败
+        return None
+
+
+def _replay_args_json(name, arguments, live_call=None):
+    """真执行时送给工具的入参 JSON：回放里是 overlay 重写过的那一份。
+
+    返回改写后的 JSON 串；不需要改写时返回原串。**只返回字符串**，不改任何 tool 对象——
+    会话历史里那条 assistant 消息的 `function.arguments` 必须保持逻辑路径，否则"模型当时
+    发起的调用"会在回放中被悄悄改写成 overlay 路径（§8.2.1 只允许改执行用的那一份副本）。
+
+    改写前的入参留在 `live_call.args`（正向重写前记的），改写后的留在 `live_call.rewritten`：
+    现场只看到"结果对不上"时，这两个值一起才能说明重写到底做了什么。
+    """
+    try:
+        args = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return arguments
+    if not isinstance(args, dict):
+        return arguments
+    from . import overlay as ov_mod
+    rewritten, note = ov_mod.rewrite_for_replay(name, args)
+    if note is None:
+        return arguments
+    if live_call is not None:
+        live_call.rewritten = rewritten
+        live_call.rewrite = note
+    return json.dumps(rewritten, ensure_ascii=False)
+
+
+def _reverse_tool_result(result, tool_name):
+    """结算层反向映射（§8.2.2）：出参里的 overlay 路径换回逻辑路径后再写 conv。"""
+    try:
+        from . import overlay as ov_mod
+        return ov_mod.reverse_for_replay(result, tool_name=tool_name)
+    except Exception:  # noqa: BLE001 —— 只影响文本形态，不该拖垮工具轮
+        return result if isinstance(result, str) else str(result)
+
+
+def _replay_verify_result(tool, result_full, stored, *, class_changed=False):
+    """回放中对账：`truncate(result_full, 现在的预算)` 是否等于录制的 result_stored。
+
+    `result_full` 必须是**工具自己的出参原文**（含 overlay 路径）；真执行的 B 类调用
+    在账本里另记一份、且不与录制结果比截断预算：它的结果本来就与录制不同，那是 L2 的
+    明文事实，不该伪装成"截断逻辑漂移"。
+    """
     try:
         from . import replay
     except Exception:  # noqa: BLE001
         return
     session = replay.active_session()
     if session is None:
+        return
+    if class_changed:
+        session.tools.live_detail.append({
+            "call_id": tool.id, "name": tool.function.name,
+            "result_full_chars": len(str(result_full or "")),
+            "result_stored_chars": len(str(stored or ""))})
         return
     rec = session.cassette.tool_result(tool.id) or {}
     limits_recorded = session.cassette.limits_for(rec.get("request_index"))
@@ -400,23 +496,36 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
     worker_meta = {}  # call_id -> task（结算阶段补发 worker_done）
     _worker_t0 = {}
 
-    def _trace_call(tool):
+    def _trace_call(tool, live_call=None):
         """记下工具的**发起**（含完整入参）：回放按这份入参决定吐结果还是重跑。
 
         `arguments_raw` 必须是**原始完整**参数：会话历史里的 assistant tool_calls 会被
         `_store_tool_args` 换成占位符（write_file 的大正文尤其），回放时正是靠这一份把
         真实入参还原回来（§4.5 两通道）。
+
+        回放中真执行的调用额外标 `overlay`（§8.2.1）：`rewrite` 保留 `structured` /
+        `best_effort` 的原义——它是**工具的分类属性**，写成"这次到底改没改"会让同一个工具
+        在不同调用上出现不同取值，读 trace 的人再也分不清"这类工具就是这么重写的"还是
+        "这一次重写命中了"。
         """
         from . import trace
         name = tool.function.name
         raw = str(getattr(tool.function, "arguments", "") or "")
-        trace.emit_record({"type": "tool_call", "name": name, "tool_name": name,
-                           "call_id": tool.id,
-                           "class": _tool_class(name), "tool_class": _tool_class(name),
-                           "rewrite": _rewrite_scope(name),
-                           "arguments_raw": raw,
-                           "arguments": _tool_args_dict(tool),
-                           "args_digest": _digest_text(raw)})
+        ev = {"type": "tool_call", "name": name, "tool_name": name,
+              "call_id": tool.id,
+              "class": _tool_class(name), "tool_class": _tool_class(name),
+              "rewrite": _rewrite_scope(name),
+              "arguments_raw": raw,
+              "arguments": _tool_args_dict(tool),
+              "args_digest": _digest_text(raw)}
+        if live_call is not None:
+            # 逻辑入参 + overlay 实际执行入参并录：这是"重写到底做了什么"的现场证据，
+            # 只记改写后的一份，就没法再判断"重写是不是把路径改错了"。
+            ov = _active_overlay()
+            ev["overlay"] = {"exec": "live", "root": getattr(ov, "root", None),
+                             "written": getattr(live_call, "rewritten", None),
+                             "rewrite_detail": getattr(live_call, "rewrite", None)}
+        trace.emit_record(ev)
 
     def _trace_result(tool, result, stored, cap, duration_ms=None, from_replay=False):
         """记下工具的**结果**：result_full 是喂给模型之外的那一份，result_stored 才是进
@@ -458,18 +567,32 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
                                "tool_class": _tool_class(name),
                                "message": text[:500]})
 
-    for _tool in use_tool_calls:
-        _trace_call(_tool)
-
     # ── 1) 并发执行阶段（只收集结果）────────────────────────
-    # 回放：先把录制结果取回来；取回来的工具不再进入执行阶段（上面 prefetch 会抛
-    # ReplayToolMissing，不允许"没录到就现跑一个"来蒙混过关）。
-    _replay_results = _replay_prefetch(use_tool_calls)
+    # 回放：先为每个工具取供给决定（§8.3）。A/C 类拿到录制结果、B 类拿到 LiveCall；
+    # 没录到的工具由 `decision()` fail-closed 抛 ReplayToolMissing——不允许"没录到就
+    # 现跑一个"来蒙混过关。
+    _plan = _replay_plan(use_tool_calls)
+    _live = {cid: d for cid, d in _plan.items() if not isinstance(d, str)}
+    _replay_results = {cid: d for cid, d in _plan.items() if isinstance(d, str)}
+
+    for _tool in use_tool_calls:
+        _trace_call(_tool, _live.get(_tool.id))
+
+    if _live:
+        ov = _active_overlay()
+        if ov is not None:
+            # "写过哪些路径"必须在执行**之前**记账：`_live` 是本次要真跑的集合，
+            # 等到执行完再记的话，中途抛出的那次写入就永远落在账本外（§8.2.3 的判据）。
+            for _cid, _d in _live.items():
+                ov.note_live_call(_cid, _d.name, _d.args)
     # 同步工具：线程池并发。worker 内禁用的工具不执行，结算阶段给错误。
     # 每个工具设结果超时（browser/ds_web 无内部兜底时会卡死线程），超时不阻塞主循环；
     # executor 用 shutdown(wait=False) 防 with 退出 join 死等（后台线程自然结束）。
+    #
+    # L2 的 B 类真执行必须**串行**且按录制发起顺序（§8.3）：写操作并发跑的话，
+    # `edit_file` 与 `write_file` 撞同一路径的顺序就不确定了，回放结果随之不可复现。
     sync = [t for t in use_tool_calls
-            if t.id not in _replay_results
+            if t.id not in _live
             and t.function.name != "delegate_task"
             and not (is_worker and t.function.name in _WORKER_FORBIDDEN)]
     if sync:
@@ -491,6 +614,25 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
                 _dur[t.id] = int((time.time() - _t0[t.id]) * 1000)
         finally:
             ex.shutdown(wait=False)
+
+    # L2：B 类按录制顺序真执行（入参已由 overlay 重写到 `tmp/overlay/<sid>/`）。
+    for _t in use_tool_calls:
+        if _t.id not in _live:
+            continue
+        # 深一份再改：那条 assistant 消息里的 tool_call 对象与会话历史共用，改它的
+        # `function.arguments` 会让"模型当时发起的调用"变样（§8.2.1 只允许改执行用的副本）。
+        # 重写已在 `_replay_plan` 里做完（`run_arguments`），这里只取用。
+        _t_run = copy.deepcopy(_t)
+        _run_args = getattr(_live[_t.id], "run_arguments", None)
+        if _run_args is not None:
+            _t_run.function.arguments = _run_args
+        _t0 = time.time()
+        try:
+            _cid, _res = _call_tool(_t_run, tool_call_map)
+        except Exception as _e:  # noqa: BLE001 —— 与并发分支保持同一种失败文本
+            _cid, _res = _t.id, f"[Error] Tool execution failed: {_e}"
+        results[_cid] = _res
+        _dur[_t.id] = int((time.time() - _t0) * 1000)
 
     # delegate_task：子 agent 异步队列（仅主 agent 可委托，受控并发）。
     if not is_worker:
@@ -557,6 +699,14 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
         if tool_result is None:
             tool_result = "[Error] Tool returned None (timeout or empty response)"
 
+        # 反向映射（§8.2.2）：真执行发生在 overlay 里，所以出参里的路径是 overlay 路径。
+        # 写进会话历史的必须是逻辑路径——否则回放出来的会话与录制的那份一比就全是对不上的
+        # `tmp/overlay/<sid>/...`，而且 overlay 回放完就删了，历史里留下一堆死路径。
+        # 只对真执行的调用做：录制结果本来就是录的时候那台机器上的逻辑路径，再"换回去"
+        # 等于对已正确的文本做一次猜测性替换。
+        if tool.id in _live:
+            tool_result = _reverse_tool_result(tool_result, tool_name)
+
         if tool_name == "delegate_task" and tool.id in worker_meta:
             emit({"type": "worker_done", "task": worker_meta[tool.id][:200], "result": str(tool_result)[:300]})
 
@@ -576,6 +726,11 @@ def run_tools(use_tool_calls, emit, conv, tool_call_map, delegate_fn,is_worker=F
         # 回放对账（§4.5）：现在的预算算出来的 stored 必须等于录制的那一份
         if tool.id in _replay_results:
             _replay_verify_result(tool, str(tool_result), stored)
+        elif tool.id in _live:
+            # 真执行的调用**本来就不该**等于录制结果（B 类写文件/跑命令）：对它做"
+            # truncate 是否等于录制 stored"的对账，只会把每次正确的真执行报成 drift。
+            # 改成只登记"真的跑了、跑出多大"，把它和"对不上"这件事分开记。
+            _replay_verify_result(tool, str(tool_result), stored, class_changed=True)
         _append_msg({"role": "tool", "tool_call_id": tool.id, "content": stored}, conv)
 
         try:

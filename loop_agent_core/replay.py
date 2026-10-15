@@ -63,6 +63,22 @@ class ReplayToolMissing(ReplayError):
     """回放时遇到录制里没有的工具调用结果。"""
 
 
+class LiveCall(SimpleNamespace):
+    """一次"回放时真执行"的工具调用（§8.3 的 B 类 / opt_in 的 C 类）。
+
+    `kind` 是**唯一的判定口径**：`record` / `stub` / `injected_date` 都是"吐内容"，
+    `live` 是"真执行"。分类（A/B/C）只解释"为什么这么判"，不参与判断。
+
+    `run_arguments` 是**回放中真正送给工具**的那份入参 JSON（overlay 重写后）；`arguments_raw`
+    式的原始逻辑入参留在 `args` 里。两份并存的理由：trace 的 `tool_call` 事件在**执行之前**
+    就发出去（它记的是"模型发起了什么调用"），所以重写必须发生在那之前，那份证据才有地方挂。
+    """
+
+    def __init__(self, *, name, call_id, cls, kind, args=None):
+        super().__init__(name=name, call_id=call_id, cls=cls, kind=kind, args=dict(args or {}),
+                         rewrite=None, run_arguments=None)
+
+
 # ── §6.4 路径归一化 ─────────────────────────────────────────────────
 class PathRoots:
     """一组 (前缀, 记号) 映射，替换时**最长前缀优先**。
@@ -500,6 +516,7 @@ class ReplayReport:
         self.expected_assertion: str | None = None
         self.reproduced: bool | None = None
         self.mismatch: str | None = None
+        self.overlay = None
         # strict 预检记账：strict_hash 相等的请求直接放行（跳过结构化 diff），
         # 不等的才交给 explain_diff 归类。两个数分开记，才能证明"相等确实跳过了"。
         self.strict_equal = 0
@@ -543,6 +560,15 @@ class ReplayReport:
         for t in self.tolerated:
             out.append(f"  容忍槽位 {t['slot']}：录制={str(t['recorded'])[:80]} "
                        f"现场={str(t['live'])[:80]}")
+        if self.overlay is not None:
+            # B 类真执行是"回放动了工作区"的唯一合法形式，它执行了哪些调用必须进报告：
+            # 只看"回放通过"这一个字，读报告的人无法区分"没有副作用"和"副作用被隔离了"。
+            out.append(f"overlay {self.overlay.root}")
+            out.append(f"  overlay {self.overlay.describe()}")
+            for call_id, name in self.overlay.live_calls:
+                out.append(f"  真执行 {name}({call_id})")
+            for name, logical, _hit in self.overlay.reads_from_overlay:
+                out.append(f"  overlay 重读 {name} {logical}")
         for d in self.drifts:
             out.append(f"  漂移 {d}")
         if self.expected_assertion:
@@ -830,41 +856,113 @@ def attribute_truncation(result_full: str, result_stored: str, recorded: dict,
 
 # ── 一次回放的全局面 ────────────────────────────────────────────────
 class ReplayToolBox:
-    """按 §4.5/§8.3 的**L1 子集**供给工具结果。
+    """按 §8.3 决定每个工具调用"吐录制结果"还是"在 overlay 里真执行"。
 
-    默认 `policy="cassette"`：所有工具都回吐录制结果。这样 L1 回放完全离线、不改工作区。
-    `policy="class"` 才启用 §8.3 的 A/C 吐录制、B 真执行——真执行会写文件，属于 L2 overlay
-    的范围，L1 不默认打开。
+    `policy="cassette"`（默认）：所有工具都回吐录制结果。L1 回放因此完全离线、不改工作区。
+    `policy="class"`：A 吐录制、B 真执行、C 吐录制（`exec_c` 显式打开才真跑）。
+    真执行会写文件，隔离由 L2 overlay 负责（`overlay.Overlay`）。
+
+    决定结果是**四元组**（`LiveCall`）而不是 `record|None`：`None` 一个值同时意味着
+    "B 类要真跑"和"录制里根本没有这个调用"，runner 只能靠猜——猜错的代价是要么漏掉
+    真执行，要么拿一个凭空现跑的结果去糊弄"复现"。
     """
 
-    def __init__(self, cassette: Cassette, *, policy="cassette"):
+    # `policy="class"` 时由 `ReplaySession` 填上（§8.1）；L1 回放保持 None。
+    # 放类属性是为了让"这个箱子有没有 overlay"在任何时候都能被安全地读，而不是
+    # 靠 `hasattr` 试探一个只在某条分支里才被赋值的实例属性。
+    overlay = None
+
+    def __init__(self, cassette: Cassette, *, policy="cassette", exec_c: bool = False,
+                 exec_date: bool = False):
         self.cassette = cassette
         self.policy = policy
+        self.exec_c = bool(exec_c)
+        self.exec_date = bool(exec_date)
         self.served: list = []
+        self.live: list = []
+        # 真执行调用的账本（§8.3）：L2 的 B 类结果**本来就不等于录制结果**，这份账
+        # 是"哪些调用真的跑了、跑出来多大"的唯一记录；不记的话报告里只剩一句"通过了"。
+        self.live_detail: list = []
 
-    def result_for(self, name: str, call_id):
+    # ── §8.3 的另一条：日期注入 ─────────────────────────────────
+    def injected_date(self) -> str | None:
+        """`trace_epoch.injected_date_str`：`get_date` 回放时该返回的那一天。"""
+        epoch = (self.cassette.meta or {}).get("trace_epoch") or {}
+        return epoch.get("injected_date_str") or None
+
+    def recorded_text(self, call_id) -> str:
+        """录制的 `result_full`（缺失时退到 `result_stored`）。"""
+        rec = self.cassette.tool_result(call_id) or {}
+        full = rec.get("result_full")
+        return str(full if full is not None else (rec.get("result_stored") or ""))
+
+    def decision(self, name: str, call_id):
+        """这个调用该怎么供给：`LiveCall`（真执行，§8.3 的 B 类）或 **str**（要吐的内容）。
+
+        返回 str 而不是再包一层 dict：runner 那一侧的判定必须是"拿到文本"还是"拿到
+        一个要真跑的调用"，中间再加一层 `record|None` 只会让"没录到"和"要真跑"重新
+        长回同一个面孔（`None` 曾经就是这个坑）。
+        """
         rec = self.cassette.tool_result(call_id)
-        if rec is None:
-            return None
         try:
             cls = class_of(name)
         except UnclassifiedToolError:
-            cls = "?"
-        if self.policy == "class" and cls == "B":
-            return None  # B 类真执行（L2 overlay 负责隔离）
-        if self.policy == "class" and cls == "C" and os.environ.get("REPLAY_EXEC_C") != "1":
-            pass  # C 类默认吐录制结果
-        self.served.append({"call_id": call_id, "name": name, "class": cls})
-        return rec
+            # 未登记工具 fail-closed：真跑等于在"不知道有没有副作用"的前提下动工作区。
+            raise ReplayToolMissing(
+                f"回放遇到未登记在 TOOL_CLASS 的工具：{name!r}（call_id={call_id}）。"
+                f"请先登记类别 A/B/C 再回放。")
+        kind = "record"
+        if name == "get_date" and self.exec_date and self.injected_date():
+            kind = "injected_date"
+        elif name == "delegate_task":
+            # §8.3 另一条：子 agent 整体 stub——子树有自己的 trace，父侧只吐录制结果。
+            kind = "stub"
+        elif self.policy == "class" and cls == "B":
+            kind = "live"
+        elif self.policy == "class" and cls == "C" and self.exec_c:
+            kind = "live"
+        if kind == "live":
+            return LiveCall(name=name, call_id=call_id, cls=cls, kind=kind)
+        if rec is None:
+            raise ReplayToolMissing(
+                f"回放时遇到没有录制结果的工具调用：{name}({call_id})")
+        if kind == "injected_date":
+            # §8.3 另一条：日期按录制时的 meta 注入，不是吐 get_date 自己的录制结果——
+            # 录制结果里是"当时那一天"，而断言与提示词里引用的是注入日，两者必须同源。
+            return str(self.injected_date())
+        return self.recorded_text(call_id)
+
+    def result_for(self, name: str, call_id):
+        """回放侧取一次工具供给。真执行的调用返回 None（由 runner 去跑）。"""
+        d = self.decision(name, call_id)
+        self.served.append({"call_id": call_id, "name": name,
+                            "class": getattr(d, "cls", None),
+                            "kind": getattr(d, "kind", "record")})
+        if isinstance(d, LiveCall):
+            self.live.append({"call_id": call_id, "name": name, "class": d.cls})
+            return None
+        return {"call_id": call_id, "name": name,
+                "class": self.served[-1]["class"], "kind": self.served[-1]["kind"],
+                "result_full": d}
+
+    def wants_live(self, name: str, call_id) -> bool:
+        return isinstance(self.decision(name, call_id), LiveCall)
 
 
 class ReplaySession:
-    """一次回放的活动现场：transport + 工具供给 + 报告 + 事件收集。"""
+    """一次回放的活动现场：transport + 工具供给 + overlay + 报告 + 事件收集。
+
+    overlay 与工具供给**同生**：`policy="cassette"`（L1）时不建 overlay——那时没有任何
+    工具会真跑，建一个空目录副本只会让"回放没碰工作区"这件事变得需要额外证明。
+    """
 
     _active = None
 
     def __init__(self, cassette_dir, *, mode=None, strict=False, window=None,
-                 tool_policy="cassette", check_env=True, run_dir=None):
+                 tool_policy="cassette", check_env=True, run_dir=None,
+                 overlay_root=None, overlay_read=False, exec_c=False, keep_overlay=False,
+                 exec_date=False):
+        from . import overlay as overlay_mod
         self.report = ReplayReport(None, mode or "fingerprint", strict=strict)
         self.cassette = Cassette(cassette_dir, mode=mode, require_llm=True, check_env=check_env)
         self.report.cassette = self.cassette
@@ -872,13 +970,26 @@ class ReplaySession:
         self.transport = ReplayTransport(cassette_dir, mode=mode, strict=strict, window=window,
                                         cassette=self.cassette, report=self.report,
                                         check_env=check_env)
-        self.tools = ReplayToolBox(self.cassette, policy=tool_policy)
+        self.tools = ReplayToolBox(self.cassette, policy=tool_policy, exec_c=exec_c,
+                                   exec_date=exec_date)
         self.run_dir = run_dir
         self._prev_session = None
+        self.overlay = None
+        if tool_policy == "class":
+            sid = str(self.cassette.meta.get("session_id")
+                      or os.path.basename(os.path.abspath(cassette_dir)))
+            self.overlay = overlay_mod.Overlay(
+                sid, root=overlay_root, read_from_overlay=overlay_read, keep=keep_overlay)
+            self.tools.overlay = self.overlay
+        self.report.overlay = self.overlay
 
     # ── 工具供给（runner 侧调用）────────────────────────────────
     def tool_result(self, name, call_id):
         return self.tools.result_for(name, call_id)
+
+    def tool_decision(self, name, call_id):
+        """runner 侧：这个调用要吐内容还是真执行（真执行时带 overlay 里的改写入参）。"""
+        return self.tools.decision(name, call_id)
 
     # ── 生命周期 ─────────────────────────────────────────────────
     def __enter__(self):
@@ -887,12 +998,20 @@ class ReplaySession:
         ReplaySession._active = self
         # set_transport 返回旧值，还原时原样放回（None 表示"回到默认惰性构建"）
         self._prev_transport = llm_mod.set_transport(self.transport)
+        if self.overlay is not None:
+            # 副本按**录制入参**建（§8.1），不是按现场将要发起的调用建：现场调用可能
+            # 因为回放本身跑偏而完全不同，照着它拷会漏掉真正要重放的路径。
+            self.overlay.prepare(self.cassette)
         return self
 
     def __exit__(self, *exc):
         from . import llm as llm_mod
         llm_mod.set_transport(self._prev_transport)
         ReplaySession._active = self._prev_session
+        if self.overlay is not None and self.overlay.delete_on_exit:
+            # overlay 是**这次回放的**副作用现场，不留到下一次：残留会让下一次回放
+            # 从"上一次跑完的状态"起跑，隔离承诺和可复现性同时失效。
+            self.overlay.cleanup()
         return False
 
 
@@ -901,8 +1020,19 @@ def active_session():
     return ReplaySession._active
 
 
+def decision_for(name, call_id):
+    """runner 的钩子入口：回放中返回 `LiveCall`（真执行）或 `str`（要吐的内容）。
+
+    非回放返回 None。
+    """
+    s = active_session()
+    if s is None:
+        return None
+    return s.tool_decision(name, call_id)
+
+
 def tool_result_for(name, call_id):
-    """runner 的钩子入口：回放中返回录制结果，否则 None。"""
+    """兼容旧入口：回放中返回录制结果，否则 None。"""
     s = active_session()
     if s is None:
         return None
@@ -958,11 +1088,17 @@ def conversation_from_cassette(cassette, question=None):
 
 def run_replay(cassette_dir, *, chat_fn=None, question=None, conv=None, mode=None,
                strict=False, window=None, tool_policy="cassette", run_dir=None,
-               on_event=None, trace_level="assert", check_env=True) -> ReplayReport:
+               on_event=None, trace_level="assert", check_env=True,
+               overlay_root=None, overlay_read=False, exec_c=False, keep_overlay=False,
+               exec_date=False) -> ReplayReport:
     """跑一次完整回放并返回报告。
 
     现场自己带一个 trace writer：断言面必须从**这次回放**的事件流里读，而不是从
     cassette 里读——从 cassette 里读的话，"复现了"永远是自证的。
+
+    `tool_policy="class"` 打开 §8.3：A 吐录制、B 在 overlay 里真执行、C 吐录制
+    （`exec_c=True` 才真跑）。真执行只写 `tmp/overlay/<sid>/`，真实 WORK_DIR 的
+    mtime/sha256 不变（§8.1/§8.2）。
     """
     # 注意：`loop_agent_v2` 是仓库根的顶层模块（不是 loop_agent_core 的子模块），
     # 早先这里写成 `from . import loop_agent_v2` 会 ImportError，把回放的默认入口整条打断。
@@ -970,7 +1106,9 @@ def run_replay(cassette_dir, *, chat_fn=None, question=None, conv=None, mode=Non
     if chat_fn is None:
         chat_fn = loop_agent_v2.chat
     session = ReplaySession(cassette_dir, mode=mode, strict=strict, window=window,
-                            tool_policy=tool_policy, check_env=check_env, run_dir=run_dir)
+                            tool_policy=tool_policy, check_env=check_env, run_dir=run_dir,
+                            overlay_root=overlay_root, overlay_read=overlay_read,
+                            exec_c=exec_c, keep_overlay=keep_overlay, exec_date=exec_date)
     result = None
     writer = None
     rid = trace_mod.new_run_id("replay")
