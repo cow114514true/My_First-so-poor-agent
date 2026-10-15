@@ -18,7 +18,7 @@ import json
 import os
 import shutil
 import time
-from typing import Iterable
+from typing import Callable, Iterable
 
 from . import trace as trace_mod
 from .checkpoint import CheckpointStore
@@ -405,15 +405,22 @@ def verify_replay(cassette_dir: str, expected_assertion: str | None = None, *,
     return {"reproduced": bool(report.reproduced), "report": text, "reason": None}
 
 
-def extract_cassette(trace_dir: str, out_dir: str, *, from_request: int = 0,
-                     to_request: int | None = None, playback_mode: str = PLAYBACK_FINGERPRINT,
-                     derived_from: str | None = None, expected_assertion: str | None = None,
-                     workspace_root: str | None = None, force: bool = False,
-                     extra_degraded: Iterable[str] = ()) -> dict:
-    """把 trace 抽成 cassette。返回 cassette_meta。
+def slice_cassette(trace_dir: str, out_dir: str, *, from_request: int = 0,
+                   to_request: int | None = None, playback_mode: str = PLAYBACK_FINGERPRINT,
+                   derived_from: str | None = None, expected_assertion: str | None = None,
+                   workspace_root: str | None = None, force: bool = False,
+                   extra_degraded: Iterable[str] = (),
+                   before_publish: Callable[[str, dict], None] | None = None) -> dict:
+    """**纯切片**：只做事件筛选 + 写盘 + 返回 cassette_meta，**不做回放验证**。
 
-    抽取器**先写临时目录、全部成功后再原子换名**：半成品 cassette 比没有 cassette 更坏，
-    因为它看起来是完整的。
+    为什么要把它从 `extract_cassette` 里拆出来：L3 收缩（`tools/shrink.py`）每个候选都要
+    切一次 cassette。`extract_cassette` 自带 `verify_replay()`（§4.8），叠在收缩循环上就是
+    "每个候选回放两次"——`--max-replays` 预算当场废掉一半，而收缩的代价正好是回放次数。
+
+    `extract_cassette` = 本函数 + `verify_replay()`，行为一字不变。
+
+    仍然**先写临时目录、成功后再原子换名**：半成品 cassette 比没有 cassette 更坏，
+    因为它看起来是完整的。加载校验（`Cassette(...)`）保留——切片产物本身必须是可加载的。
     """
     trace_dir = os.path.abspath(trace_dir)
     out_dir = os.path.abspath(out_dir)
@@ -447,17 +454,13 @@ def extract_cassette(trace_dir: str, out_dir: str, *, from_request: int = 0,
         meta["checkpoint_count"] = n_snaps
         with open(os.path.join(tmp, CASSETTE_META), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
-        # 抽完立刻自检一遍：加载校验 + **真回放一次**（§4.8）。不合格就**不许**落到目标目录：
-        # 一份不能复现目标失败的 cassette 留在 fixtures 里，会被当成"已有证据"，比没有更坏。
+        # 切片产物至少要能加载：`Cassette` 会跑格式/工具面/canon_version 三重校验。
         Cassette(tmp, check_env=False)
-        check = verify_replay(tmp, expected_assertion)
-        if expected_assertion and check["reproduced"] is not True:
-            raise CassetteError(f"抽取的 cassette 未能复现 {expected_assertion}：{check['reason']}\n"
-                                f"{check['report']}")
-        meta["replay_check"] = {"reproduced": check["reproduced"], "reason": check["reason"]}
-        # meta.json 要重写一次：回放验证要能 load（先得有 meta.json），而验证结论又要进 meta
-        with open(os.path.join(tmp, CASSETTE_META), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+        # 发布前的可选闸：`extract_cassette` 用它在 **tmp 上**跑 `verify_replay()`，
+        # 不合格就抛错——于是"不合格的 cassette 绝不落到 out_dir"仍然成立，而且
+        # 目标目录里原有的 cassette 一个字节都不会被碰。本函数自己不做回放。
+        if before_publish is not None:
+            before_publish(tmp, meta)
         if os.path.exists(out_dir) and not _remove_tree(out_dir):
             raise CassetteError(
                 f"{out_dir} 清不掉（可能被其它进程占用），抽取中止："
@@ -471,6 +474,37 @@ def extract_cassette(trace_dir: str, out_dir: str, *, from_request: int = 0,
         _remove_tree(tmp)
         raise
     return meta
+
+
+def extract_cassette(trace_dir: str, out_dir: str, *, from_request: int = 0,
+                     to_request: int | None = None, playback_mode: str = PLAYBACK_FINGERPRINT,
+                     derived_from: str | None = None, expected_assertion: str | None = None,
+                     workspace_root: str | None = None, force: bool = False,
+                     extra_degraded: Iterable[str] = ()) -> dict:
+    """把 trace 抽成 cassette，**并立刻回放一次自检**（§4.8）。返回 cassette_meta。
+
+    就是 `slice_cassette()` + `verify_replay()`——拆开是为了让 L3 收缩能只切片不回放，
+    这里的行为与拆分前逐字一致：不合格的 cassette 绝不留在目标目录里，**目标目录里原有的
+    cassette 也不会被碰**（自检在临时目录上跑，通过了才换名）。
+    """
+
+    def _verify_before_publish(tmp: str, meta: dict) -> None:
+        # 抽完立刻自检一遍：**真回放一次**。不合格就**不许**发布：
+        # 一份不能复现目标失败的 cassette 留在 fixtures 里，会被当成"已有证据"，比没有更坏。
+        check = verify_replay(tmp, expected_assertion)
+        if expected_assertion and check["reproduced"] is not True:
+            raise CassetteError(f"抽取的 cassette 未能复现 {expected_assertion}：{check['reason']}\n"
+                                f"{check['report']}")
+        meta["replay_check"] = {"reproduced": check["reproduced"], "reason": check["reason"]}
+        # meta.json 要重写一次：回放验证要能 load（先得有 meta.json），验证结论又要进 meta。
+        with open(os.path.join(tmp, CASSETTE_META), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return slice_cassette(trace_dir, out_dir, from_request=from_request,
+                          to_request=to_request, playback_mode=playback_mode,
+                          derived_from=derived_from, expected_assertion=expected_assertion,
+                          workspace_root=workspace_root, force=force,
+                          extra_degraded=extra_degraded, before_publish=_verify_before_publish)
 
 
 # ── 加载与校验 ──────────────────────────────────────────────────────
