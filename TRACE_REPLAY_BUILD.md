@@ -523,6 +523,25 @@ def test(candidate) -> "FAIL" | "PASS" | "UNRESOLVED"
 # FAIL 的条件：回放后 assert 级事件序列中出现 candidate.expected_assertion 对应的 id
 ```
 
+判等**严格照抄回放器的成员判定**：id 由 `trace.assertion_id()` / `trace.assertion_ids()`
+派生，成员判定用 `exp in assertion_ids`（与 `replay.py` 的 `ReplayReport.finalize()` 同一
+写法）。收缩器里不长出第二套 id 口径——两套口径就是两个「同一个失败」的定义。
+
+三态口径：
+
+- `FAIL`：目标 id 在序列里。
+- `PASS`：目标 id 不在。**出现另一个失败 id 也判 `PASS`**，不是 `UNRESOLVED`：断言 id 只由
+  `reason` 字符串决定（§16.7），一次**不同**的失败若恰好同 reason 会被误判成同一个失败，
+  所以「换了个失败」必须保守地当成「没复现」——否则收缩器会把 bug A 的现场缩成 bug B 的
+  现场。换成了哪个 id 记进报告的 `substituted_assertion`，只记录、不做别的动作。同理
+  **不引入概率判据**（「跑 N 次里有 M 次失败就算失败诱导」）：那会让「大多数时候报另一个
+  reason」的候选被接受，是把单次静默变成统计静默。
+- `UNRESOLVED`：只有两个来源，且不能扩展——① 超时；② 确定性护栏（同一个候选连跑两次、
+  断言签名不一致）。按 delta debugging 原义，`UNRESOLVED` **当 `PASS` 处理**：保守拒绝该
+  候选、继续删。超时必须是**独立状态**，不能与「没复现」共用一条代码路径——两者都会导致
+  「这个候选不要」，但一个是判据不足（预算/环境），一个是判据完整（现场真的不在了），
+  混在一起以后就再也分不出是收缩器在保守还是回放器在坏。`--runs` 只服务第 ② 条，不参与判等。
+
 输出口径：`1-minimal`（删去任一剩余单元即不再 FAIL）。
 
 ### 7.2 两阶段 ddmin
@@ -535,7 +554,10 @@ c2    = ddmin(c1,       units=history_groups, test=FAIL_same_assertion,
 ```
 
 - 阶段 1 单元 = 用户轮；阶段 2 单元 = `_find_groups()` 的组（`context.py:28-51`）。
-- 单元固定项：首轮、含失败断言的轮、全部 assert 级控制流事件。
+- 单元固定项：首轮、含失败断言的轮、全部 assert 级控制流事件。实现上靠**结构**保证：删除单元只覆盖可删载荷事件（`llm_request` / `llm_chunk` / `llm_end` / `token_usage` / `tool_call` / `tool_result`），控制流事件不进任何单元，于是「永不删」不需要额外判据。
+- 分层删：轮单元之下再切出响应包（一次请求的 `llm_request` 到 `llm_end`）与工具包（`tool_call` 与配对的 `tool_result`），先删大块再细分。
+- 依赖保持：`tool_result` 不能在没有对应 `tool_call` 时存活、反之亦然。回放前先做投影校验，不合法的候选直接判 `PASS` 且**不花回放预算**——否则回放器会以 `ReplayToolMissing` / 漂移拒掉，等于白烧一次预算。
+- **本轮只实现阶段 1（轮级 ddmin）**。阶段 2 的单元从「对话态」派生，而把事件流重建成对话态的 converter 不存在；硬凑一份等于自己发明历史语义，缩出来的 cassette 就没法和真实回放对上。接口留在 `tools/shrink.py` 的 `history_group_units()`，接上去之前先写 converter，再用 `spine_guard()` 做守卫。
 - 阶段 2 守卫：候选的响应序列相对 `spine` 只允许减少或保持，出现新增或重排即判该候选无效；响应数减少时记入报告。
 - 收缩后 checkpoint 的 B 组状态按新序列重算并覆盖源快照值。
 
@@ -543,6 +565,10 @@ c2    = ddmin(c1,       units=history_groups, test=FAIL_same_assertion,
 
 - 重放次数上限 `--max-replays`（默认 500）。耗尽时输出 `"converged": false` 与当前最优候选。
 - 报告字段：`cassette` / `units` / `replays` / `converged` / `result`（`1-minimal`）/ `expected_assertion` / `response_count_before` / `response_count_after` / `calls_before` / `calls_after` / `skipped_units`。
+- 另加三栏，各自解决一个「读报告时问不出口」的问题：
+  - `unconsumed`：录制了但回放中**从未被消费**的事件清单。收缩过程里它就是死代码清单——一条响应从没被取走，说明它对这次现场没有贡献；ddmin 要靠反复试删才得到的结论，这里一眼能读。空表示每条录制事件都被消费过。
+  - `critical_elements`：少了它就复现不了的那几个元素。比「删掉了什么」好读：删掉的可能几十条，决定失败的就那么几个。固定项（首轮、含失败断言的轮、控制流/断言面事件）也一并列出来，读的人才知道哪些是判据、哪些是没试过。
+  - `substituted_assertion`：`PASS` 时换成了哪个 id（§7.1）。为 `null` 表示没换、或这个候选压根没跑到断言面。
 - 导出：产出新 cassette，`playback_mode` 置 `"positional"`，`derived_from` 填源 trace 标识 + 本次 shrink 记录，`expected_assertion` 填失败 id。
 - 词表或 `cassette_format` 升级时提供 converter；`expected_assertion` 无法解析时抛错并列出待迁移 id。
 
@@ -679,3 +705,4 @@ python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>
 | 4 | 存储格式 | 自研 JSONL；OTEL 作为派生视图 `python -m tools.trace export --format otel`，不进 L0 存储层（§4.1） |
 | 5 | L3 导出粒度 | 一个 fixture 一个失败轮次、一个 `expected_assertion`（§7.4） |
 | 6 | 脱敏口径 | L1 抹密钥类，写入时始终开启（不是选项）；入库判据是「bug 与正文无关」（换掉输入仍复现），靠**录制源头用合成输入**保证，不靠事后抹正文——事后抹会改掉请求指纹，回放找不到那个请求；必须原样重放的现场不入库（§8.4） |
+| 7 | L3 谓词与报告口径 | 三态 `FAIL` / `PASS` / `UNRESOLVED`：判等照抄回放器的 `exp in assertion_ids`；「换了个失败」判 `PASS` 并记 `substituted_assertion`；`UNRESOLVED` 只有超时与确定性护栏两个来源、按 delta debugging 原义当 `PASS`，超时是独立状态；不引入概率判据。报告另加 `unconsumed` / `critical_elements` / `substituted_assertion` 三栏。本轮只实现阶段 1（轮级），阶段 2 留 `history_group_units()` 接口（§7.1、§7.2、§7.3） |
