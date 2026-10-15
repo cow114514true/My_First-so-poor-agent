@@ -765,3 +765,70 @@ python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>
 | 6 | 脱敏口径 | L1 抹密钥类，写入时始终开启（不是选项）；入库判据是「bug 与正文无关」（换掉输入仍复现），靠**录制源头用合成输入**保证，不靠事后抹正文——事后抹会改掉请求指纹，回放找不到那个请求；必须原样重放的现场不入库（§8.4） |
 | 7 | L3 谓词与报告口径 | 三态 `FAIL` / `PASS` / `UNRESOLVED`：判等照抄回放器的 `exp in assertion_ids`；「换了个失败」判 `PASS` 并记 `substituted_assertion`；`UNRESOLVED` 只有超时与确定性护栏两个来源、按 delta debugging 原义当 `PASS`，超时是独立状态；不引入概率判据。报告另加 `unconsumed` / `critical_elements` / `substituted_assertion` 三栏。本轮只实现阶段 1（轮级），阶段 2 留 `history_group_units()` 接口（§7.1、§7.2、§7.3） |
 | 8 | 生产开录的开关、边界与保留策略 | 开关是单一判据 `TRACE_ENABLED`（`1` / `true` / `yes` / `on` / `strict`），只在会话起点求值一次，中途不改主意；档位仍归 `TRACE_LEVEL`；一次会话 = 一次进程级入口运行（TUI 取 `AgentTUI.run()`、CLI 取 `__main__` 输入循环），不取 `chat()`——`request_index` 要跨轮只增；收尾走 `try/finally` 且不外抛；失败现场（`tool_error:*` / `exception:*` / `turn_end:reason=<非 answer/interrupted>`）记 `retention=failure` 默认保留，正常会话记 `normal` 由 `python -m tools.trace clean --older-than 30d` 清，清失败现场要显式 `--include-failures`（§4.10、§4.9） |
+| 9 | thinking-only 重试的口径 | 预算 3 次、**先判后加**：饱和后不再发第 4 次请求，在两处循环顶（主循环与收尾段）提前返回，守卫位于 `_prep_context` / `_checkpoint` **之前**（那两处会为一次并不存在的请求推进 `request_index`）；每轮注入 nudge 前先把该轮思考存成一条 assistant 消息（`reasoning:: …`），nudge 独立成条、**不改写用户原话**（§3.x 落点为 `runner.py` 的 `_append_thinking_turn` / `_nudge_is_last`） |
+| 10 | `request_index` 的单调性 | 轮号与请求号是两件事：`set_tool_round()` **不清零** `request_index`，否则轮级事件（`notice` / `turn_end` / `checkpoint`）退回 `0`，`validate_events()` 会报 `request_index 回退`，回放侧也找不到归属。请求号只由 `writer.begin_request` 分配，跨轮只增（§4.5） |
+| 11 | L3 的轮级删除空间 | 轮级 ddmin 的空间由**源现场的请求条数**决定：`positional_stuck` 只有 3 条响应，且 3 条都是「预算耗尽的证据」——只留 2 条时 `_empty_retries` 到不了预算，`reason=stuck` 那条饱和分支根本不会触发（§7.1 的 `FAIL` 判据是成员判定，见 §7.4）。要拿到「真删成功」的证据需要一份**多用户轮**的真现场 |
+
+---
+
+## 11. 实施状态（交接）
+
+本节只记录**文档之外的现实**：哪些已经落地、用什么验证过、还欠什么。规格本身以 §3–§8 为准，本节不重复。
+
+### 11.1 各阶段落地情况
+
+| 阶段 | 交付物 | 状态 | 验证 |
+|---|---|---|---|
+| 0 | `llm.py` 网关、`toolclass.py`、断言 id 词表 | 已落地 | `tests/test_trace.py` |
+| 1 | `trace.py` / `checkpoint.py` / `cassette.py` / `tools/trace.py` | 已落地 | `tests/test_trace.py`（35 条）、`tests/test_replay.py`、`tests/test_compaction.py` |
+| 1 | 生产开录（§4.10） | 已落地 | `tests/test_prod_recording.py`（10 条，含真 TUI / CLI 入口子进程、开关关闭不产生字节、失败现场保留） |
+| 2 | `tools/trace_migrate.py` | 已落地 | 真语料全量跑过：`conversations/` 过滤后 **108 份会话 / 417 个用户轮 / 1107 次工具调用**；`tests/test_migrate.py`（14 条） |
+| 3 | `replay.py` 指纹与游标 | 已落地 | `tests/test_replay.py`（48 条） |
+| 4 | L2 overlay 与工具策略 | 已落地 | `tests/test_replay.py` 的 `test_fixture_l2_file_ops_replays_into_overlay`（真录制轨迹，不猴补 `write_file`）、`test_overlay_*` 合成用例 |
+| 5 | `tools/shrink.py` | 阶段 1（轮级）已落地 | `tests/test_shrink.py`（11 条）；阶段 2 只留 `history_group_units()` 接口 |
+
+### 11.2 入库 fixture（`tests/fixtures/replay/`）
+
+| 名字 | 模式 | 内容 | 用途 |
+|---|---|---|---|
+| `fingerprint_tool_round` | `fingerprint` | 单次 `get_date` 工具轮 | 指纹匹配与工具结果的基本现场 |
+| `positional_stuck` | `positional` | 3 条响应（thinking-only 预算耗尽的证据），`expected_assertion=turn_end:reason=stuck` | 唯一「失败可复现」的现场，L3 的唯一真实输入 |
+| `l2_file_ops` | `fingerprint` | `write_file`（B 类）+ `read_file`（A 类）+ `search_code`（递归扫描） | L2 三类重写的真覆盖 |
+
+`tests/fixtures/replay/_regenerate.py` 是这三份 fixture 的**同源闸门**：重录只写 `tmp/`，`--check` 不写盘。改了 `runner.py` 的请求形状后，`tests/test_replay.py:test_committed_fixtures_are_regenerable_and_drift_is_caught` 会按设计报警，确认是预期改动后重录即可。**换检出目录会误报**（`meta.json` 里写死绝对 `workspace_root`），所以不要在 `git worktree` 里跑套件。
+
+### 11.3 已知欠账
+
+1. **`--shareable` 名不副实**：`tools/trace.py` 的 `cmd_export` 有这个参数但完全没接线，只做 `--format otel|json` 派生视图。按 §8.4 的新口径，它要么做成诚实的最小版本（抹 URL query / 路径 / 用户名并在 meta 标 `redacted`，明确不做正文语义脱敏、且承认脱敏后不可回放），要么把参数删掉。
+2. **CLI 层与真 fixture 之间没有用例**：`tests/test_replay.py:test_cli_replay_overlay_flags` 用的是合成 cassette，只证明 CLI 参数透传到 `ReplaySession`。风险有限（`cmd_replay` 只是透传五个参数）。
+3. **回放匹配器是否改成按签名分桶的 FIFO 游标**：待拍板。收益大（支持代码合法地增删/重排调用），但动的是已入库的回放核心。
+4. **L3 的「真删成功」证据很薄**：唯一真现场 0 删除，而这是**真结论不是没试到**（见 §10 已定项 11）。轮级 ddmin 真删成功、`repatch_b_group` 在删除后重算 B 组、`unconsumed` 非空这三条路径**从未被真跑过**——要拿到它们，得造一份**多用户轮**的真现场。
+5. **L3 报告里 `replays` 与 `derived_from` 的数字不一致**（一个含导出后复核、一个不含），待统一。
+6. **`tools/trace.py` 的汇总行打印「请求 ? 条」**：cassette 的 `meta.json` 没有 `request_count` 键，纯显示问题。
+7. **生产路径的真实条件未验证**：真实网络 / 真 key、真 TTY、真 Ctrl-C 信号、`TRACE_LEVEL=stream` 落在生产入口、30 天保留期、>5MB 告警——只跑过假 transport + headless。
+
+### 11.4 这套工具的「上战场」记录
+
+唯一一次拿它排查真问题的记录（2026-10-15）：`debug_filtered.txt` 里那条 `turn_end:stuck / retries=4 / reasoning=我再想想`，用 `TRACE_ENABLED=1` + 真 `chat()` 入口录下来（只换假 transport，因为本地 LLM 未起、不许触网），trace 一次给出三件手工留痕给不了的事实：
+
+1. nudge 被拼进末条 user（四轮 `msgs=2`、`bytes` 122 → 292 → 462 → 632），用户原话被逐轮改写；
+2. `llm_request` 4 次而 `thinking_only_retry` 只有 3 条——`+= 1` 写在 `<= 3` 之前，第 4 次请求已经发出去了；
+3. `validate_events()` 报 `request_index 回退：3 → 0`——`set_tool_round()` 清零了请求号。
+
+三条都已修并补了回归用例（§10 已定项 9、10）。**这次现场没有入库**（`tmp/_probe_stuck/`，一个真 token 都没有），只作诊断材料。
+
+### 11.5 怎么验证
+
+```bash
+# 全套件（唯一权威清单在 run_tests.py 的 SUITES，当前 15 项）
+DS_KEY=sk-selftest-not-a-real-key python run_tests.py
+
+# 单份现场：抽取 → 回放
+python -m tools.trace extract-cassette tmp/traces/<sid> --out tmp/cas/<name>
+python -m tools.trace replay tmp/cas/<name> --question "<原问题>"
+
+# 生产开录
+TRACE_ENABLED=1 python loop_agent_v2.py
+```
+
+两处环境坑：`os.makedirs(path, mode=0o700)` 在 Windows 上会把目录建成**自己都进不去**（`harden_dir` 已改成不传 mode）；`pwsh` 的 `Set-Content` / `>` 按 cp936 落盘会毁掉 UTF-8 中文，写文件用 `[System.IO.File]::WriteAllText(path, text, [System.Text.UTF8Encoding]::new($false))`。
