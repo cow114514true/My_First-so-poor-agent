@@ -101,7 +101,7 @@ python run_tests.py      # 逐套件起子进程跑，退出码非 0 = 有失败
   4. 回放匹配器是否改成「按签名分桶的 FIFO 游标」（支持代码合法地增删/重排调用）待拍板；动的是已入库的回放核心。
   5. L3 报告里 `replays`（含导出后复核）与 `derived_from` 里记的数字不一致。
   6. `tools/trace.py` 的汇总行打印「请求 ? 条」：cassette 的 `meta.json` 没有 `request_count` 键，纯显示问题。
-  7. 生产的真实条件未验证：真网络 / 真 key、真 TTY、真 Ctrl-C、`TRACE_LEVEL=stream` 落在生产入口、30 天保留期、>5MB 告警——只跑过假 transport + headless。
+  7. 生产的真实条件**部分**已验证：`TRACE_LEVEL=stream` 落在生产入口（`test_stream_level_is_honoured_at_production_entry`，真 CLI 入口断言 `response_chunk` 落盘）、TUI 的 Esc 中断（`test_tui_escape_interrupts_agent_and_closes_trace`，慢流后端里按键 → `turn_end:reason=interrupted`）、CLI 的 Ctrl-C（`test_ctrl_c_still_closes_as_interrupted`）三条已覆盖。**仍未验**：真网络 / 真 key、真 TTY（全是 headless 驱动）、30 天保留期、>5MB 告警。Esc 用例里两处 headless 专属的坑写在了启动器注释里（进程级 `interrupt_event` 会从前一次会话漏进来，得自己清；焦点在 TextArea 时 escape 不冒泡到 App 绑定，故先试 `pilot.press` 再直接调绑定动作）。
 - 唯一一次拿它排查真问题的记录：`debug_filtered.txt` 里那条 `turn_end:stuck / retries=4 / reasoning=我再想想`。开录后 trace 一次给出三件手工留痕给不了的事实——nudge 被拼进末条 user（四轮 `msgs=2`、字节数 122 → 292 → 462 → 632，用户原话被逐轮改写）、`llm_request` 4 次而 `thinking_only_retry` 只有 3 条（计数先加后判，第 4 次请求已经发出去）、`validate_events()` 报 `request_index 回退：3 → 0`（`set_tool_round()` 清零了请求号）。三条都已修并补了回归用例。那条现场**未入库**（`tmp/_probe_stuck/`，一个真 token 都没有），只作诊断材料。
 - CONTENT：本文件不存放施工细节，只放下个会话必需的坐标与欠账；规格一律查 `TRACE_REPLAY_BUILD.md`。
 
