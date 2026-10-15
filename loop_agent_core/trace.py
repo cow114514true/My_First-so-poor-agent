@@ -1083,8 +1083,17 @@ def begin_turn(turn=0, session="") -> TraceContext:
 
 
 def set_tool_round(n: int) -> TraceContext:
-    """推进工具轮号（每个工具轮的动作事件都挂在它下面）。"""
-    ctx = current_context().evolve(tool_round=n, request_index=0)
+    """推进工具轮号（每个工具轮的动作事件都挂在它下面）。
+
+    **不清零 request_index**：这里推进的是轮号，不是请求号。原来的
+    `evolve(tool_round=n, request_index=0)` 会让轮内"还没发出请求"的轮级事件
+    （notice / turn_end / checkpoint）退回 0，而 0 早被上一个请求占用了——
+    `validate_events` 立刻报 `request_index 回退：3 → 0`，且这些事件在回放侧
+    找不到归属。真正的请求号由 `writer.begin_request` 分配（只增、跨轮），
+    清零纯属误伤。实测证据：`tmp/_probe_stuck/`（thinking-only 预算用尽、
+    提前返回那条 `notice:warn:stuck` 挂 0，紧邻的 `turn_end` 也是 0）。
+    """
+    ctx = current_context().evolve(tool_round=n)
     set_context(ctx)
     return ctx
 
