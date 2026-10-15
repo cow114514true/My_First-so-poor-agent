@@ -742,11 +742,16 @@ def _record_write(name, rel, content, marker="[LIVE]"):
     return rec
 
 
-def _replay_class(cass_dir, name="l2-rep", *, overlay_read=False, keep=False):
+def _replay_class(cass_dir, name="l2-rep", *, overlay_read=False, keep=False, stub_write=True):
     """L2 回放：`tool_policy="class"`，B 类入 overlay 真执行。
 
     `keep=True` 让 overlay 在这次回放后**留一会儿**（`keep_overlay`），用完自己删：
     overlay 按设计是"本次回放的副作用现场"，跑完就清（§8.1），要在里面取样就得先留住它。
+
+    `stub_write=False` 时不猴补 `write_file`，直接用真工具。合成的 L2 用例需要
+    `_L2Fn` 那个 `[LIVE]` 标记来证明"真执行的是我装的这个函数"；但**真录的 fixture**
+    是用真 `write_file_mock` 录出来的，它的返回文案（`Overwritten …` + 自查 diff）进了
+    请求指纹，换成标记文本的第一个请求就配不上。
     """
     from loop_agent_core import confirm
     run_dir = _fresh_dir(_TRACE_ROOT, name)
@@ -759,7 +764,8 @@ def _replay_class(cass_dir, name="l2-rep", *, overlay_read=False, keep=False):
     ov_root = os.path.join(ROOT, "tmp", "overlay", f"l2-{name}")
     shutil.rmtree(ov_root, ignore_errors=True)
     confirm.set_policy("allow_all")
-    la.TOOL_CALL_MAP["write_file"] = _L2Fn("[LIVE]")
+    if stub_write:
+        la.TOOL_CALL_MAP["write_file"] = _L2Fn("[LIVE]")
     try:
         rep = replay.run_replay(cass_dir, question=None, conv=_new_conv(os.path.basename(run_dir)),
                                 run_dir=run_dir, tool_policy="class", check_env=False,
@@ -903,7 +909,9 @@ def test_overlay_path_mapping_round_trip():
         logical = os.path.join(ROOT, "tmp", "a", "b.py")
         inside = ov.to_overlay(logical)
         assert inside.startswith(ov.root), inside
-        assert ov.to_logical(inside) == logical, ov.to_logical(inside)
+        # `to_logical` 给的是**相对逻辑路径**（§8.1：overlay 就是 WORK_DIR 的目录副本，
+        # 映射关系是"相对结构原样保留"）；绝对路径形态由 `reverse_text` 还原。
+        assert ov.to_logical(inside) == os.path.relpath(logical, ROOT), ov.to_logical(inside)
         # 出参里的 overlay 路径必须换回逻辑路径（写进会话历史前）
         text = f"Written 12 bytes to {inside}\n"
         assert ov.reverse_text(text) == f"Written 12 bytes to {logical}\n"
@@ -1336,7 +1344,7 @@ def test_committed_fixtures_are_regenerable_and_drift_is_caught():
 
 def test_fixture_is_self_describing():
     """fixture 的 meta 必须是自洽的：模式/完整度/断言面/检查结果都在。"""
-    for name in ("fingerprint_tool_round", "positional_stuck"):
+    for name in ("fingerprint_tool_round", "positional_stuck", "l2_file_ops"):
         cas = cassette_mod.Cassette(_fixture(name), check_env=False)
         meta = cas.meta
         assert meta["cassette_format"] == cassette_mod.CASSETTE_FORMAT
@@ -1351,6 +1359,124 @@ def test_fixture_is_self_describing():
         store = cas.store()
         for req in cas.requests:
             assert store.keys_for_request(req["request_index"]), req["request_index"]
+
+
+# ── L2 入库 fixture：真录制轨迹 + overlay（§8）────────────────────
+_L2FIX = "l2_file_ops"
+_L2FIX_MARKER = "l2fileops-marker-9f3a"
+
+
+def test_fixture_l2_file_ops_replays_into_overlay():
+    """真录的 L2 现场：B 类真执行只落 overlay，A 类跨类重读命中，递归扫描重写根。
+
+    这是**唯一**一条覆盖"真录制轨迹 + L2"的用例：此前 L2 只有合成用例，它们能证明
+    "我按我以为的方式拼了参数"，证明不了"真录下来的轨迹在真回放下仍然对得上"。
+
+    五个机制各钉一条：
+    1. 真 cassette 走指纹回放仍然全部命中（顺带验了"真 trace → extract_cassette →
+       回放"这条线，此前只有合成 `_record` 走过）；
+    2. B 类 `write_file` 在 overlay 里真写，真实 `tmp/_l2fix_work/` 整棵树回放前后
+       逐文件 sha256/size 不变（§9 #26）；
+    3. A 类 `read_file` 从 overlay 读到刚写进去的内容（§8.2.3 跨类重读）；
+    4. `search_code` 在真实目录不存在的情况下仍能搜到那个标记 —— 它只可能搜的是
+       重写后的 overlay 根（§9 #35），且出参里的路径已被反向映射回逻辑路径（§8.2.2）；
+    5. 录制入参在会话历史里仍是逻辑路径（§8.2.1：重写只作用于执行用的副本）。
+
+    关于起点：录制由 `_regenerate._seed_l2_work()` 建出"写之前就有一个旧文件"的状态，
+    这里**不能**把这个目录删掉。`write_file_mock` 的返回文案随"之前有没有这个文件"变
+    （`Written` vs `Overwritten`），这条消息进请求指纹；而 `extract_cassette` 内建的自检
+    回放是在录制结束、真实目录仍在的情况下跑的。用例若改了起点，第一个请求就配不上
+    （现场实测：`NoMatchInWindow: 滑窗 [1, 9] 内没有匹配的录制请求`）。
+    所以这里保持与录制同源的起点，隔离性改由"回放前后真实工作区一字不动"来证明。
+    """
+    import hashlib
+
+    def _snap(root):
+        out = {}
+        for dp, _dn, fn in os.walk(root):
+            for f in fn:
+                fp = os.path.join(dp, f)
+                with open(fp, "rb") as fh:
+                    out[os.path.relpath(fp, root)] = (
+                        os.path.getsize(fp), hashlib.sha256(fh.read()).hexdigest())
+        return out
+
+    cass = _fixture(_L2FIX)
+    cas = cassette_mod.Cassette(cass, check_env=False)
+    assert cas.meta["playback_mode"] == "fingerprint"
+    assert cas.meta["completeness"]["llm"] == "full", cas.meta["completeness"]
+    assert cas.expected_assertion() == "turn_end:reason=answer"
+    # 这条 cassette 是**真**录的：meta 里带 workspace_root，且三个工具都是一等公民
+    assert cas.meta.get("workspace_root"), "真录的 cassette 必须记 workspace_root"
+    assert {"write_file", "read_file", "search_code"} <= {c["name"] for c in cas.tool_calls()}
+
+    real_work = os.path.join(ROOT, "tmp", "_l2fix_work")
+    # 必须**无条件**铺录制起点，不能只在文件缺失时铺。理由是反直觉的：录制起点
+    # 不是"文件在不在"，而是文件里写着什么。`_regenerate.py` 的漂移闸门会重录这条
+    # fixture，重录时 `write_file_mock` 会把 `L2_CONTENT` 真的写进 `tmp/_l2fix_work/out.txt`
+    # ——文件还在，内容已经是"写完之后的"。此时若跳过播种，`prepare()` 就把这份新内容
+    # 拷进 overlay，真执行看到"内容没变"、出参回 `[diff for self-check] no textual change`，
+    # 与录制的 `@@ -1 +1,3 @@` 对不上，第一个请求就报 `NoMatchInWindow`（实测就是这条
+    # 把套件里唯一那条真 fixture 用例弄红的）。播种后 overlay 里是真旧文件，两边都走
+    # `Overwritten` + 同一段 diff，指纹才配得上。
+    sys.path.insert(0, os.path.dirname(_fixture(_L2FIX)))
+    try:
+        import _regenerate as _regen
+        _regen._seed_l2_work()
+    finally:
+        sys.path.pop(0)
+    assert os.path.isfile(os.path.join(real_work, "out.txt")), f"录制起点铺不出来：{real_work}"
+    before = _snap(real_work)
+    rep = None
+    try:
+        rep = _replay_class(cass, name="l2fix", overlay_read=True, keep=True, stub_write=False)
+        ov_root = _L2_SEEN["overlay_root"]
+        text = rep.text()
+
+        # 1. 真 trace 的指纹回放真的全中了（不是靠窗口硬凑）
+        assert rep.reproduced, text
+        assert rep.skips_count == 0, text
+        assert len(rep.matches) == cas.request_count(), (rep.matches, cas.request_count())
+
+        # 2. §9 #26：真实工作区逐文件 sha256/size 一字不变（B 类真执行只落 overlay）
+        assert _snap(real_work) == before, \
+            f"L2 回放动了真实工作区：{real_work} 的内容变了"
+
+        # 3. overlay 树结构对：只镜像被触碰的逻辑路径，且内容是这次真写进去的那份
+        inner = os.path.join(rep.overlay.root, "tmp", "_l2fix_work", "out.txt")
+        assert os.path.isfile(inner), f"overlay 里没有这次真写的文件：{inner}"
+        with open(inner, encoding="utf-8") as f:
+            assert _L2FIX_MARKER in f.read(), "overlay 里的不是这次写入的内容"
+
+        # 2b/3b. 逐条查回放 trace：谁真跑了、重写成了什么、A 类有没有回读 overlay
+        events = [e for e in trace.read_events(_LAST_RUN["dir"]) if e.get("type") == "tool_call"]
+        by_id = {e["call_id"]: e for e in events}
+        assert set(by_id) == {"l2w", "l2r", "l2s"}, sorted(by_id)
+        live = [cid for cid, e in by_id.items() if e.get("overlay")]
+        assert live == ["l2w", "l2r"], f"真执行的调用集合不对：{live}"
+        # 逻辑入参必须原样留在历史里（§8.2.1）——重写只发生在执行用的副本上
+        for cid, logical in (("l2w", "tmp/_l2fix_work/out.txt"),
+                             ("l2r", "tmp/_l2fix_work/out.txt"),
+                             ("l2s", "tmp/_l2fix_work")):
+            assert by_id[cid]["arguments"]["path"] == logical, (cid, by_id[cid]["arguments"])
+            assert by_id[cid]["rewrite"] == "structured", (cid, by_id[cid]["rewrite"])
+        assert by_id["l2w"]["overlay"]["written"]["path"] == inner, by_id["l2w"]["overlay"]
+        assert by_id["l2r"]["overlay"]["rewrite_detail"] == "structured:path", by_id["l2r"]["overlay"]
+        assert by_id["l2s"].get("overlay") is None, "A 类按设计不回吐录制结果之外的东西"
+        reads = [(n, p) for n, p, _hit in rep.overlay.reads_from_overlay]
+        assert ("read_file", "tmp/_l2fix_work/out.txt") in reads, reads
+        assert ("write_file", "l2w") in [(n, c) for c, n in rep.overlay.live_calls]
+
+        # 4. 真执行写的是 overlay，录到的却是"搜得到标记"：只可能是重写后的 overlay 根（§9 #35）
+        srec = cas.tool_result("l2s") or {}
+        assert _L2FIX_MARKER in str(srec.get("result_full") or ""), srec.get("result_full")
+        assert "tmp\\overlay" not in json.dumps(srec, ensure_ascii=False), \
+            "录制结果的出参里漏出了 overlay 路径（反向映射没做）"
+    finally:
+        if rep is not None and getattr(rep, "overlay", None) is not None:
+            rep.overlay.cleanup(force=True)
+        shutil.rmtree(_L2_SEEN.get("overlay_root") or "", ignore_errors=True)
+        shutil.rmtree(real_work, ignore_errors=True)
 
 
 # ── 合成 cassette（不经过录制）────────────────────────────────────

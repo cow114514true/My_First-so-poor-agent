@@ -118,22 +118,50 @@ class Overlay:
             return path
         return os.path.normpath(os.path.join(self.root, rel))
 
-    def to_logical(self, path: str) -> str:
-        """overlay 内路径 → 逻辑路径（反向映射，§8.2.2）。"""
+    def _strip_prefix(self, path: str):
+        """把 overlay 根或 WORK_DIR 前缀换成逻辑相对路径；不在其下则原样返回。
+
+        两条前缀都要认，因为回放里两种写法会同时出现：B 类工具是在 overlay 里跑的
+        （出参里是 overlay 绝对路径），但工具也可能把"入参那条逻辑路径"拼成 WORK_DIR
+        绝对路径之后再回显。只认 overlay 那条，第二种就会在会话历史里留下一串本机
+        绝对路径，与录制期存的对不上（实测就是这条让真录 fixture 的 `NoMatchInWindow`
+        卡在第二个请求上）。
+
+        `_path_variants` 的 `/` 变体只做纯文本替换，所以切完先用 `_under` 复核：
+        否则 `/` 分隔的"恰好同前缀的别的目录"会被误切，切出来的相对路径还可能带 `..`。
+        """
         p = str(path)
         for variant in _path_variants(self.root):
             if variant in p:
                 rest = p.split(variant, 1)[1].lstrip("\\/")
-                return os.path.normpath(os.path.join(self.workspace, rest))
+                cand = os.path.abspath(os.path.join(self.root, rest))
+                if _under(cand, self.root):
+                    return os.path.relpath(cand, self.root)
+        for variant in _path_variants(self.workspace):
+            if variant in p:
+                rest = p.split(variant, 1)[1].lstrip("\\/")
+                if rest:
+                    cand = os.path.abspath(os.path.join(self.workspace, rest))
+                    if _under(cand, self.workspace):
+                        return os.path.relpath(cand, self.workspace)
         return p
+
+    def to_logical(self, path: str) -> str:
+        """overlay 内路径 → 逻辑相对路径（反向映射，§8.2.2）。"""
+        rel = self._strip_prefix(path)
+        return rel if rel != str(path) else str(path)
 
     def reverse_text(self, text: str) -> str:
         """把一段文本里的 overlay 根换回真实 WORK_DIR（工具出参用）。
 
-        先换 `/` 写法再换 `\\` 写法：`\\` 那条会把 `/` 写法的前缀也顺带吃掉一部分
-        （`_path_variants` 的两个变体只在分隔符上不同），反过来先换 `/` 两种都能干净落地。
-        换完把文本里剩下的 `/` 归一成 WORK_DIR 的原生分隔符——这里处理的是一段**路径文本**
-        （出参里那一行），归一让会话历史里不出现 `C:\\...\\agent/tmp/a/b.py` 这种混合写法。
+        换回的是 **WORK_DIR 绝对路径**，不是相对路径：录制期工具出参里本就是"入参那条
+        逻辑相对路径被 `_resolve_path` 拼成 WORK_DIR 绝对路径"的样子。会话历史两边必须
+        是同一形态，否则真录 fixture 的指纹在第二个请求上就配不上（实测 `NoMatchInWindow`）。
+
+        `_path_variants` 的两个变体只在分隔符上不同，而 `\\` 那条会把 `/` 写法的前缀
+        顺带吃掉一部分，所以**先换 `/` 再换 `\\`**。换完把文本里剩下的 `/` 归一成 WORK_DIR
+        的原生分隔符——这里处理的是一段**路径文本**（出参里那一行），归一让会话历史里
+        不出现 `C:\\...\\agent/tmp/a/b.py` 这种混合写法。
         """
         if not isinstance(text, str) or not text:
             return text
