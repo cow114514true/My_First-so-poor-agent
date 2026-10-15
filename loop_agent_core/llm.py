@@ -515,10 +515,12 @@ class LLM:
             resp = transport.create(kind, cfg, kwargs)
         except Exception as exc:  # 参数不支持 → 去参重试一次
             if not is_retryable_param_error(exc):
+                self._note_failure(kind, exc)
                 self._note_error(kind, exc)
                 raise
             stripped = {k: v for k, v in kwargs.items() if k not in RETRY_STRIP_PARAMS}
             if stripped == kwargs:
+                self._note_failure(kind, exc)
                 self._note_error(kind, exc)
                 raise
             from . import trace
@@ -526,7 +528,12 @@ class LLM:
                               "dropped": [p for p in RETRY_STRIP_PARAMS if p in kwargs],
                               "error": str(exc)[:500]}, level_hint=trace.LEVEL_CORE)
             self._emit_request(kind, cfg, stripped)
-            resp = transport.create(kind, cfg, stripped)
+            try:
+                resp = transport.create(kind, cfg, stripped)
+            except Exception as exc2:
+                self._note_failure(kind, exc2)
+                self._note_error(kind, exc2)
+                raise
         if not kwargs.get("stream"):
             self._note_response(kind, resp, latency_ms=int((time.time() - t0) * 1000),
                                 request_index=self._last_request_index)
@@ -544,6 +551,24 @@ class LLM:
                           "func": trace.exception_site(exc),
                           "error": f"{type(exc).__name__}: {str(exc)[:500]}"},
                          level_hint=trace.LEVEL_CORE)
+
+    def _note_failure(self, kind, exc):
+        """失败的调用也要闭合 llm_request → llm_end。
+
+        没有这条，失败录像里每一条 llm_request 都缺对端，`trace.validate_events` 会把
+        整份现场判成不自洽——而失败现场恰恰是这套设施最贵的产物（§4.10 失败保留）。
+        与 `_note_response` 的区别是带 `error` 且没有正文：回放宁可按"这次调用没有结果"
+        还原，也不该去猜一个不存在响应。
+        """
+        from . import trace
+        trace.emit_record({"type": "llm_end", "kind": kind,
+                           "request_index": self._last_request_index,
+                           "finish_reason": None,
+                           "usage": None,
+                           "chunk_count": 0,
+                           "latency_ms": None,
+                           "interrupted": False,
+                           "error": f"{type(exc).__name__}: {str(exc)[:500]}"})
 
     # ── 兼容外观：当成 OpenAI client 用 ──────────────────────
     def _compat_create(self, **kwargs):
