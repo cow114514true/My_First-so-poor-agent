@@ -26,6 +26,7 @@ SUITES = [
     "test_compaction.py",
     "test_runner_visibility.py",
     "test_trace.py",
+    "test_prod_recording.py",
     "test_replay.py",
     "test_migrate.py",
     "test_shrink.py",
