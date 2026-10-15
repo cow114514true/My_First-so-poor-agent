@@ -333,11 +333,27 @@ def cmd_replay(args) -> int:
     return 0
 
 
+def _retention_of(d):
+    """读一份 trace 的保留判据（meta.json 的 retention）；读不出来返回 None。
+
+    None 表示「录制壳之外产生的 trace」——手工脚本、迁移产物、老录像。这类没有失败
+    标记可言，按普通会话走保留期，不给它开免死金牌。
+    """
+    try:
+        return trace_mod.load_manifest(d).get("retention")
+    except (OSError, trace_mod.TraceError):
+        return None
+
+
 def cmd_clean(args) -> int:
     """删掉超过保留期的会话目录（§4.1：默认 30 天）。
 
     安全闸：只删 trace 根目录下、且 `_is_trace_dir()` 认得的直接子目录。传进来的 root
     必须是一个存在的目录——不做任何"向上找"的猜测。
+
+    第二条闸（§4.10）：录制壳标了 `retention=failure` 的会话**不随保留期消失**。失败
+    现场正是这套设施存在的理由，自动删掉它等于把最贵的证据先扔了。要连它一起清必须
+    显式 `--include-failures`。
     """
     root = os.path.abspath(args.root or trace_mod.trace_root())
     if not os.path.isdir(root):
@@ -346,6 +362,7 @@ def cmd_clean(args) -> int:
     age = _parse_age(args.older_than)
     now = time.time()
     victims = []
+    held = []
     for name in sorted(os.listdir(root)):
         d = os.path.join(root, name)
         if not _is_trace_dir(d):
@@ -359,6 +376,9 @@ def cmd_clean(args) -> int:
             except OSError:
                 pass
         if now - newest > age:
+            if _retention_of(d) == trace_mod.RETENTION_FAILURE and not args.include_failures:
+                held.append((d, now - newest))
+                continue
             victims.append((d, trace_mod.dir_size(d), now - newest))
     total = sum(v[1] for v in victims)
     for d, size, age_s in victims:
@@ -366,8 +386,12 @@ def cmd_clean(args) -> int:
               f"（{_fmt_size(size)}，{age_s / 86400:.1f} 天未动）")
         if not args.dry_run:
             shutil.rmtree(d, ignore_errors=True)
+    for d, age_s in held:
+        print(f"  保留（失败现场，--include-failures 才清）{os.path.relpath(d, root)}"
+              f"（{age_s / 86400:.1f} 天未动）")
     print(f"{'将清理' if args.dry_run else '已清理'} {len(victims)} 个会话，"
-          f"{_fmt_size(total)}（保留期 {args.older_than}）")
+          f"{_fmt_size(total)}（保留期 {args.older_than}）"
+          + (f"；另保留 {len(held)} 个失败现场" if held else ""))
     return 0
 
 
@@ -375,17 +399,24 @@ def cmd_size(args) -> int:
     root = args.root or trace_mod.trace_root()
     runs = trace_mod.list_runs(root)
     over = []
+    fails = 0
     for r in runs:
         size = trace_mod.dir_size(r["dir"])
+        failure = _retention_of(r["dir"]) == trace_mod.RETENTION_FAILURE
+        fails += 1 if failure else 0
         if size > trace_mod.SIZE_WARN_BYTES or args.all:
-            over.append((r["run_id"], size))
+            over.append((r["run_id"], size, failure))
     over.sort(key=lambda kv: -kv[1])
     if not over:
-        print(f"{len(runs)} 个会话，均未超过 {_fmt_size(trace_mod.SIZE_WARN_BYTES)}")
+        print(f"{len(runs)} 个会话，均未超过 {_fmt_size(trace_mod.SIZE_WARN_BYTES)}"
+              + (f"（失败现场 {fails} 个）" if fails else ""))
         return 0
-    for rid, size in over:
+    for rid, size, failure in over:
         mark = "⚠" if size > trace_mod.SIZE_WARN_BYTES else " "
-        print(f"{mark} {rid:<40} {_fmt_size(size)}")
+        print(f"{mark} {rid:<40} {_fmt_size(size)}"
+              + ("  失败现场（clean 默认保留）" if failure else ""))
+    if fails:
+        print(f"失败现场 {fails} 个：clean 默认保留，需 --include-failures 才清")
     return 0
 
 
@@ -468,6 +499,8 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--root", default=None)
     q.add_argument("--dry-run", action="store_true")
     q.add_argument("--quiet", action="store_true")
+    q.add_argument("--include-failures", action="store_true",
+                   help="连失败现场（retention=failure）一起清；默认保留")
     q.set_defaults(func=cmd_clean)
 
     q = sub.add_parser("size", help="会话体积与告警")
