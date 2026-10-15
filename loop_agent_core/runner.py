@@ -412,8 +412,49 @@ def _dump_api_error(e, conv, kwargs):
         pass
 
 
+def _append_thinking_turn(reasoning, conv):
+    """把"只出思考、无正文"的那一轮**记进历史**（`content` 就是思考原文）。
+
+    为什么必须记：以前这一轮被整个丢掉，于是 nudge 注入时末条仍是 user，只能
+    **拼进上一条 user 消息**。两个后果都在真录的 trace 里看得见（`tmp/_probe_stuck/`）：
+
+    - 用户的原话被改写了。四个请求摊开是 `user('干个活…')` → `user('[Self-check]…\\n\\n干个活…')`
+      → 三遍自检叠在同一条 user 消息里（`messages_bytes` 122→292→462→632）。事后从
+      `conv` 里**重建不出"用户到底说了什么"**，而"用户说的"是回放比对与最小化的锚。
+    - 模型侧看到的是"用户从头到尾在抱怨它没产出"，而不是"我上一轮只想了没答"。
+      DeepSeek 的 tool_calls 契约要求把 `reasoning_content` 回传，本身就说明思考是
+      对话的一部分、不该凭空消失。
+
+    记下这一轮之后，末条是 assistant，`_inject_user_nudge` 自然走"追加"分支——
+    交替协议不靠合并来维持，而且 `reasoning::` 前缀让它一眼可分、不冒充模型正文。
+    """
+    text = (reasoning or "").strip()
+    if not text:
+        return
+    _append_msg({"role": "assistant", "content": f"reasoning:: {text}"}, conv)
+
+
+def _nudge_is_last(conv):
+    """末条消息是不是我们注入的空 nudge（即"上一轮只思考、已被催过"）。
+
+    只用它回答一个问题：**这次请求还该不该发**。判据取末条消息而不是回合号/计数，
+    因为收尾段那个 `for final_round` 在"注入 nudge → continue"与"进入收尾段"之间
+    是**同一个迭代号**，拿它当"新请求"的证据必然误判。
+    """
+    msgs = conv.get("messages") or []
+    if not msgs or msgs[-1].get("role") != "user":
+        return False
+    return str(msgs[-1].get("content", "")).startswith(_EMPTY_NUDGE)
+
+
 def _inject_user_nudge(text, conv):
-    """注入一条 user 消息：若末条已是 user 则合并（避免连续 user 违反 API 交替协议），否则追加。"""
+    """注入一条 user 消息：末条已是 user 则合并（避免连续 user 违反 API 交替协议），否则追加。
+
+    "末条是 user"通常只在**模型的这一轮没有产出**时出现，而那个情形现在由
+    `_append_thinking_turn()` 先补上 assistant 轮，所以正常路径走的是追加分支。
+    保留合并分支是给"既无正文也无思考"的乱码轮兜底：那种轮不值得记进历史，
+    但提示仍要发出去。
+    """
     msgs = conv["messages"]
     if msgs and msgs[-1].get("role") == "user":
         msgs[-1]["content"] = text + "\n\n" + str(msgs[-1].get("content", ""))
@@ -979,6 +1020,22 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             _noticec("interrupted")
             _turn_end("interrupted")
             return "[Interrupted by user]"
+        # 预算已饱和且末条就是我们注入的 nudge → **这次请求不该再发**。
+        # 不判的话：3 次重试用光后 `continue` 回到这里，第 4 次请求照发，模型照旧只思考，
+        # 然后才在下面的饱和分支收摊——白花一次往返，`retries` 也记成 4（越过 `<= 3`）。
+        # 实测证据：`tmp/_probe_stuck/`（改前 llm_request 4 次、thinking_only_retry 3 条）。
+        #
+        # 位置必须在 `_prep_context` / `_checkpoint` **之前**：那两处会为一次并不存在的
+        # 请求推进 request_index，而随后 `_noticec` / `_turn_end` 取不到请求号只能退回 0
+        # ——trace 里就出现 `request_index 回退：4 → 0`。既然不打算干活，就别先记账。
+        if conv.get("_empty_retries", 0) >= 3 and _nudge_is_last(conv):
+            _noticec("stuck")
+            _dump_filtered("turn_end:stuck",
+                           f"round={tool_round} retries={conv['_empty_retries']} "
+                           f"thinking_only（预算已用尽，未再发请求）")
+            _append_msg({"role": "assistant", "content": _STUCK_MSG}, conv)
+            _turn_end("stuck", _STUCK_MSG)
+            return _STUCK_MSG
         # 每次 API 调用前整理上下文：L0 去重 → L1 分块摘要 → L2 硬裁剪
         q_idx, pruned = _prep_context(_prune_cap(), q_idx, conv, active_summarize, _emit)
         _checkpoint("pre_request", q_idx)
@@ -1074,8 +1131,12 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                     continue
                 if reasoning.strip() and not cleaned:
                     # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
-                    conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
-                    if conv["_empty_retries"] <= 3:
+                    # 先判后加：旧写法是 `+= 1` 之后才 `<= 3`，于是计到 4 才落在判断外，
+                    # 而那时**第 4 次请求已经发出去了**（trace 里 llm_request 4 次、
+                    # thinking_only_retry 只有 3 条，`retries=4` 就是这么来的）。
+                    if conv.get("_empty_retries", 0) < 3:
+                        conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
+                        _append_thinking_turn(reasoning, conv)
                         _trace("thinking_only_retry", round=tool_round,
                                count=conv["_empty_retries"])
                         _inject_user_nudge(_EMPTY_NUDGE, conv)
@@ -1086,7 +1147,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                     _noticec("stuck")
                     # 留痕：notice 会随滚动消失，这条能事后 grep（debug_filtered.txt）
                     _dump_filtered("turn_end:stuck",
-                                   f"round={tool_round} retries={conv['_empty_retries']} "
+                                   f"round={tool_round} retries={conv.get('_empty_retries', 0)} "
                                    f"reasoning={reasoning[:200]}")
                 else:
                     msg = "[Response filtered: detected garbled output. Please rephrase your request.]"
@@ -1141,6 +1202,17 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
             _noticec("interrupted")
             _turn_end("interrupted")
             return "[Interrupted by user]"
+        # 预算已饱和且末条就是我们注入的 nudge → **这次请求不该再发**（理由见工具轮同款守卫：
+        # 位置必须在 `_prep_context` / `_checkpoint` 之前，否则会为不存在的请求推进
+        # request_index，trace 里出现回退）。
+        if conv.get("_empty_retries", 0) >= 3 and _nudge_is_last(conv):
+            _noticec("stuck")
+            _dump_filtered("turn_end:stuck",
+                           f"final_round={final_round} retries={conv['_empty_retries']} "
+                           f"thinking_only（预算已用尽，未再发请求）")
+            _append_msg({"role": "assistant", "content": _STUCK_MSG}, conv)
+            _turn_end("stuck", _STUCK_MSG)
+            return _STUCK_MSG
         q_idx, pruned = _prep_context(_prune_cap(), q_idx, conv, active_summarize, _emit)
         _checkpoint("pre_request", q_idx)
         response_stream = _model_call(conv, model=cfg["model"], messages=conv["messages"], stream=True,
@@ -1226,8 +1298,10 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
         if _is_garbage_content(save_response):
             if full_thinking.strip() and not save_response:
                 # thinking-only：回合没走完，注入提示让模型继续（有界 3 次）
-                conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
-                if conv["_empty_retries"] <= 3:
+                # 先判后加，理由同工具轮那处：否则会白跑一次请求才收摊。
+                if conv.get("_empty_retries", 0) < 3:
+                    conv["_empty_retries"] = conv.get("_empty_retries", 0) + 1
+                    _append_thinking_turn(full_thinking, conv)
                     _trace("thinking_only_retry", round=final_round,
                            count=conv["_empty_retries"])
                     _inject_user_nudge(_EMPTY_NUDGE, conv)
@@ -1237,7 +1311,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
                 msg = _STUCK_MSG  # 3 次后仍卡 → 思考循环，说清楚
                 _noticec("stuck")
                 _dump_filtered("turn_end:stuck",
-                               f"final_round={final_round} retries={conv['_empty_retries']} "
+                               f"final_round={final_round} retries={conv.get('_empty_retries', 0)} "
                                f"thinking={full_thinking[:200]}")
             else:
                 msg = "[Response filtered: detected garbled output. Please rephrase your request.]"
