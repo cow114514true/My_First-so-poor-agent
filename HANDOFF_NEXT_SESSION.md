@@ -133,7 +133,7 @@ python run_tests.py      # 逐套件起子进程跑，退出码非 0 = 有失败
 - 多模型运行时切换：设计稿 `MULTI_MODEL_SWITCH_DESIGN.md`，未开工。
 
 ### 7) 工作区现状
-- HEAD = `28f7294`（`docs(trace): 实施状态交接与 §10 已定项`），工作区干净。Trace & Replay 的阶段 0–5 就是最近这一串提交：`c119ac1` toolclass → `ed8fc0f` llm → `385fbdd` trace → `581bd5c` checkpoint → `a65f65f` cassette → `c69e1d5` replay → `12cafa0` 生产开录 → `1a65514`/`9ee6332` 迁移器 → `6623f29` overlay → `17481ef` shrink → `f36bffa`/`e101ba1`/`9eb6e79` 三处修复 → `b430658` 重录 fixture → `28f7294` 文档。
+- HEAD = `8f6ba1d`（`docs(trace): 实施状态与欠账移入交接文档，施工文档只留规格`），工作区干净。Trace & Replay 的阶段 0–5 就是最近这一串提交：`c119ac1` toolclass → `ed8fc0f` llm → `385fbdd` trace → `581bd5c` checkpoint → `a65f65f` cassette → `c69e1d5` replay → `12cafa0` 生产开录 → `1a65514`/`9ee6332` 迁移器 → `6623f29` overlay → `17481ef` shrink → `f36bffa`/`e101ba1`/`9eb6e79` 三处修复 → `b430658` 重录 fixture → `28f7294` 文档。
 - 根目录已整理（2026-10-13）：11 个测试脚本 → `tests/`（`git mv` 保留历史）；`convolution.ts`、`demo_headroom.py`（依赖被排除的 headroom）、`draw_square.ps1`+`square.png`（画图产物）、`deepseek_tokenizer.py`（孤儿 HF 片段，无人引用）、`agent/`（与 agent 产品无关，实为 mark_coin.ps1）→ `archive/`。**`archive/` 只在本机，不入库**（`deepseek_tokenizer.py` 已从版本库删除，副本留在本地归档）。
 - 刻意不入库的杂物（见 `SECURITY_AUDIT_REPORT.md` 的"明确排除"）：`archive/`（本地归档）、`headroom/`、`test_claude/`（两个第三方克隆，合计约 145MB）、`tools_work/`、`git/`（空仓库）、`screenshots/`（运行时产出，已 gitignore）。**没动它们**，因为都已在 ignore 规则里；要真删得单独确认。
 - **`tokenizer.json`（7.8MB）与 `tokenizer_config.json` 不能移**：`loop_agent_core/tokens.py:20` 从 `WORK_DIR`（=仓库根）读它做精确计数。曾差点被当杂物归档。
