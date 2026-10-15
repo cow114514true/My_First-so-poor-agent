@@ -28,6 +28,7 @@ SUITES = [
     "test_trace.py",
     "test_replay.py",
     "test_migrate.py",
+    "test_shrink.py",
 ]
 
 
