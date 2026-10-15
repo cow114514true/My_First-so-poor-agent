@@ -875,6 +875,197 @@ def close_writer(writer=None, reason="normal") -> None:
     check_size(w.run_dir)
 
 
+# ── 会话级录制：生产入口的建档与收尾（§4.10） ─────────────────────
+# 失败断言口径：一条断言 id 落进下面两类之一，这次会话就是「失败现场」，
+# 保留策略不得删除（tools/trace.py clean 认 meta.json 的 retention 字段）。
+#
+# turn_end 的哪些理由算「正常」：
+#   answer      —— 拿到正文，这是唯一的成功终局；
+#   interrupted —— 用户自己按的 Esc，是人的意图，不是代码跑歪。
+# 其余理由（stuck / garbled / rounds_exhausted / api_error / fallback）都是运行出了问题。
+# notice 不进失败口径：它是诊断通道（提示/降级/跳过压缩），不是「这次会话坏了」。
+TURN_END_NORMAL_REASONS = ("answer", "interrupted")
+FAILURE_ASSERTION_PREFIXES = ("tool_error:", "exception:")
+RETENTION_FAILURE = "failure"
+RETENTION_NORMAL = "normal"
+
+
+def is_failure_assertion(aid) -> bool:
+    """一条断言 id 是否代表失败现场（判据见上面两段注释）。"""
+    a = str(aid or "")
+    if a.startswith(FAILURE_ASSERTION_PREFIXES):
+        return True
+    head = "turn_end:reason="
+    if a.startswith(head):
+        return a[len(head):] not in TURN_END_NORMAL_REASONS
+    head = "run_end:reason="
+    if a.startswith(head):
+        return a[len(head):] not in TURN_END_NORMAL_REASONS
+    return False
+
+
+def failure_assertions(events) -> list:
+    """事件序列 → 失败断言 id（保序）。口径复用 assertion_ids，不另造一套。
+
+    额外补一条 `run_end:reason=exception`：会话是**从入口崩出去**的（例如传输层抛异常
+    把 chat 拽崩），这时里面可能一条断言都没有，但这次运行显然不是正常收尾。
+    """
+    out = [a for a in assertion_ids(events) if is_failure_assertion(a)]
+    for e in events:
+        if e.get("type") == "run_end" and e.get("reason") == "exception":
+            out.append("run_end:reason=exception")
+            break
+    return out
+
+
+def failure_assertions_in(run_dir) -> list:
+    """从落盘的 trace 里数失败断言。读不出来就当「没有失败」，绝不外抛。"""
+    try:
+        return failure_assertions(read_events(run_dir))
+    except (OSError, TraceError):
+        return []
+
+
+def mark_retention(run_dir, reason="normal") -> dict:
+    """把保留判据写进 meta.json：失败现场标 failure，其余标 normal（§4.10）。
+
+    只**加字段**、不动事件流：回放器不读 retention，所以这里标错也不会污染录像本身；
+    而 `tools.trace clean` 靠它决定谁不能删。原子替换，避免半截 meta 把会话弄坏。
+    """
+    man = load_manifest(run_dir)
+    fails = failure_assertions_in(run_dir)
+    man["retention"] = RETENTION_FAILURE if fails else RETENTION_NORMAL
+    man["failure_assertions"] = fails
+    man["end_reason"] = reason
+    path = os.path.join(run_dir, TRACE_META)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(man, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+    if fails:
+        log_problem(run_dir, "[trace] 失败现场，已标记保留（clean 默认不清）："
+                             + ", ".join(fails))
+    return man
+
+
+def session_backend() -> str:
+    """本次会话真正在用的后端名（manifest.backend 的来源）。"""
+    return os.environ.get("MODEL_BACKEND") or "deepseek"
+
+
+def session_model() -> str:
+    """本次会话真正在用的模型名。取不到就空串，不为一个字段让会话起不来。"""
+    try:
+        from .config import cfg
+        return str(cfg.get("model") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def current_session_id() -> str:
+    """当前活跃 writer 的会话 id（没有在录就是空串）。
+
+    供薄壳给 conv 打 `_session_id`：这样 turn_start / turn_end 里的 session
+    与 run_start 里的 session 是同一个值，而不是各写各的。
+    """
+    w = current_writer()
+    return str(getattr(w, "run_id", "") or "") if w is not None else ""
+
+
+class SessionRecording:
+    """一次会话的录制壳：起点建档、终点收尾（§4.10）。
+
+    三条硬规矩：
+
+    1. **开关只在起点求值一次**。进了 `start()` 之后再改 `TRACE_ENABLED` 也不改主意——
+       半路开关会让 trace 同时缺前半段和后半段，比不录更难查。
+    2. **收尾走 try/finally**（`finish()` 幂等）：正常退出、异常退出、用户中断都补
+       `run_end` 与 `trace.idx.json`。
+    3. **收尾失败不外抛**：录制是诊断设施，它不能成为「会话挂掉」的原因。
+    """
+
+    def __init__(self, session_id=None, *, entry="", backend=None, model=None,
+                 run_dir=None, level=None, on_event=None, reason="normal"):
+        self.entry = entry
+        self.session_id = session_id or new_run_id(entry or "session")
+        self.run_dir = run_dir
+        # level=None 表示「档位交给 TRACE_LEVEL 决定」（默认 assert），不在这里钉死。
+        self.level = level
+        self.on_event = on_event
+        self.backend = backend
+        self.model = model
+        self.reason = reason
+        self.writer = None
+        self.active = False
+        self.retention = None
+
+    def start(self):
+        """求值开关并建档。关着时**一根文件都不产生**（不等价于建个空目录）。"""
+        if self.active:
+            return self
+        if not tracing_enabled():
+            return self
+        man = {"session_id": self.session_id,
+               "backend": self.backend or session_backend(),
+               "model": self.model or session_model()}
+        if self.entry:
+            man["entry"] = self.entry
+        self.writer = open_writer(self.session_id, level=self.level,
+                                  run_dir=self.run_dir, manifest=man,
+                                  on_event=self.on_event)
+        self.run_dir = self.writer.run_dir
+        self.active = True
+        return self
+
+    def finish(self, reason=None):
+        """收尾（幂等）：补 run_end + 索引 + 保留判据。返回写入的 manifest。"""
+        w = self.writer
+        if w is None:
+            return None
+        self.writer = None
+        self.active = False
+        reason = reason or self.reason
+        try:
+            w.write_index()          # 关文件之前写：之后 writer 就不知道字节位置了
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            close_writer(w, reason=reason)
+        except Exception as exc:  # noqa: BLE001
+            log_problem(w.run_dir, f"[trace] 收尾失败（{type(exc).__name__}: {exc}）")
+        try:
+            self.retention = mark_retention(w.run_dir, reason=reason)
+        except Exception as exc:  # noqa: BLE001 —— 标不上保留只是少一层保护，不该外抛
+            log_problem(w.run_dir, f"[trace] 保留判据写入失败（{type(exc).__name__}: {exc}）")
+        return self.retention
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, exc_type, exc, tb):
+        self.finish(reason=_exit_reason(exc_type))
+        return False
+
+
+def _exit_reason(exc_type) -> str:
+    if exc_type is None:
+        return "normal"
+    if issubclass(exc_type, KeyboardInterrupt):
+        return "interrupted"
+    return "exception"
+
+
+def session_recording(session_id=None, **kw) -> SessionRecording:
+    """生产入口的会话录制壳（§4.10）。用法：
+
+        with trace.session_recording(entry="tui"):
+            run_one_session()
+
+    开关关着时 `__enter__` 直接返回一个未激活的壳，没有任何 IO。
+    """
+    return SessionRecording(session_id, **kw)
+
+
 def begin_turn(turn=0, session="") -> TraceContext:
     """开一轮：绑定 turn/session，清零 tool_round 与 request_index。"""
     ctx = current_context().evolve(turn=turn, session=session, tool_round=0,
