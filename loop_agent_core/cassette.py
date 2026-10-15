@@ -18,6 +18,7 @@ import json
 import os
 import shutil
 import time
+from typing import Iterable
 
 from . import trace as trace_mod
 from .checkpoint import CheckpointStore
@@ -230,8 +231,15 @@ def headroom_fingerprint(meta: dict | None = None) -> dict:
 
 def build_meta(trace_dir: str, events: list, *, playback_mode: str = PLAYBACK_FINGERPRINT,
                derived_from: str | None = None, expected_assertion: str | None = None,
-               workspace_root: str | None = None) -> dict:
-    """组装 cassette_meta（§4.8）。"""
+               workspace_root: str | None = None,
+               extra_degraded: Iterable[str] = ()) -> dict:
+    """组装 cassette_meta（§4.8）。
+
+    `extra_degraded` 是给**知道内情的调用方**留的口子：抽取器只能从事件里推出
+    "缺 llm_end / 缺 tool_result"，而有些降级来源根本不在事件里——旧会话迁移就是
+    这种情况（旧格式不存 LLM 请求体、也不记 limits）。没有这个口子，迁移器只能在
+    抽完之后重写 meta.json 来补一行"为什么这份是降级的"。
+    """
     src = trace_mod.load_manifest(trace_dir) or {}
     hr = headroom_fingerprint()
     comp = completeness(events)
@@ -240,6 +248,9 @@ def build_meta(trace_dir: str, events: list, *, playback_mode: str = PLAYBACK_FI
         degraded.append(f"缺少 llm_end 的请求：{comp['missing_llm_end'][:8]}")
     if comp["missing_tool_results"]:
         degraded.append(f"缺少 tool_result 的调用：{comp['missing_tool_results'][:8]}")
+    for reason in extra_degraded or ():
+        if reason not in degraded:
+            degraded.append(str(reason))
     return {
         "cassette_format": CASSETTE_FORMAT,
         "canon_version": trace_mod.CANON_VERSION,
@@ -390,7 +401,8 @@ def verify_replay(cassette_dir: str, expected_assertion: str | None = None, *,
 def extract_cassette(trace_dir: str, out_dir: str, *, from_request: int = 0,
                      to_request: int | None = None, playback_mode: str = PLAYBACK_FINGERPRINT,
                      derived_from: str | None = None, expected_assertion: str | None = None,
-                     workspace_root: str | None = None, force: bool = False) -> dict:
+                     workspace_root: str | None = None, force: bool = False,
+                     extra_degraded: Iterable[str] = ()) -> dict:
     """把 trace 抽成 cassette。返回 cassette_meta。
 
     抽取器**先写临时目录、全部成功后再原子换名**：半成品 cassette 比没有 cassette 更坏，
@@ -414,7 +426,7 @@ def extract_cassette(trace_dir: str, out_dir: str, *, from_request: int = 0,
     assert_ids = trace_mod.assertion_ids(picked)
     meta = build_meta(trace_dir, picked, playback_mode=playback_mode,
                       derived_from=derived_from, expected_assertion=expected_assertion,
-                      workspace_root=workspace_root)
+                      workspace_root=workspace_root, extra_degraded=extra_degraded)
     meta["assertion_ids"] = assert_ids
 
     tmp = out_dir + ".tmp"

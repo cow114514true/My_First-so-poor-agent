@@ -271,6 +271,17 @@ NOTICE_CODES = {
                            "模型把工具调用写进了思考但没能解析出来，正在重试。"),
     "fallback": ("warn", "fallback",
                  "模型多轮都没有产出可用的正文，已中止本轮。请换个说法重试。"),
+    # 这条**不由 runner 发**：旧会话迁移器写的（`tools/trace_migrate.py`）。旧格式不记录
+    # turn_end reason，迁移器不臆造一个看起来合理的 reason，只记一条说明。放进词表是因为
+    # 断言面的判定口径是"这个词表认不认识"——词表外的 code 会让整份迁移产物加载即报
+    # `CassetteFormatError`（实测），等于把"如实记录缺什么"变成了"产物坏了"。
+    "migration_no_reason": ("info", "migration_no_reason",
+                            "本次会话由旧格式迁移而来，不记录 turn_end reason。"),
+    # 同样由迁移器写：旧语料里同一个 call_id 被复用（实测 3 次工具调用都叫 `xml0`），
+    # 迁移器加 `#N` 后缀消歧——不加的话 cassette 的 call_id 索引会把它们挤成一条，
+    # 全量实测 136 次调用凭空消失。这条 notice 是那份丢失的"证人"。
+    "migration_dup_call_id": ("info", "migration_dup_call_id",
+                              "旧会话里有被复用的 call_id，迁移时为消歧加了 #N 后缀。"),
 }
 
 
