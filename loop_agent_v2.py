@@ -400,10 +400,19 @@ def assert_tools_classified():
 
 # 交互式连续对话
 if __name__ == "__main__":
+    from loop_agent_core import trace as _trace
+
     assert_tools_classified()  # 未登记工具直接拒绝启动（见 toolclass.py 注释）
     print(" 多轮对话🤣（输入 'exit' 退出）\n")
-    while True:
-        question = input("😎 You: ")
-        if question.lower() == 'exit':
-            break
-        chat(question)
+    # 一次进程 = 一次会话（BUILD §4.10）：开关只在起点求值一次，收尾走 with 的 finally。
+    # EOFError 是管道/重定向读尽，属于正常收尾，所以在 with **内部**接住；
+    # KeyboardInterrupt 不接：让它穿出 with，__exit__ 才能把 run_end 记成 interrupted。
+    with _trace.session_recording(entry="cli"):
+        try:
+            while True:
+                question = input("😎 You: ")
+                if question.lower() == 'exit':
+                    break
+                chat(question)
+        except EOFError:
+            print()

@@ -3,6 +3,7 @@ TUI for loop_agent_v2.py — three-panel chat interface powered by Textual.
 Run: python tui.py
 """
 
+import contextvars
 import queue
 import threading
 import json
@@ -30,6 +31,7 @@ from loop_agent_v2 import chat, messages as _agent_messages
 from loop_agent_v2 import CURRENT_MODEL
 import loop_agent_v2
 import loop_agent_core.config as _cfg
+from loop_agent_core import trace as _trace
 
 
 # ─────────────────── 会话文件：识别 + 校验（BUG 31 的防线） ───────────────────
@@ -1269,6 +1271,24 @@ class AgentTUI(App):
         self._discard_exit: bool = False  # 用户主动丢弃 → atexit 应急保存跳过
         self._llm_reachable = None        # None=未检；P2 健康检查缓存
 
+    # ── 会话边界：一次 App.run() = 一次录制会话（BUILD §4.10） ──────
+    def run(self, *args, **kwargs):
+        """把整个 App 运行包成一次录制会话：起点建档、终点收尾。
+
+        为什么边界取在这里、而不是每个问题：
+
+        1. `messages` 是**进程级**的，一次 TUI 运行就是一段连续对话；`/clear` 与 `/load`
+           换的是对话内容，不是换一份 trace 文件。
+        2. trace 的 `request_index` 要**跨轮只增**（回放按它定位请求）。按问题开档会让
+           每个问题都从 0 重新数，checkpoint 键位互相覆盖。
+        3. `App.run()` 是 `python tui.py` 的唯一入口，也是唯一能覆盖"用户怎么退出"的地方。
+
+        收尾用 `with`（即 try/finally）：正常退出、异常退出、Ctrl-C 都补 `run_end` 与
+        `trace.idx.json`。开关关着时 `session_recording` 一次 IO 都不做。
+        """
+        with _trace.session_recording(entry="tui"):
+            return super().run(*args, **kwargs)
+
     def compose(self) -> ComposeResult:
         with Vertical():
             yield RichLog(id="shell-output", wrap=True, markup=True, max_lines=2000)
@@ -1802,7 +1822,13 @@ class AgentTUI(App):
 
         self._set_status("thinking")
 
-        threading.Thread(target=self._run_agent, args=(question,), daemon=True).start()
+        # 录制上下文必须**显式**带进 agent 线程：contextvars 不随 threading.Thread 传播，
+        # 不拷的话 trace.current_writer() 在子线程里恒为 None —— 目录建了、run_start 写了，
+        # 而 llm_request / tool_call / turn_end 一条都落不下来。这正是"机制全绿但从没在
+        # 真实路径上录过"的成因之一，所以拷贝放在开线程的地方，而不是靠调用方自觉。
+        agent_ctx = contextvars.copy_context()
+        threading.Thread(target=agent_ctx.run, args=(self._run_agent, question),
+                         daemon=True).start()
 
     def _confirm_ask(self, kind, target, is_worker, purpose=""):
         """Runs in agent thread. Shows the confirm modal, then blocks for the TUI answer.
