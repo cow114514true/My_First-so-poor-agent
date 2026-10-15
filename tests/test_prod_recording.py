@@ -18,6 +18,7 @@
 假后端（`llm.set_transport`）是唯一被替换的东西，原因是不许触网。
 Run: python tests/test_prod_recording.py
 """
+import json
 import os
 import shutil
 import subprocess
@@ -50,20 +51,21 @@ def _fresh_root(tag: str) -> str:
 
 
 def _run_entry(entry: str, mode: str = "ok", *, trace_dir=None, enabled=True,
-               stdin=_STDIN, timeout=180):
+               stdin=_STDIN, timeout=180, level="assert", extra_argv=()):
     """在真入口上跑一次会话，返回 CompletedProcess。"""
     env = dict(os.environ)
     env["DS_KEY"] = "sk-selftest-not-a-real-key"
     env["MODEL_BACKEND"] = "deepseek"          # 让 manifest.backend 可断言
     env["TRACE_DIR"] = trace_dir or _TRACE_ROOT
-    env["TRACE_LEVEL"] = "assert"
+    env["TRACE_LEVEL"] = level
     env["PYTHONIOENCODING"] = "utf-8"
     env.pop("HEADROOM_STORE_URL", None)        # 隔离：不许把遥测指到别处
     if enabled:
         env["TRACE_ENABLED"] = "1"
     else:
         env.pop("TRACE_ENABLED", None)
-    cmd = [sys.executable, os.path.join(_TESTS, "_prod_recording_launcher.py"), entry, mode]
+    cmd = [sys.executable, os.path.join(_TESTS, "_prod_recording_launcher.py"),
+           entry, mode, *extra_argv]
     return subprocess.run(cmd, cwd=ROOT, env=env, input=stdin, text=True,
                           encoding="utf-8", errors="replace",
                           capture_output=True, timeout=timeout)
@@ -83,7 +85,7 @@ def _hash(path: str):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def _assert_wellformed(run_dir: str, *, expect_llm=True):
+def _assert_wellformed(run_dir: str, *, expect_llm=True, level="assert"):
     """一份生产录像的硬形状：首尾、自洽、meta 字段。"""
     evs = trace.read_events(run_dir)
     problems = trace.validate_events(evs)
@@ -95,7 +97,7 @@ def _assert_wellformed(run_dir: str, *, expect_llm=True):
     assert man["session_id"] == os.path.basename(run_dir), man
     assert man["backend"] == "deepseek", man
     assert man["model"], man
-    assert man["trace_level"] == "assert", man
+    assert man["trace_level"] == level, man
     assert os.path.exists(os.path.join(run_dir, trace.TRACE_INDEX)), "trace.idx.json 缺失"
     if expect_llm:
         types_ = [e["type"] for e in evs]
@@ -213,6 +215,77 @@ def test_body_exception_still_closes_as_exception():
     evs = trace.read_events(run_dir)
     assert evs[-1]["type"] == "run_end" and evs[-1]["reason"] == "exception", evs[-1]
     assert os.path.exists(os.path.join(run_dir, trace.TRACE_INDEX))
+
+
+# ── 3.5 档位：TRACE_LEVEL 必须从生产入口传下去 ──────────────────────
+def test_stream_level_is_honoured_at_production_entry():
+    """`TRACE_LEVEL=stream` 时 `response_chunk` / `thinking_chunk` 必须真的落盘。
+
+    §4.4 的档位过滤只有一处用武之地：`_should_write()`（`trace.py:501-502`）对
+    ≥ `LEVEL_STREAM` 的事件要求 writer 档位也是 stream，而这类事件只有
+    `response_chunk` / `thinking_chunk` 两种（`trace.py:86-87`）——正是"模型到底
+    一个字一个字吐了什么"的原始证据。
+
+    这条用例补的缺口：此前每个生产入口用例都写死 `TRACE_LEVEL=assert`
+    （`tests/test_prod_recording.py` 里 `env["TRACE_LEVEL"] = "assert"`），于是
+    「环境变量能不能真的把档位升到 stream」从来没在任何真入口上验过——出事时最想
+    要的那类证据，恰好是唯一没验过的那条路。
+    """
+    root = _fresh_root("stream")
+    p = _run_entry("cli", trace_dir=root, level="stream")
+    assert p.returncode == 0, f"stderr={p.stderr[-2000:]}"
+    run_dir = _only_dir(root)
+    evs = _assert_wellformed(run_dir, level="stream")
+    types_ = [e["type"] for e in evs]
+    # 假后端第 2 轮给的是正文，所以必然有 response_chunk。
+    assert "response_chunk" in types_, types_
+    chunk = next(e for e in evs if e["type"] == "response_chunk")
+    assert chunk["chunk"], chunk
+    # 升了档但没丢核心面：同一批事件仍在，run_start / limits 的位置不变。
+    assert evs[0]["type"] == "run_start" and evs[0]["level"] == trace.LEVEL_STREAM, evs[0]
+    assert "llm_request" in types_ and "turn_end" in types_, types_
+
+
+# ── 3.6 TUI 的 Esc 中断：按键 → 中断标记 → runner 收尾 ──────────────
+def test_tui_escape_interrupts_agent_and_closes_trace():
+    """在真 TUI 里按 Esc（= `tui.py:1405 action_collapse_panel`）中断在飞的回合。
+
+    此前 Ctrl-C 只接了 CLI（`kb` 模式），TUI 的中断路径一次都没跑过
+    （`tui.py:1406-1408`：`_agent_busy` 时按 Esc 置 `interrupt_event`）。这条路径
+    牵的不是一句提示语，而是 runner 的流式中断收尾：停流 → 已生成的部分正文落库
+    → `turn_end:reason=interrupted`。中断标记在按键之后立刻被清掉
+    （`tui.py:1919-1920`），所以"按键那一刻标记真的被置起了"只能由子进程当场记下来，
+    事后从 trace 里读不出来。
+
+    按键路由有一处 headless 专属的坑：焦点在 `#input-area`（TextArea）时，Textual
+    8.2.8 的 headless 驱动没把 escape 冒泡到 App 级绑定，所以子进程先试 `pilot.press`，
+    没生效再直接调那个绑定指向的动作。绑定关系本身在这里断言，动作内容由子进程验。
+    """
+    import tui as tui_mod
+
+    bindings = {getattr(b, "key", None): getattr(b, "action", None)
+                for b in tui_mod.AgentTUI.BINDINGS}
+    assert bindings.get("escape") == "collapse_panel", bindings
+    assert hasattr(tui_mod.AgentTUI, "action_collapse_panel"), "Esc 绑定的动作不存在"
+    root = _fresh_root("tui-esc")
+    probe = os.path.join(root, "esc_probe.json")
+    os.makedirs(root, exist_ok=True)
+    p = _run_entry("tui", mode="slow", trace_dir=root, extra_argv=(probe,))
+    assert p.returncode == 0, f"stderr={p.stderr[-2000:]}"
+    assert os.path.exists(probe), f"启动器没写 Esc 探针文件（stderr={p.stderr[-2000:]}）"
+    with open(probe, encoding="utf-8") as fp:
+        pr = json.load(fp)
+    assert pr["busy_at_key"], pr                      # Esc 落在"agent 还在跑"的窗口里
+    assert pr["set_after_key"], pr                    # 真的置起了中断标记，不是折叠面板
+
+    run_dir = _only_dir(root)
+    evs = _assert_wellformed(run_dir)
+    turn = [e for e in evs if e["type"] == "turn_end"]
+    assert turn, [e["type"] for e in evs]
+    assert turn[-1]["reason"] == "interrupted", turn[-1]
+    # 中断必须有痕迹：要么落了部分正文、要么说明"一个字都没来得及说"。
+    codes = [e.get("code") for e in evs if e["type"] == "notice"]
+    assert ("interrupted_partial" in codes) or ("interrupted" in codes), codes
 
 
 # ── 4. 保留策略：失败留下、正常可清 ──────────────────────────────────
