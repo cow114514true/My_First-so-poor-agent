@@ -21,7 +21,7 @@
   },
   "derived_from": "tests/fixtures/replay/_regenerate.py",
   "expected_assertion": "turn_end:reason=stuck",
-  "session_id": "positional_stuck-656868",
+  "session_id": "positional_stuck-754327",
   "model": "deepseek-v4-flash",
   "backend": "fake",
   "extracted_at": "2026-10-14T14:29:10",
@@ -32,7 +32,7 @@
     "notice:warn:stuck",
     "turn_end:reason=stuck"
   ],
-  "checkpoint_count": 4,
+  "checkpoint_count": 3,
   "replay_check": {
     "reproduced": true,
     "reason": null

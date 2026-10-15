@@ -21,7 +21,7 @@
   },
   "derived_from": "tests/fixtures/replay/_regenerate.py",
   "expected_assertion": "turn_end:reason=answer",
-  "session_id": "fingerprint_tool_round-656430",
+  "session_id": "fingerprint_tool_round-753893",
   "model": "deepseek-v4-flash",
   "backend": "fake",
   "extracted_at": "2026-10-14T14:29:10",
