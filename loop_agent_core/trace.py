@@ -522,6 +522,12 @@ class TraceWriter:
                 "tool_round": event.get("tool_round", ctx.tool_round),
                 "request_index": event.get("request_index", ctx.request_index),
             }
+            # 会话 id 与 turn / tool_round 一样按上下文补：写入器知道自己在录哪次会话，
+            # 不该要求每个发射点自己记得带上它。缺了它，单看一行事件无法归因到哪次运行
+            # （run_start 有、turn_end 没有的那种半截归属），而 trace 的意义正是"每一行
+            # 都能独立归因"。
+            if "session" not in event and ctx.session:
+                rec["session"] = ctx.session
             for k, v in event.items():
                 if k not in rec:
                     rec[k] = v

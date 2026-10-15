@@ -10,6 +10,7 @@ import threading
 
 from loop_agent_core.config import (WORK_DIR, _compact_k, _is_local_backend, _backend_config,
                                     cfg, CURRENT_MODEL, client, check_local_llm)
+from loop_agent_core import trace as _trace
 from loop_agent_core.tokens import (estimate_tokens, _read_budget, _char_heuristic,
                                     _local_tokenize, _load_ds_tokenizer)
 from loop_agent_core.schemas import tools
@@ -374,7 +375,8 @@ def chat(question, on_event=None, _conv=None):
     global _msg_size
     if _conv is None:
         _conv = {"messages": messages, "size": _msg_size, "_archive": _archive(),
-                 "_compact_state": _compact_state()}
+                 "_compact_state": _compact_state(),
+                 "_session_id": _trace.current_session_id()}
     
     is_main = _conv["messages"] is messages
     try:
@@ -400,8 +402,6 @@ def assert_tools_classified():
 
 # 交互式连续对话
 if __name__ == "__main__":
-    from loop_agent_core import trace as _trace
-
     assert_tools_classified()  # 未登记工具直接拒绝启动（见 toolclass.py 注释）
     print(" 多轮对话🤣（输入 'exit' 退出）\n")
     # 一次进程 = 一次会话（BUILD §4.10）：开关只在起点求值一次，收尾走 with 的 finally。
