@@ -27,30 +27,32 @@
 
 ## 2. 代码落点表
 
+落点以**符号名**为准；行号是参照，会随同文件其他改动漂移。同一符号出现多处时给全。
+
 | 落点 | 施工内容 | 阶段 |
 |---|---|---|
-| `loop_agent_core/runner.py:386` `_emit` | 转发给 trace 写入器 | 1 |
-| `loop_agent_core/runner.py:392` `_notice(level, message)` | 改签名为 `_notice(level, code, message)`；17 个调用点（`runner.py:445,503,505,531,538,541,548,583,593,641,643,668,679,682,688,697` 及 `_STUCK_NOTICE`）各补一个稳定 `code` | 0 |
+| `loop_agent_core/runner.py:862` `_emit` | 转发给 trace 写入器 | 1 |
+| `loop_agent_core/runner.py:868` `_notice(level, message)` | 改签名为 `_notice(level, code, message)`，调用点各补一个稳定 `code`（调用点一律走 `_noticec(key, **fmt)`，`runner.py:907`：code / level / 文案三处只有一份来源） | 0 |
 | `runner.py` 各 return 分支 | 发 `turn_end` 事件，`reason` 取闭集枚举 | 0 |
-| `runner.py:367` `_safe_create` | 改走 `llm.create(kind="chat", ...)` | 0 |
-| `runner.py:418` `next_turn` | 结果写入事件字段 `turn` | 1 |
-| `runner.py:442` / `:591` 的 `tool_round` / `final_round` | 写入事件字段 `tool_round` | 1 |
-| `runner.py:448`、`:595` `_prep_context` 之后 / `:450`、`:596` `_safe_create` 之前 | 写 `pre_request[i]` 快照 | 1 |
-| `runner.py` 一轮全部结算动作之后 | 写 `post_turn` 快照 | 1 |
-| `runner.py:233-341` `run_tools` | 两通道结果、`tool_call` / `tool_result` 事件、回放时 B 类串行 | 1 / 4 |
-| `runner.py:187-197` `_store_tool_args` | 占位改为可重取（原文落 `tool_call` 事件） | 1 |
-| `runner.py:211` `_call_tool` 入参层 | 回放时 B 类路径正向重写 | 4 |
-| `runner.py:462`、`:610` `_record_usage` | 发 `token_usage` 事件 | 1 |
-| `runner.py:201-203` `_TOOL_TIMEOUT` / `_WORKER_TIMEOUT` / `_SYNC_MAX` | 进 `limits` 事件 | 1 |
-| `context.py:95-104` `_rollback_tool_round` | 发 `tool_round_rollback` 事件 | 1 |
-| `context.py:141` `render_prune_notice` / `_prep_context` | 发 `prune` 事件 | 1 |
+| `runner.py:833` `_safe_create` | 改走 `llm.create(kind="chat", ...)` | 0 |
+| `runner.py:992` `next_turn` | 结果写入事件字段 `turn` | 1 |
+| `runner.py:1016`（主循环）与 `:1199`（收尾段）的 `tool_round` / `final_round` | 写入事件字段 `tool_round` | 1 |
+| `runner.py:1041`、`:1217` `_prep_context` 之后 / `:833` `_safe_create` 之前 | 写 `pre_request[i]` 快照 | 1 |
+| `runner.py:941` | 一轮全部结算动作之后，写 `post_turn` 快照 | 1 |
+| `runner.py:535` `run_tools` | 两通道结果、`tool_call` / `tool_result` 事件、回放时 B 类串行 | 1 / 4 |
+| `runner.py:478` `_store_tool_args` | 占位改为可重取（原文落 `tool_call` 事件） | 1 |
+| `runner.py:513` `_call_tool` 入参层 | 回放时 B 类路径正向重写（重写只改执行用的副本，会话历史里那条 assistant 消息仍是逻辑路径） | 4 |
+| `runner.py:1055`、`:1232` `_record_usage` | 发 `token_usage` 事件 | 1 |
+| `runner.py:503-505` `_SYNC_MAX` / `_TOOL_TIMEOUT` / `_WORKER_TIMEOUT` | 进 `limits` 事件 | 1 |
+| `context.py:104` `_rollback_tool_round` | 发 `tool_round_rollback` 事件 | 1 |
+| `context.py:164` `render_prune_notice` / `:221` `_prep_context` | 发 `prune` 事件 | 1 |
 | `compaction.py` 决策点 | 发 `compaction` 事件 | 1 |
-| `config.py:143` headroom `db_path` | 改读 `HEADROOM_STORE_URL` | 0 |
-| `config.py:38-90` `_compact_k()` | 发 `limits` 事件；提供 `reset_compact_k_cache()` | 1 |
-| `config.py:159` | 网关构造 headroom 包裹层，包裹对象为 transport | 0 |
+| `config.py:161-162` headroom `db_path` | 改读 `HEADROOM_STORE_URL` | 0 |
+| `config.py:38` `_compact_k()` | 发 `limits` 事件；提供 `reset_compact_k_cache()` | 1 |
+| `config.py:155-168` | 网关构造 headroom 包裹层，包裹对象为 transport | 0 |
 | `loop_agent_v2.py:182` `_summary_client()` | 改走 `llm.create(kind="summary", ...)` | 0 |
-| `vision.py:5` | 改走 `llm.create(kind="vision", ...)` | 0 |
-| `tui.py:45` `is_conversation_file()` | 迁移器复用其口径 | 2 |
+| `vision.py:3` | 改走 `llm.create(kind="vision", ...)` | 0 |
+| `tui.py:39` `is_conversation_file()` | 迁移器复用其口径 | 2 |
 
 ---
 
@@ -139,8 +141,8 @@ notice:<level>:<code>               # level ∈ {info, warn}
 施工动作：
 
 1. `chat()` 的每个 return 分支发一次 `_emit({"type": "turn_end", "reason": ...})`。
-2. `_notice` 增 `code` 形参，调用点补 code。
-3. 异常 id 由 `traceback` 里首个项目内帧的函数名 + 异常类名拼装（`loop_agent_core/` 路径判定）。
+2. `_notice` 增 `code` 形参，调用点补 code。落地形态是一张 `NOTICE_CODES` 词表（`runner.py:257`，键 = code，值 = `(level, code, 文案模板)`）加一层 `_noticec(key, **fmt)`（`runner.py:907`）：code、level、文案只有一份来源，改文案不动 code（§9 #3）。
+3. 异常 id 由 `traceback` 里首个项目内帧的函数名 + 异常类名拼装（`loop_agent_core/` 路径判定），落点是 `trace.assertion_id_for_error()`（`trace.py:180`）；`assertion_id()`（`trace.py:214`）/ `assertion_ids()`（`trace.py:243`）是它的消费侧。
 4. 工具错误在工具包装层统一转成 `tool_error:<tool>:<code>` 并计入 assert 级事件。
 5. 词表变更走 `cassette_format` converter（见 §7.3）。
 
@@ -194,7 +196,7 @@ class TraceWriter:
 | `llm_chunk` | record | `request_index` / `seq` / `content` / `reasoning_content` / `tool_calls`（按 `index` 分片）/ `usage` / `finish_reason` / `choices_empty` | `llm.create` |
 | `llm_end` | record | `request_index` / `finish_reason` / `usage` / `latency_ms` / `interrupted` | `llm.create` |
 | `headroom_transform` | record | `request_index` / `messages_pre` / `messages_post` | headroom 包裹层 |
-| `token_usage` | assert | `request_index` / `turn` / usage 各项 | `runner.py:462`、`:610` |
+| `token_usage` | assert | `request_index` / `turn` / usage 各项 | `runner.py:1055`、`:1232` |
 | `tool_call` | assert | `call_id` / `turn` / `tool_round` / `name` / `arguments_raw` / `class` / `rewrite` | `run_tools` |
 | `tool_result` | assert | `call_id` / `name` / `class` / `result_full` / `result_stored` / `truncation` / `duration_ms` / `from_replay` | `run_tools` |
 | `limits` | assert | 生效旋钮值 + B 组记账值（见 §4.5） | `_compact_k()` / `_prune_cap()` / `run_tools` cap / `_store_tool_args` |
@@ -269,7 +271,7 @@ else:                                           记 drift（strict 模式失败�
 | E 工作区 | 路径 + mtime + size + sha256（小文件）/ mtime + size（大文件），只含 agent 触碰过的路径 | manifest |
 | F 前缀稳定性 | `stable_prefix_hash` | 值 |
 
-快照时机：每个请求一份，落在 `_prep_context` 之后、`_safe_create` 之前（`runner.py:448`→`450`、`runner.py:595`→`596`）；每轮结束追加一份 `post_turn`。
+快照时机：每个请求一份，落在 `_prep_context` 之后、`_safe_create` 之前（`runner.py:1041`、`:1217` 的 `_checkpoint("pre_request", q_idx)`）；每轮结束追加一份 `post_turn`（`runner.py:941`）。
 
 快照记录：
 
@@ -498,9 +500,9 @@ strict_hash = sha256(raw(kind, model, params, messages))
 | 槽位 | 重注入方式 |
 |---|---|
 | `ts` | 回放按 `meta.json.trace_epoch.injected_date_str` 注入 |
-| `memory` | 注入来源为录制文本；识别标记 `"[长期记忆"`（`runner.py:426-433`） |
+| `memory` | 注入来源为录制文本；识别标记 `"[长期记忆"`（`runner.py:1001`） |
 | `nudge` | 按 `_EMPTY_NUDGE` / `_WRAPUP_NUDGE` 注入 |
-| `trim_notice` | 按 `render_prune_notice` 累加语义（`context.py:8,141,147`）与录制的 `limits` 重算 |
+| `trim_notice` | 按 `render_prune_notice` 累加语义（`context.py:8,164`）与录制的 `limits` 重算 |
 | `workspace_path` | 按 §6.4 根表重写 |
 
 ### 6.3 游标走位
@@ -610,7 +612,7 @@ c2    = ddmin(c1,       units=history_groups, test=FAIL_same_assertion,
               guard=no_new_or_reordered_responses)
 ```
 
-- 阶段 1 单元 = 用户轮；阶段 2 单元 = `_find_groups()` 的组（`context.py:28-51`）。
+- 阶段 1 单元 = 用户轮；阶段 2 单元 = `_find_groups()` 的组（`context.py:37-51`）。
 - 单元固定项：首轮、含失败断言的轮、全部 assert 级控制流事件。实现上靠**结构**保证：删除单元只覆盖可删载荷事件（`llm_request` / `llm_chunk` / `llm_end` / `token_usage` / `tool_call` / `tool_result`），控制流事件不进任何单元，于是「永不删」不需要额外判据。
 - 分层删：轮单元之下再切出响应包（一次请求的 `llm_request` 到 `llm_end`）与工具包（`tool_call` 与配对的 `tool_result`），先删大块再细分。
 - 依赖保持：`tool_result` 不能在没有对应 `tool_call` 时存活、反之亦然。回放前先做投影校验，不合法的候选直接判 `PASS` 且**不花回放预算**——否则回放器会以 `ReplayToolMissing` / 漂移拒掉，等于白烧一次预算。
@@ -738,7 +740,7 @@ python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>
 | 24 | `test_path_normalization_cross_checkout` | 两个检出目录各录一次 → `loose` 序列一致 |
 | 25 | `test_path_normalization_longest_prefix` | 嵌套 overlay 路径按最长前缀归一 |
 | 26 | `test_overlay_does_not_touch_repo` | B 类重写后真实 `WORK_DIR` 文件 mtime / sha256 不变 |
-| 27 | `test_migration_matrix` | 113 份会话迁移不崩；矩阵每格计数 + 降级工具归因 |
+| 27 | `test_migration_matrix` | 真实语料（`conversations/` 经 `tui.is_conversation_file()` 过滤后 108 份）迁移不崩；矩阵每格计数 + 降级工具归因 |
 | 28 | `test_migration_degraded_rejected` | `llm: "missing"` 的 cassette 进入 LLM 回放路径时抛错 |
 | 29 | `test_shrink_anchor` | 失败变成另一个失败时该候选判 PASS |
 | 30 | `test_shrink_converged_flag` | 预算耗尽输出 `converged: false` + 当前最优 |
@@ -768,67 +770,3 @@ python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>
 | 9 | thinking-only 重试的口径 | 预算 3 次、**先判后加**：饱和后不再发第 4 次请求，在两处循环顶（主循环与收尾段）提前返回，守卫位于 `_prep_context` / `_checkpoint` **之前**（那两处会为一次并不存在的请求推进 `request_index`）；每轮注入 nudge 前先把该轮思考存成一条 assistant 消息（`reasoning:: …`），nudge 独立成条、**不改写用户原话**（§3.x 落点为 `runner.py` 的 `_append_thinking_turn` / `_nudge_is_last`） |
 | 10 | `request_index` 的单调性 | 轮号与请求号是两件事：`set_tool_round()` **不清零** `request_index`，否则轮级事件（`notice` / `turn_end` / `checkpoint`）退回 `0`，`validate_events()` 会报 `request_index 回退`，回放侧也找不到归属。请求号只由 `writer.begin_request` 分配，跨轮只增（§4.5） |
 | 11 | L3 的轮级删除空间 | 轮级 ddmin 的空间由**源现场的请求条数**决定：`positional_stuck` 只有 3 条响应，且 3 条都是「预算耗尽的证据」——只留 2 条时 `_empty_retries` 到不了预算，`reason=stuck` 那条饱和分支根本不会触发（§7.1 的 `FAIL` 判据是成员判定，见 §7.4）。要拿到「真删成功」的证据需要一份**多用户轮**的真现场 |
-
----
-
-## 11. 实施状态（交接）
-
-本节只记录**文档之外的现实**：哪些已经落地、用什么验证过、还欠什么。规格本身以 §3–§8 为准，本节不重复。
-
-### 11.1 各阶段落地情况
-
-| 阶段 | 交付物 | 状态 | 验证 |
-|---|---|---|---|
-| 0 | `llm.py` 网关、`toolclass.py`、断言 id 词表 | 已落地 | `tests/test_trace.py` |
-| 1 | `trace.py` / `checkpoint.py` / `cassette.py` / `tools/trace.py` | 已落地 | `tests/test_trace.py`（35 条）、`tests/test_replay.py`、`tests/test_compaction.py` |
-| 1 | 生产开录（§4.10） | 已落地 | `tests/test_prod_recording.py`（10 条，含真 TUI / CLI 入口子进程、开关关闭不产生字节、失败现场保留） |
-| 2 | `tools/trace_migrate.py` | 已落地 | 真语料全量跑过：`conversations/` 过滤后 **108 份会话 / 417 个用户轮 / 1107 次工具调用**；`tests/test_migrate.py`（14 条） |
-| 3 | `replay.py` 指纹与游标 | 已落地 | `tests/test_replay.py`（48 条） |
-| 4 | L2 overlay 与工具策略 | 已落地 | `tests/test_replay.py` 的 `test_fixture_l2_file_ops_replays_into_overlay`（真录制轨迹，不猴补 `write_file`）、`test_overlay_*` 合成用例 |
-| 5 | `tools/shrink.py` | 阶段 1（轮级）已落地 | `tests/test_shrink.py`（11 条）；阶段 2 只留 `history_group_units()` 接口 |
-
-### 11.2 入库 fixture（`tests/fixtures/replay/`）
-
-| 名字 | 模式 | 内容 | 用途 |
-|---|---|---|---|
-| `fingerprint_tool_round` | `fingerprint` | 单次 `get_date` 工具轮 | 指纹匹配与工具结果的基本现场 |
-| `positional_stuck` | `positional` | 3 条响应（thinking-only 预算耗尽的证据），`expected_assertion=turn_end:reason=stuck` | 唯一「失败可复现」的现场，L3 的唯一真实输入 |
-| `l2_file_ops` | `fingerprint` | `write_file`（B 类）+ `read_file`（A 类）+ `search_code`（递归扫描） | L2 三类重写的真覆盖 |
-
-`tests/fixtures/replay/_regenerate.py` 是这三份 fixture 的**同源闸门**：重录只写 `tmp/`，`--check` 不写盘。改了 `runner.py` 的请求形状后，`tests/test_replay.py:test_committed_fixtures_are_regenerable_and_drift_is_caught` 会按设计报警，确认是预期改动后重录即可。**换检出目录会误报**（`meta.json` 里写死绝对 `workspace_root`），所以不要在 `git worktree` 里跑套件。
-
-### 11.3 已知欠账
-
-1. **`--shareable` 名不副实**：`tools/trace.py` 的 `cmd_export` 有这个参数但完全没接线，只做 `--format otel|json` 派生视图。按 §8.4 的新口径，它要么做成诚实的最小版本（抹 URL query / 路径 / 用户名并在 meta 标 `redacted`，明确不做正文语义脱敏、且承认脱敏后不可回放），要么把参数删掉。
-2. **CLI 层与真 fixture 之间没有用例**：`tests/test_replay.py:test_cli_replay_overlay_flags` 用的是合成 cassette，只证明 CLI 参数透传到 `ReplaySession`。风险有限（`cmd_replay` 只是透传五个参数）。
-3. **回放匹配器是否改成按签名分桶的 FIFO 游标**：待拍板。收益大（支持代码合法地增删/重排调用），但动的是已入库的回放核心。
-4. **L3 的「真删成功」证据很薄**：唯一真现场 0 删除，而这是**真结论不是没试到**（见 §10 已定项 11）。轮级 ddmin 真删成功、`repatch_b_group` 在删除后重算 B 组、`unconsumed` 非空这三条路径**从未被真跑过**——要拿到它们，得造一份**多用户轮**的真现场。
-5. **L3 报告里 `replays` 与 `derived_from` 的数字不一致**（一个含导出后复核、一个不含），待统一。
-6. **`tools/trace.py` 的汇总行打印「请求 ? 条」**：cassette 的 `meta.json` 没有 `request_count` 键，纯显示问题。
-7. **生产路径的真实条件未验证**：真实网络 / 真 key、真 TTY、真 Ctrl-C 信号、`TRACE_LEVEL=stream` 落在生产入口、30 天保留期、>5MB 告警——只跑过假 transport + headless。
-
-### 11.4 这套工具的「上战场」记录
-
-唯一一次拿它排查真问题的记录（2026-10-15）：`debug_filtered.txt` 里那条 `turn_end:stuck / retries=4 / reasoning=我再想想`，用 `TRACE_ENABLED=1` + 真 `chat()` 入口录下来（只换假 transport，因为本地 LLM 未起、不许触网），trace 一次给出三件手工留痕给不了的事实：
-
-1. nudge 被拼进末条 user（四轮 `msgs=2`、`bytes` 122 → 292 → 462 → 632），用户原话被逐轮改写；
-2. `llm_request` 4 次而 `thinking_only_retry` 只有 3 条——`+= 1` 写在 `<= 3` 之前，第 4 次请求已经发出去了；
-3. `validate_events()` 报 `request_index 回退：3 → 0`——`set_tool_round()` 清零了请求号。
-
-三条都已修并补了回归用例（§10 已定项 9、10）。**这次现场没有入库**（`tmp/_probe_stuck/`，一个真 token 都没有），只作诊断材料。
-
-### 11.5 怎么验证
-
-```bash
-# 全套件（唯一权威清单在 run_tests.py 的 SUITES，当前 15 项）
-DS_KEY=sk-selftest-not-a-real-key python run_tests.py
-
-# 单份现场：抽取 → 回放
-python -m tools.trace extract-cassette tmp/traces/<sid> --out tmp/cas/<name>
-python -m tools.trace replay tmp/cas/<name> --question "<原问题>"
-
-# 生产开录
-TRACE_ENABLED=1 python loop_agent_v2.py
-```
-
-两处环境坑：`os.makedirs(path, mode=0o700)` 在 Windows 上会把目录建成**自己都进不去**（`harden_dir` 已改成不传 mode）；`pwsh` 的 `Set-Content` / `>` 按 cp936 落盘会毁掉 UTF-8 中文，写文件用 `[System.IO.File]::WriteAllText(path, text, [System.Text.UTF8Encoding]::new($false))`。

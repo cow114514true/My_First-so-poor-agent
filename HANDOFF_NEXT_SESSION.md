@@ -79,7 +79,7 @@ set DS_KEY=sk-dummy      # cmd / $env:DS_KEY="sk-dummy" (PowerShell)：必须先
 python run_tests.py      # 逐套件起子进程跑，退出码非 0 = 有失败
 ```
 
-- 套件在 `tests/` 下。清单的唯一权威是 `run_tests.py` 的 `SUITES`（当前 10 个）。新增套件必须加进去，否则不会跑到。
+- 套件在 `tests/` 下。清单的唯一权威是 `run_tests.py` 的 `SUITES`（当前 **15** 个：`test_code_index` / `test_multi_agent` / `test_interrupt` / `test_vision_tool` / `test_shell_tools` / `test_tui_markdown` / `test_security_hardening` / `test_purpose` / `test_compaction` / `test_runner_visibility` / `test_trace` / `test_prod_recording` / `test_replay` / `test_migrate` / `test_shrink`）。新增套件必须加进去，否则不会跑到。
 - 纯逻辑、不触网、不需要本地服务，但 **`DS_KEY` 必须有值**：`loop_agent_core/config.py` 在 import 时构造 `OpenAI()`，缺 key 直接 `OpenAIError: Missing credentials` → 只要 import 到 config 的套件全挂。给假值即可，不会真的调 API。此坑已写进 `config.py` 与 `run_tests.py` 注释。
 - 套件落在 `tests/` 后，各文件的 `sys.path` 补丁与 `tmp/`、`conversations/` 锚点已改成"仓库根"。新加套件照抄 `tests/test_compaction.py` 开头那两行。
 - `test_vision.py` 不在 SUITES 里，是**手动**视觉连通性脚本（需本地 llama.cpp）。别当漏登记去"补上"。
@@ -88,12 +88,22 @@ python run_tests.py      # 逐套件起子进程跑，退出码非 0 = 有失败
 
 ## 四、下一步（按优先级）
 
-### 1) Trace & Replay 施工（当前主线，尚未动一行代码）
-- 设计已定稿：`TRACE_REPLAY_DESIGN.md`（v13，含 5 项待定结论）+ `TRACE_REPLAY_BUILD.md`（交付物表 + 代码落点表）。
-- 落点行号记于清理前的 HEAD `6564406`，此后已被本文件的两次改写作废。以函数名为准定位，别信数字。
-- 待建文件全部不存在：`loop_agent_core/{llm,toolclass,trace,checkpoint,cassette,replay}.py`、`tools/{trace,trace_migrate,shrink}.py`、`tests/`。
-- 阶段 0 必须先做：LLM 出口归一 + 全 17 个 `_notice` 调用点补稳定 code + `turn_end` 事件。`_notice` 现签名为 `_notice(level, message)`（`loop_agent_core/runner.py`），3 参数版尚未实现，是阶段 0 的产物。它是回放与断言的前置，跳过则后面全部返工。
-- 新依赖：`zstandard`。
+### 1) Trace & Replay 施工（阶段 0–5 已落地，欠账见下）
+- 规格与落点：`TRACE_REPLAY_DESIGN.md`（v13）+ `TRACE_REPLAY_BUILD.md`（§1 交付物表、§2 代码落点表、§3–§8 各阶段规格、§9 验收清单、§10 已定项）。落点以**符号名**为准，行号会随同文件其他改动漂移。
+- 已落地：阶段 0（`llm.py` 网关 / `toolclass.py` / 断言 id 词表）、阶段 1（`trace.py` / `checkpoint.py` / `cassette.py` / `tools/trace.py`，含 §4.10 生产开录）、阶段 2（`tools/trace_migrate.py`）、阶段 3（`replay.py`）、阶段 4（`overlay.py` + L2 工具策略）、阶段 5 的**阶段 1（轮级 ddmin）**。阶段 5 的阶段 2（历史组）只留 `history_group_units()` 接口。
+- 验收：#1–#38 全在套件里，`run_tests.py` 的 `SUITES` 共 **15** 项，`test_trace.py` 35 条 / `test_replay.py` 48 条 / `test_migrate.py` 14 条 / `test_shrink.py` 11 条 / `test_prod_recording.py` 10 条。
+- 生产开录怎么用：`TRACE_ENABLED=1 python loop_agent_v2.py`（TUI 直接 `python tui.py`）。开关只在会话起点求值一次；档位归 `TRACE_LEVEL`（默认 `assert`）；失败现场记 `retention=failure` 默认保留，`python -m tools.trace clean --older-than 30d` 只清正常会话，清失败现场要显式 `--include-failures`。
+- 入库 fixture 在 `tests/fixtures/replay/`：`fingerprint_tool_round`（文件级指纹 + 一次 `get_date`）、`positional_stuck`（真失败现场，3 条响应、`turn_end:reason=stuck`，L3 唯一真实输入）、`l2_file_ops`（B 类写 → A 类读 → 递归扫描，L2 三类重写的真覆盖）。`tests/fixtures/replay/_regenerate.py` 是同源闸门：重录只写 `tmp/`、`--check` 不写盘；改了请求形状后 `test_committed_fixtures_are_regenerable_and_drift_is_caught` 会按设计报警。**换检出目录会误报**（`meta.json` 写死绝对 `workspace_root`），故不要在 `git worktree` 里跑套件。
+- 已知欠账（按价值排）：
+  1. `tools/trace.py` 的 `cmd_export` 有 `--shareable` 参数但**完全没接线**，只做 `--format otel|json` 派生视图。按 §8.4 口径要么做成诚实的最小版本（抹 URL query / 路径 / 用户名并在 meta 标 `redacted`，明确不做正文语义脱敏、且承认脱敏后不可回放），要么把参数删掉。
+  2. L3「真删成功」的**证据很薄**：唯一真现场 0 删除，而这是真结论不是没试到（`positional_stuck` 只有 3 条响应，只留 2 条时 `_empty_retries` 到不了预算，`reason=stuck` 那条饱和分支根本不触发）。轮级 ddmin 真删成功、`repatch_b_group` 删除后重算、`unconsumed` 非空这三条路径从未被真跑过——要拿到得先造一份**多用户轮**的真现场。
+  3. CLI 层与真 fixture 之间没有用例：`test_cli_replay_overlay_flags` 用的是合成 cassette，只证明命令行参数透传到 `ReplaySession`。
+  4. 回放匹配器是否改成「按签名分桶的 FIFO 游标」（支持代码合法地增删/重排调用）待拍板；动的是已入库的回放核心。
+  5. L3 报告里 `replays`（含导出后复核）与 `derived_from` 里记的数字不一致。
+  6. `tools/trace.py` 的汇总行打印「请求 ? 条」：cassette 的 `meta.json` 没有 `request_count` 键，纯显示问题。
+  7. 生产的真实条件未验证：真网络 / 真 key、真 TTY、真 Ctrl-C、`TRACE_LEVEL=stream` 落在生产入口、30 天保留期、>5MB 告警——只跑过假 transport + headless。
+- 唯一一次拿它排查真问题的记录：`debug_filtered.txt` 里那条 `turn_end:stuck / retries=4 / reasoning=我再想想`。开录后 trace 一次给出三件手工留痕给不了的事实——nudge 被拼进末条 user（四轮 `msgs=2`、字节数 122 → 292 → 462 → 632，用户原话被逐轮改写）、`llm_request` 4 次而 `thinking_only_retry` 只有 3 条（计数先加后判，第 4 次请求已经发出去）、`validate_events()` 报 `request_index 回退：3 → 0`（`set_tool_round()` 清零了请求号）。三条都已修并补了回归用例。那条现场**未入库**（`tmp/_probe_stuck/`，一个真 token 都没有），只作诊断材料。
+- CONTENT：本文件不存放施工细节，只放下个会话必需的坐标与欠账；规格一律查 `TRACE_REPLAY_BUILD.md`。
 
 ### 2) 攒真实前缀缓存数据（埋点已就绪，成本最低）
 - 现只有 2 条样本（`hit_ratio` 0.97 @ `gap_s:null`；0.84 @ `gap_s:84.8s`），不足以判断任何事。
@@ -123,7 +133,7 @@ python run_tests.py      # 逐套件起子进程跑，退出码非 0 = 有失败
 - 多模型运行时切换：设计稿 `MULTI_MODEL_SWITCH_DESIGN.md`，未开工。
 
 ### 7) 工作区现状
-- HEAD = 分次提交后的 `master`（`git log --oneline -10` 可见这 10 个提交：toolclass → llm → trace → checkpoint → cassette → replay → cli → tests 迁移 → trace/replay 用例 → 本文档）。`git status` 无输出，工作区干净。
+- HEAD = `28f7294`（`docs(trace): 实施状态交接与 §10 已定项`），工作区干净。Trace & Replay 的阶段 0–5 就是最近这一串提交：`c119ac1` toolclass → `ed8fc0f` llm → `385fbdd` trace → `581bd5c` checkpoint → `a65f65f` cassette → `c69e1d5` replay → `12cafa0` 生产开录 → `1a65514`/`9ee6332` 迁移器 → `6623f29` overlay → `17481ef` shrink → `f36bffa`/`e101ba1`/`9eb6e79` 三处修复 → `b430658` 重录 fixture → `28f7294` 文档。
 - 根目录已整理（2026-10-13）：11 个测试脚本 → `tests/`（`git mv` 保留历史）；`convolution.ts`、`demo_headroom.py`（依赖被排除的 headroom）、`draw_square.ps1`+`square.png`（画图产物）、`deepseek_tokenizer.py`（孤儿 HF 片段，无人引用）、`agent/`（与 agent 产品无关，实为 mark_coin.ps1）→ `archive/`。**`archive/` 只在本机，不入库**（`deepseek_tokenizer.py` 已从版本库删除，副本留在本地归档）。
 - 刻意不入库的杂物（见 `SECURITY_AUDIT_REPORT.md` 的"明确排除"）：`archive/`（本地归档）、`headroom/`、`test_claude/`（两个第三方克隆，合计约 145MB）、`tools_work/`、`git/`（空仓库）、`screenshots/`（运行时产出，已 gitignore）。**没动它们**，因为都已在 ignore 规则里；要真删得单独确认。
 - **`tokenizer.json`（7.8MB）与 `tokenizer_config.json` 不能移**：`loop_agent_core/tokens.py:20` 从 `WORK_DIR`（=仓库根）读它做精确计数。曾差点被当杂物归档。
