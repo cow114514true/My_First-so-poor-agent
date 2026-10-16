@@ -273,6 +273,9 @@ def build_meta(trace_dir: str, events: list, *, playback_mode: str = PLAYBACK_FI
         "trace_epoch": src.get("trace_epoch") or trace_mod.trace_epoch(),
         "derived_from": derived_from,
         "expected_assertion": expected_assertion,
+        # 请求条数写进 meta，`tools/trace.py extract-cassette` 才能直接显示；
+        # 它同时也是 L3 报告的 response_count 口径（每条 llm_request 对应一条响应）。
+        "request_count": len([e for e in events if e.get("type") == "llm_request"]),
         "session_id": src.get("session_id"),
         "model": src.get("model"),
         "backend": src.get("backend"),
@@ -672,6 +675,77 @@ class Cassette:
                     for part in content:
                         if isinstance(part, dict) and part.get("type") == "text":
                             return part.get("text") or ""
+        return None
+
+    # ── 多轮切分（§4.7 回放的消费单位）──────────────────────────
+    def turns(self) -> list:
+        """把录制按 turn_start 切成用户轮，供多轮回放消费。
+
+        每轮返回：{index, start, end, request_indices, question, assertion_ids}。
+        `question` 取该轮**第一条 llm_request** 上下文里的末条 user 消息——那正是
+        runner 当时追加进会话的问题文本（记忆注入已合并其中）。回放时把它原样传回
+        chat_fn，就能让第一轮到最后一轮都对准录制。
+
+        没有 turn_start 的旧 cassette / 合成流退化成"整段一轮"，与单轮回放行为一致。
+
+        L3 最小化删掉一整轮的**可删载荷**时，该轮的 ``turn_start`` 作为控制流固定项会
+        留下来（§16.3 的结构不变式：删除单元只覆盖可删载荷）。这种空块不是一个还能
+        回放的用户轮，直接跳过；否则多轮回放会把"载荷已被删"误判成"问题解析不出"。
+        """
+        starts = [i for i, e in enumerate(self.events) if e.get("type") == "turn_start"]
+        if not starts:
+            starts = [0]
+        turns = []
+        for idx, lo in enumerate(starts):
+            hi = starts[idx + 1] if idx + 1 < len(starts) else len(self.events)
+            evs = self.events[lo:hi]
+            ris = [e.get("request_index") for e in evs if e.get("type") == "llm_request"]
+            if not ris:
+                continue  # 空轮（载荷已被 L3 删除，只剩控制流标记）：不是用户轮
+            turns.append({
+                "index": len(turns),
+                "start": lo,
+                "end": hi,
+                "request_indices": ris,
+                "question": self.question_in(ris[0]),
+                "assertion_ids": trace_mod.assertion_ids(evs),
+            })
+        return turns
+
+    def question_in(self, request_index):
+        """取某请求上下文里的用户问题文本（pre_request 快照优先，退回 llm_request.messages）。
+
+        取**末条** user 消息而不是首条：会话可能带着 /load 进来的历史，首条 user 是别人的旧话，
+        只有末条才是本轮刚追加、需要原样喂回 chat_fn 的那一句。
+        """
+        req = None
+        for e in self._requests:
+            if e.get("request_index") == request_index:
+                req = e
+                break
+        if req is None:
+            return None
+        messages = None
+        try:
+            snap = self.load_for_request(request_index, kind="pre_request")
+        except Exception:  # noqa: BLE001 —— 没有快照不算致命，退回请求体
+            snap = None
+        if snap is not None:
+            messages = snap.get("messages_inline")
+        if messages is None:
+            messages = req.get("messages")
+        if not isinstance(messages, list):
+            return None
+        for m in reversed(messages):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            content = m.get("content")
+            if isinstance(content, str) and content.strip():
+                return content
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        return part.get("text") or ""
         return None
 
     def store(self) -> CheckpointStore:

@@ -968,9 +968,13 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # ── trace 上下文：本回合的 turn 号 + 会话标识 ───────────────
     # 在写任何事件之前绑定：后面 llm/tool/turn_end 事件都按这个 turn 归组，
     # 序列对不上时回放就能明确报"是这一轮的哪个位置开始分叉"。
+    #
+    # turn 号取会话级自增的 next_turn：早先写的是 trace.current_context().turn，
+    # 而该字段从没人推进，于是**每个用户轮的 turn_start/turn_end 都记成 turn=0**，
+    # trace 里分不出轮。多轮回放（replay.all_turns）正需要这个轮号来定位。
     from . import trace
-    trace.begin_turn(trace.current_context().turn,
-                     session=str(conv.get("_session_id") or "main"))
+    conv["_user_turn"] = _user_turn = next_turn(conv)
+    trace.begin_turn(_user_turn, session=str(conv.get("_session_id") or "main"))
     _turn_started = time.time()
 
     # 初始化消息 token 记账（首次）
@@ -989,7 +993,7 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     # 三层压缩（L0/L1）只在主会话启用；worker 会话生命周期短，本轮不压。
     # L2 硬裁剪对两者都生效（worker 原先也走 _prune_messages）。
     active_summarize = summarize_fn if is_main_session else None
-    conv["_user_turn"] = next_turn(conv)
+    # turn 号的推进已提到上面的 begin_turn 处，这里不再重复 next_turn。
     # 压缩记账必须挂在跨轮存活的 _compact_state 上：conv 每次 chat() 都是新建的包装 dict，
     # 直接写在 conv 上会让计数器每轮归零（MIN_ROUNDS/MAX_PER_SESSION 退化成"每轮"口径）
     _st = cstate(conv)
@@ -997,7 +1001,11 @@ def chat_impl(question, on_event, conv, tool_call_map, delegate_fn,
     _st.setdefault("_dedup_saved", 0)
     _st.setdefault("_compact_last_turn", None)
     # 添加用户问题（记忆注入合并进问题文本，避免额外 user 消息破坏 user/assistant 交替协议）
-    if is_main_session and not any(
+    # 回放时**不再注入记忆**：录制下来的那条用户消息已经包含注入文本，回放器传的就是它；
+    # 再注入一次会让请求与录制指纹不符，多轮回放从第二轮起就全错位。
+    from . import replay as replay_mod
+    _in_replay = replay_mod.active_session() is not None
+    if is_main_session and not _in_replay and not any(
         m.get("role") == "user" and "[长期记忆" in str(m.get("content", ""))
         for m in conv["messages"]
     ):

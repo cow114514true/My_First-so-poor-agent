@@ -168,7 +168,7 @@ def _extract(rec, name, **kw):
 
 
 def _replay(cass_dir, question=None, *, mode=None, strict=False, name="rep",
-            tool_text="真执行了！！", check_env=False):
+            tool_text="真执行了！！", check_env=False, all_turns=False, reseed=False):
     """跑一次回放。工具被换成"真执行了"以便证明回放**没有**真执行。"""
     run_dir = _fresh_dir(_TRACE_ROOT, name)
     _LAST_RUN["dir"] = run_dir
@@ -180,7 +180,8 @@ def _replay(cass_dir, question=None, *, mode=None, strict=False, name="rep",
     try:
         return replay.run_replay(cass_dir, question=question, conv=conv,
                                  run_dir=run_dir,
-                                 mode=mode, strict=strict, check_env=check_env)
+                                 mode=mode, strict=strict, check_env=check_env,
+                                 all_turns=all_turns, reseed=reseed)
     finally:
         if prev_tool is not None:
             la.TOOL_CALL_MAP["get_date"] = prev_tool
@@ -662,6 +663,82 @@ def test_skip_report_note_has_first_divergence():
         f"skip note 没带 message 内容：{note!r}"
     assert "skip" in "\n".join(report.lines()), report.lines()
 
+
+def _kind_entries(spec):
+    """spec: [(kind, model, request_index, user_content)] → 带 llm_end 的事件列表。"""
+    out = []
+    for kind, model, ri, content in spec:
+        msgs = [{"role": "user", "content": content}]
+        out.append({"type": "llm_request", "request_index": ri, "kind": kind,
+                    "model": model, "params": {"max_tokens": 10}, "stream": True,
+                    "messages": msgs})
+        out.append({"type": "llm_end", "request_index": ri, "kind": kind,
+                    "finish_reason": "stop", "message": {"content": "ok"}, "usage": {}})
+    return out
+
+
+def _bucket_drive(tr, kind, model, content):
+    return tr.create(kind, {}, {"model": model, "max_tokens": 10, "stream": True,
+                                "messages": [{"role": "user", "content": content}]})
+
+
+def test_signature_bucket_reorders_across_kinds():
+    """§6.3 分桶游标：混 kind 会话里现场把调用重排，仍逐条命中、零跳过。
+
+    单调全局游标 + 窗口 0 时会在这里第一次就报 NoMatchInWindow（summary 在录制里排第 2，
+    现场却先发 summary）；分桶后 chat / summary 各走各的 FIFO，互不错位。
+    """
+    entries = _kind_entries([("chat", "m", 0, "Q1"),
+                             ("summary", "s", 1, "块"),
+                             ("chat", "m", 2, "Q2")])
+    path = _synth_cassette("buckets-reorder", entries, playback_mode="fingerprint")
+    cas = cassette_mod.Cassette(path, check_env=False)
+    report = replay.ReplayReport(cas, "fingerprint")
+    tr = replay.ReplayTransport(path, cassette=cas, report=report, window=0)
+    assert len(tr.buckets) == 2, tr.buckets
+    _bucket_drive(tr, "summary", "s", "块")
+    _bucket_drive(tr, "chat", "m", "Q1")
+    _bucket_drive(tr, "chat", "m", "Q2")
+    assert [m["position"] for m in report.matches] == [1, 0, 2], report.matches
+    assert report.skips_count == 0, report.skips
+
+
+def test_signature_bucket_deletion_shows_unconsumed():
+    """§6.3 分桶支持「代码合法删调用」：被删掉的录制响应必须显式可见，不许静默变绿。"""
+    entries = _kind_entries([("chat", "m", 0, "Q1"),
+                             ("summary", "s", 1, "块"),
+                             ("chat", "m", 2, "Q2")])
+    path = _synth_cassette("buckets-delete", entries, playback_mode="fingerprint")
+    cas = cassette_mod.Cassette(path, check_env=False)
+    report = replay.ReplayReport(cas, "fingerprint")
+    tr = replay.ReplayTransport(path, cassette=cas, report=report, window=0)
+    _bucket_drive(tr, "chat", "m", "Q1")
+    _bucket_drive(tr, "chat", "m", "Q2")
+    assert [u["request_index"] for u in tr.unconsumed()] == [1], tr.unconsumed()
+    report.unconsumed = tr.unconsumed()
+    assert "未消费录制请求 1 条" in report.text(), report.text()
+    assert report.skips_count == 0, report.skips
+
+
+def test_signature_bucket_addition_without_spare_fails():
+    """§6.3 分桶不假装支持「凭空新增调用」：同 kind 多发而录制没有，必须报错。"""
+    entries = _kind_entries([("chat", "m", 0, "Q1")])
+    path = _synth_cassette("buckets-add", entries, playback_mode="fingerprint")
+    cas = cassette_mod.Cassette(path, check_env=False)
+    report = replay.ReplayReport(cas, "fingerprint")
+    tr = replay.ReplayTransport(path, cassette=cas, report=report, window=0)
+    _bucket_drive(tr, "chat", "m", "Q1")
+    try:
+        _bucket_drive(tr, "chat", "m", "Q2")
+        raise AssertionError("录制里没有第二条 chat，现场多发却成功了")
+    except replay.NoMatchInWindow as exc:
+        assert "签名 chat" in str(exc), str(exc)
+    # 新增一个录制里完全没有的 kind，同样报错而不是静默给空响应
+    try:
+        _bucket_drive(tr, "summary", "s", "块")
+        raise AssertionError("录制里没有 summary，现场新增却成功了")
+    except replay.NoMatchInWindow as exc:
+        assert "签名 summary" in str(exc), str(exc)
 
 def test_replay_does_not_touch_workspace():
     """回放不改工作区：仓库文件 mtime/sha256 不变，也不新增文件（§9 #26 的 L1 子集）。"""
@@ -1211,6 +1288,54 @@ def test_fixture_positional_banner_and_assertion():
     assert "未做请求指纹比对" in rep.text()
     assert rep.expected_assertion == "turn_end:reason=stuck"
     assert rep.reproduced, rep.text()
+
+
+# ── 多轮回放（§4.7）：turn_start 切轮 + all_turns 逐轮驱动 ─────────
+def test_cassette_turns_split_multiturn_fixture():
+    """§4.7 切轮：入库真会话按 turn_start 分成 3 个用户轮，问题/请求号/断言各归各轮。"""
+    cas = cassette_mod.Cassette(_fixture("multiturn_stuck"), check_env=False)
+    turns = cas.turns()
+    assert [t["question"] for t in turns] == ["想个办法", "再想一个", "还有别的吗"], turns
+    assert [t["request_indices"] for t in turns] == [[1, 2, 3], [4], [5]], turns
+    assert "turn_end:reason=stuck" in turns[0]["assertion_ids"]
+    assert turns[1]["assertion_ids"] == ["turn_end:reason=answer"]
+    assert turns[2]["assertion_ids"] == ["turn_end:reason=answer"]
+
+
+def test_replay_default_is_single_turn():
+    """回归：API 的 all_turns 默认关，单轮行为一字不改（只跑第一轮）。"""
+    rep = _replay(_fixture("multiturn_stuck"), mode="positional",
+                  name="fixture-mt-single", check_env=False)
+    assert rep.all_turns is False
+    assert rep.turns == []
+    assert rep.reproduced, rep.text()
+    assert "turn_end:reason=answer" not in rep.assertion_ids, rep.assertion_ids
+    # 后两轮的请求没人消费，必须显式可见（§6.3 的"删除必须可见"）
+    assert [u["request_index"] for u in rep.unconsumed] == [4, 5], rep.unconsumed
+
+
+def test_replay_all_turns_reproduces_every_user_turn():
+    """§4.7 全轮：3 个用户轮各跑一次 chat、5 个录制请求全消费，答案轮也复现。"""
+    rep = _replay(_fixture("multiturn_stuck"), mode="positional",
+                  name="fixture-mt-all", check_env=False, all_turns=True)
+    assert rep.all_turns is True
+    assert [(t["index"], t["question"]) for t in rep.turns] == [
+        (0, "想个办法"), (1, "再想一个"), (2, "还有别的吗")], rep.turns
+    assert rep.reproduced, rep.text()
+    assert rep.assertion_ids.count("turn_end:reason=answer") == 2, rep.assertion_ids
+    assert "turn_end:reason=stuck" in rep.assertion_ids, rep.assertion_ids
+    assert len(rep.matches) == 5, rep.matches
+    assert rep.unconsumed == [], rep.unconsumed
+
+
+def test_replay_all_turns_reseed_is_isolated_and_reproduces():
+    """reseed=True：每轮从该轮 pre_request 快照重置会话，隔离上一轮漂移，仍全轮复现。"""
+    rep = _replay(_fixture("multiturn_stuck"), mode="positional",
+                  name="fixture-mt-reseed", check_env=False,
+                  all_turns=True, reseed=True)
+    assert rep.reproduced, rep.text()
+    assert len(rep.turns) == 3, rep.turns
+    assert "turn_end:reason=stuck" in rep.assertion_ids, rep.assertion_ids
 
 
 def test_replay_transport_signature_matches_spec():

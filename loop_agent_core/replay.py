@@ -377,6 +377,20 @@ def strict_fingerprint(kind, model, params, messages, *, roots=None, tools=None)
     return _fingerprint(core)
 
 
+def request_signature(kind) -> str:
+    """请求签名：把调用流按「可互换的响应来源」分桶（§6.3 分桶游标）。
+
+    签名只取 `kind`，不取 model / params / messages：同一个 kind 的调用在真实会话里
+    本来就是**同一条响应流**（chat 的多轮、summary 的多次压缩尝试），而不同 kind 的调用
+    在录制里会**交错出现**。用全局单一游标时，一次 kind 交错就整体错位——明明每条都有
+    对应录制，却因为不在同一个窗口里而报「漂移」。
+
+    model / params / messages 是否真的变了仍由 `loose` 指纹判定，分桶不会放过它们：
+    桶只决定「从哪条流里按 FIFO 取」，取到之后照旧逐条比 loose。
+    """
+    return str(kind or "")
+
+
 # ── §6.5 差异归因 ───────────────────────────────────────────────────
 class DiffExplanation:
     """一次指纹不等的完整解释：哪些槽位解释了差异、值是否相等、剩下什么。"""
@@ -517,6 +531,13 @@ class ReplayReport:
         self.reproduced: bool | None = None
         self.mismatch: str | None = None
         self.overlay = None
+        # §6.3 分桶游标：录制里从未被现场消费的请求（代码合法删调用时可见），
+        # 由 ReplaySession 退出时从 transport 收上来。
+        self.unconsumed: list = []
+        # 多轮回放（run_replay(all_turns=True)）：按 turn_start 切出的用户轮。
+        # 单轮时为空，报告不打印这一段。
+        self.turns: list = []
+        self.all_turns = False
         # strict 预检记账：strict_hash 相等的请求直接放行（跳过结构化 diff），
         # 不等的才交给 explain_diff 归类。两个数分开记，才能证明"相等确实跳过了"。
         self.strict_equal = 0
@@ -554,9 +575,19 @@ class ReplayReport:
                    f"cassette={os.path.basename(self.cassette.dir)}")
         out.append(f"请求匹配 {len(self.matches)} 个 / 录制 {self.cassette.request_count()} 个；"
                    f"跳过 {self.skips_count} 个")
+        if self.turns:
+            out.append(f"多轮回放 {len(self.turns)} 轮：")
+            for t in self.turns:
+                q = str(t.get("question") or "")[:40]
+                out.append(f"  turn#{t['index']} 请求 {len(t.get('request_indices') or [])} 个"
+                           f" 问题={q!r}")
         for s in self.skips:
             out.append(f"  skip {s['from_position']}..{s['to_position']} "
                        f"(request_index={s['recorded_index']}) {s['note']}")
+        if self.unconsumed:
+            detail = "、".join(f"{u['request_index']}({u.get('kind')})"
+                                   for u in self.unconsumed[:6])
+            out.append(f"  未消费录制请求 {len(self.unconsumed)} 条：{detail}")
         for t in self.tolerated:
             out.append(f"  容忍槽位 {t['slot']}：录制={str(t['recorded'])[:80]} "
                        f"现场={str(t['live'])[:80]}")
@@ -693,8 +724,20 @@ class ReplayTransport:
         self.roots = record_roots(self.cassette.meta.get("workspace_root"))
         self.live_roots = replay_roots()
         self.calls: list = []
-        if self.mode == cassette_mod.PLAYBACK_POSITIONAL and self.report is not None:
-            self.report.banner = POSITIONAL_BANNER
+        # §6.3 签名分桶 FIFO 游标：每个 kind 一条独立响应流，各自按录制顺序消费。
+        # 全局 cursor 只留给按位模式（positional）；指纹模式的走位由 bucket_at 决定。
+        # 桶键只取 kind（request_signature）：混 kind 会话里一次交错就让全局游标整体
+        # 错位，而松散指纹本来就保证「只有同 kind 才可能匹配」，分桶不会放过真变化。
+        self.buckets: dict = {}      # signature -> [录制位置, ...]（升序）
+        self.bucket_at: dict = {}    # signature -> 该桶已消费到的下标
+        if self.mode == cassette_mod.PLAYBACK_POSITIONAL:
+            if self.report is not None:
+                self.report.banner = POSITIONAL_BANNER
+        else:
+            for pos in range(self.cassette.request_count()):
+                rec = self.cassette.request_at(pos)
+                self.buckets.setdefault(request_signature(rec.get("kind")), []).append(pos)
+            self.bucket_at = {sig: 0 for sig in self.buckets}
 
     # ── 匹配 ──────────────────────────────────────────────────────
     def _recorded_core(self, req: dict):
@@ -705,11 +748,20 @@ class ReplayTransport:
                                  tools=req.get("tools"))
 
     def _match_fingerprint(self, live):
-        """在 [cursor, cursor+W] 内找匹配；返回 (position, exact)。"""
-        n = self.cassette.request_count()
-        hi = min(n - 1, self.cursor + self.window)
+        """在该现场请求的**签名桶**里，从桶游标起按 FIFO 找 loose 命中（§6.3）。
+
+        桶按 request_signature(kind) 分，桶内 FIFO：同 kind 的调用按录制顺序消费，
+        不同 kind 在录制里怎么交错、现场又怎么重排，都不会互相错位。窗口 W 的语义
+        从「全局后 W 条」变成「本桶后 W 条」——这才让「同一段历史重跑一次都不该跳」
+        在混 kind 会话里也成立。返回 (position, exact, rec)。
+        """
+        sig = request_signature(live.get("kind"))
+        bucket = self.buckets.get(sig) or []
+        start = self.bucket_at.get(sig, 0)
+        hi = min(len(bucket) - 1, start + self.window)
         diffs = []
-        for pos in range(self.cursor, hi + 1):
+        for bi in range(start, hi + 1):
+            pos = bucket[bi]
             rec = self.cassette.request_at(pos)
             rec_loose = self._recorded_core(rec)
             if rec_loose != live["loose"]:
@@ -741,25 +793,28 @@ class ReplayTransport:
                     if ex.unclassified:
                         raise UnclassifiedDiff(
                             f"strict 差异未归类：{ex.unclassified}（录制 {rec.get('request_index')}）")
-            if pos > self.cursor and self.report is not None:
-                # 每个 skip 都要能解释"为什么跳过了这几条"（§9 #10）：只写"前移了"
+            if bi > start and self.report is not None:
+                # 每个 skip 都要能解释「为什么跳过了这几条」（§9 #10）：只写「前移了」
                 # 等于把差异藏起来——而跳过恰恰是最可能掩盖真实不匹配的地方。
                 # 给出**被跳过的那条录制请求**与现场的首个分叉 message。
-                skipped = self.cassette.request_at(self.cursor)
+                skipped_pos = bucket[start]
+                skipped = self.cassette.request_at(skipped_pos)
                 note = _first_diff(
                     canon_messages(skipped.get("messages") or [], self.roots),
                     live["canon_messages"])
-                self.report.add_skip(self.cursor, pos - 1, rec.get("request_index"), note=note)
+                self.report.add_skip(skipped_pos, bucket[bi - 1], rec.get("request_index"),
+                                     note=note)
+            self.bucket_at[sig] = bi + 1
             return pos, exact, rec
         detail = "\n".join(
             f"  position={p} request_index={r.get('request_index')} "
             f"{_first_diff(live['canon_messages'], canon_messages(r.get('messages') or [], self.roots))}"
             for p, r in diffs[:3])
         raise NoMatchInWindow(
-            f"滑窗 [{self.cursor}, {self.cursor + self.window}] 内没有匹配的录制请求。\n"
+            f"签名 {sig or '<none>'} 的桶 [{start}, {start + self.window}] 内没有匹配的录制请求"
+            f"（该 kind 共 {len(bucket)} 条，已消费 {start} 条）。\n"
             f"现场 loose={live['loose'][:16]} model={live['model']} kind={live['kind']}\n"
-            + (detail or "  （窗口内没有剩余请求）"))
-
+            + (detail or "  （本桶内没有剩余请求——现场比录制多发了这个 kind 的调用？）"))
     def create(self, kind=None, cfg=None, kwargs=None, **extra):
         """Transport 协议入口。
 
@@ -818,7 +873,30 @@ class ReplayTransport:
         return ReplayStream(self.cassette.chunks_for(ri))
 
     def finished(self) -> bool:
-        return self.cursor >= self.cassette.request_count()
+        if self.mode == cassette_mod.PLAYBACK_POSITIONAL:
+            return self.cursor >= self.cassette.request_count()
+        # 指纹模式：全部签名桶都消费到桶尾才算跑完（桶内 FIFO）。
+        return all(self.bucket_at.get(sig, 0) >= len(b) for sig, b in self.buckets.items())
+
+    def unconsumed(self) -> list:
+        """录制里没有被任何现场请求消费的请求（§6.3：代码合法删调用时可见）。
+
+        分桶之后「删掉一个调用」不再让后续整体错位，代价是那条录制的响应**没人取**。
+        它必须显式进报告，否则「回放通过」会把「录制有 5 条、现场只用了 3 条」这种
+        真实差异掩盖成绿色。
+        """
+        if self.mode == cassette_mod.PLAYBACK_POSITIONAL:
+            rest = list(range(self.cursor, self.cassette.request_count()))
+        else:
+            rest = []
+            for sig, bucket in self.buckets.items():
+                rest.extend(bucket[self.bucket_at.get(sig, 0):])
+        out = []
+        for pos in sorted(rest):
+            rec = self.cassette.request_at(pos)
+            out.append({"position": pos, "request_index": rec.get("request_index"),
+                        "kind": rec.get("kind")})
+        return out
 
 
 # ── §4.5 工具结果的归因 ─────────────────────────────────────────────
@@ -1008,6 +1086,10 @@ class ReplaySession:
         from . import llm as llm_mod
         llm_mod.set_transport(self._prev_transport)
         ReplaySession._active = self._prev_session
+        if self.report is not None:
+            # §6.3：分桶游标跑完后，录制里没被取用的请求必须显式留下，
+            # 否则「现场少发了调用」会被当成绿色通过。
+            self.report.unconsumed = self.transport.unconsumed()
         if self.overlay is not None and self.overlay.delete_on_exit:
             # overlay 是**这次回放的**副作用现场，不留到下一次：残留会让下一次回放
             # 从"上一次跑完的状态"起跑，隔离承诺和可复现性同时失效。
@@ -1039,7 +1121,7 @@ def tool_result_for(name, call_id):
     return s.tool_result(name, call_id)
 
 
-def conversation_from_cassette(cassette, question=None):
+def conversation_from_cassette(cassette, question=None, request_index=None):
     """从 cassette 还原"开始回放时的会话"（§4.7 A 组 + §4.8 checkpoints 的用途）。
 
     回放必须在**录制时的那个会话**上重跑。用 loop_agent_v2 的模块级全局会话会带着
@@ -1054,7 +1136,18 @@ def conversation_from_cassette(cassette, question=None):
     reqs = cassette.requests
     if not reqs:
         raise ReplayError("cassette 里没有 llm_request，无法还原会话")
-    first = reqs[0]
+    # 默认从第一条请求起步（单轮回放）；给了 request_index 就从那一轮的第一条请求
+    # 起步（多轮 reseed：把会话重置到该轮开始时的快照）。
+    first = None
+    if request_index is not None:
+        for r in reqs:
+            if r.get("request_index") == request_index:
+                first = r
+                break
+        if first is None:
+            raise ReplayError(f"cassette 里没有 request_index={request_index} 的请求")
+    else:
+        first = reqs[0]
     q = cassette.initial_question() if question is None else question
     snap = None
     ri = first.get("request_index", 0)
@@ -1090,7 +1183,7 @@ def run_replay(cassette_dir, *, chat_fn=None, question=None, conv=None, mode=Non
                strict=False, window=None, tool_policy="cassette", run_dir=None,
                on_event=None, trace_level="assert", check_env=True,
                overlay_root=None, overlay_read=False, exec_c=False, keep_overlay=False,
-               exec_date=False) -> ReplayReport:
+               exec_date=False, all_turns=False, reseed=False) -> ReplayReport:
     """跑一次完整回放并返回报告。
 
     现场自己带一个 trace writer：断言面必须从**这次回放**的事件流里读，而不是从
@@ -1099,6 +1192,12 @@ def run_replay(cassette_dir, *, chat_fn=None, question=None, conv=None, mode=Non
     `tool_policy="class"` 打开 §8.3：A 吐录制、B 在 overlay 里真执行、C 吐录制
     （`exec_c=True` 才真跑）。真执行只写 `tmp/overlay/<sid>/`，真实 WORK_DIR 的
     mtime/sha256 不变（§8.1/§8.2）。
+
+    `all_turns=True` 打开 §4.7 多轮：按 cassette 的 turn_start 逐轮调 chat_fn，会话
+    自然累积（上一轮的 assistant 回复留在 conv 里进入下一轮），复现整段会话而不是
+    只有第一个用户轮。任一解析不出问题就报错，**不静默少跑一轮**（少跑会伪装成通过）。
+    `reseed=True` 是逃生口：每轮开始前把会话重置到该轮第一条请求的 pre_request 快照，
+    用于"上一轮回放偏了、但想单独定位某轮"的场合。
     """
     # 注意：`loop_agent_v2` 是仓库根的顶层模块（不是 loop_agent_core 的子模块），
     # 早先这里写成 `from . import loop_agent_v2` 会 ImportError，把回放的默认入口整条打断。
@@ -1123,9 +1222,31 @@ def run_replay(cassette_dir, *, chat_fn=None, question=None, conv=None, mode=Non
             # 下一次调用就会惰性构建出真网关，回放静悄悄地打到了线上。
             if conv is None:
                 conv = conversation_from_cassette(session.cassette, question=question)
-            if question is None:
-                question = session.cassette.initial_question()
-            result = chat_fn(question, on_event=on_event, _conv=conv)
+            turns = session.cassette.turns()
+            if all_turns and len(turns) > 1:
+                # 多轮：逐轮驱动。任一问题解析不出就报错——静默跳过一轮会让"复现了"
+                # 变成一种假象（现场只跑了一半却报绿）。
+                for t in turns:
+                    if not t.get("question"):
+                        raise ReplayError(
+                            f"第 {t['index']} 轮解析不出用户问题，拒绝静默少跑一轮")
+                session.report.all_turns = True
+                session.report.turns = [
+                    {"index": t["index"], "question": t["question"],
+                     "request_indices": t["request_indices"]}
+                    for t in turns
+                ]
+                for t in turns:
+                    if reseed:
+                        # 逃生口：每轮重置到该轮开始时的快照，隔离上一轮的偏差。
+                        conv = conversation_from_cassette(
+                            session.cassette, question=t["question"],
+                            request_index=t["request_indices"][0])
+                    result = chat_fn(t["question"], on_event=on_event, _conv=conv)
+            else:
+                if question is None:
+                    question = session.cassette.initial_question()
+                result = chat_fn(question, on_event=on_event, _conv=conv)
     finally:
         try:
             if writer is not None:

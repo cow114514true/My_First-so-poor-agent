@@ -173,8 +173,10 @@ def test_request_index_is_monotonic_across_tool_rounds():
     # 预算 3 次：3 个请求（序号 1..3）。旧行为发 4 个——那是 `+= 1` 在判断**之前**
     # 导致"计到 4 才落在 `<= 3` 之外"，而第 4 次请求已经发出去了。
     assert ri == [1, 2, 3], ri
+    # 轮号从 1 起（`runner.chat` 每轮推进 `next_turn(conv)` 再 `begin_turn`；曾把从不
+    # 推进的 `trace.current_context().turn` 传进去，于是所有轮都记成 0）。
     turn = [e["turn"] for e in r["stored"] if e["type"] == "turn_end"]
-    assert turn == [0], turn
+    assert turn == [1], turn
     # 预算用尽之后那条 notice 不能退回 request_index=0：轮级事件挂的还是最后一次请求
     stuck = [e for e in r["stored"]
              if e["type"] == "notice" and e.get("code") == "stuck"]
