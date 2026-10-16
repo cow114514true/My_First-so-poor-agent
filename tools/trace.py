@@ -194,8 +194,8 @@ def _otel_view(events: list) -> list:
 def cmd_export(args) -> int:
     """派生视图导出（§10 已定项 4）：OTEL 不进 L0 存储层，只在这里生成。
 
-    `--shareable` 是 L2 的对外口径（§8.4：抹正文/文件内容/路径/URL query）——本阶段
-    只做 trace 自己的脱敏（密钥在写入时就已抹掉），额外抹正文的能力留在 L2。
+    这里只导出 trace 已有的事件：密钥等敏感字段在**写入时**就已抹掉；§8.4 的
+    "对外分享抹正文/路径/URL query"是 L2 的独立能力，不在本命令里。
     """
     d, events = _load(args.trace_dir)
     fmt = (args.format or "otel").lower()
@@ -319,7 +319,8 @@ def cmd_replay(args) -> int:
         args.cassette_dir, question=args.question, mode=args.mode, strict=args.strict,
         window=args.window, tool_policy=args.tool_policy,
         overlay_root=args.overlay_root, overlay_read=args.overlay_read,
-        exec_c=args.exec_c, keep_overlay=args.keep_overlay, exec_date=args.exec_date)
+        exec_c=args.exec_c, keep_overlay=args.keep_overlay, exec_date=args.exec_date,
+        all_turns=args.all_turns, reseed=args.reseed)
     print(report.text())
     if args.expected_assertion and report.expected_assertion != args.expected_assertion:
         print(f"✗ cassette 声明的目标断言 {report.expected_assertion!r} 与命令行给的 "
@@ -454,8 +455,6 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("trace_dir")
     q.add_argument("--format", choices=("otel", "json"), default="otel")
     q.add_argument("--out", default=None, help="输出文件（缺省打到 stdout）")
-    q.add_argument("--shareable", action="store_true",
-                   help="对外分享口径（正文抹除属 L2 §8.4 范围）")
     q.set_defaults(func=cmd_export)
 
     q = sub.add_parser("extract-cassette", help="抽取可独立回放的证据包（§4.8）")
@@ -492,7 +491,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="回放结束保留 overlay 目录，便于人工核对")
     q.add_argument("--no-exec-date", dest="exec_date", action="store_false",
                    help="get_date 不注入 trace_epoch 的日期，改吐录制结果")
-    q.set_defaults(func=cmd_replay, exec_date=True)
+    # 多轮（§4.7）默认开：用户跑 `trace replay` 期望的是"重放这段会话"，不是只跑第一轮。
+    # API 的 all_turns 默认关（现有单轮调用零影响），CLI 这一层显式打开。
+    q.add_argument("--single-turn", dest="all_turns", action="store_false",
+                   help="只回放第一个用户轮（默认按 turn_start 回放全部轮）")
+    q.add_argument("--reseed", action="store_true",
+                   help="每轮重置到该轮 pre_request 快照，隔离上一轮的偏差")
+    q.set_defaults(func=cmd_replay, exec_date=True, all_turns=True, reseed=False)
 
     q = sub.add_parser("clean", help="清理过期会话")
     q.add_argument("--older-than", default="30d")
