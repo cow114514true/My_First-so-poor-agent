@@ -505,16 +505,23 @@ strict_hash = sha256(raw(kind, model, params, messages))
 | `trim_notice` | 按 `render_prune_notice` 累加语义（`context.py:8,164`）与录制的 `limits` 重算 |
 | `workspace_path` | 按 §6.4 根表重写 |
 
-### 6.3 游标走位
+### 6.3 签名分桶的 FIFO 游标
+
+游标按请求签名分桶，桶内 FIFO（`replay.request_signature()` / `ReplayTransport.buckets`）：
 
 ```python
-cursor, W = 0, 8      # strict 模式 W = 0
+signature = kind                     # 只取 kind；model/params/messages 交给 loose 指纹
+buckets   = { sig: [录制位置, ...] }  # 升序
+at        = { sig: 已消费下标 }
+W         = 8                        # strict 模式 W = 0（按桶锁步）
 ```
 
-- 在 `[cursor, cursor+W]` 内搜 `loose` 命中。
-- 命中 `cursor+k`：`cursor..cursor+k-1` 记为 skipped，发 `replay_skip` 事件（含两侧 loose / strict 差异摘要），`cursor = cursor+k+1`。
-- 窗口内无命中：抛 `NoMatchInWindow`，输出两侧 diff。
-- 报告输出 skip 计数与每条 skip 的位置；漂移计入报告，测试通过与否由用例声明的 `skips` 阈值决定（钉死用例加 `assert skips == 0`）。
+- 现场请求只进自己的签名桶，在 `[at[sig], at[sig]+W]` 内搜 `loose` 命中。
+- 命中本桶下标 `k`：`at[sig]..k-1` 记为 skipped，发 `replay_skip` 事件（含两侧 loose / strict 差异摘要），`at[sig] = k+1`。
+- 本桶窗口内无命中：抛 `NoMatchInWindow`（消息点名签名桶与已消费数），输出两侧 diff。
+- 跑完把**没人取的录制请求**收进 `report.unconsumed` 并在报告里列出（`ReplaySession.__exit__` 回收）。
+- 报告输出 skip 计数与每条 skip 的位置；漂移计入报告，测试通过与否由用例声明的阈值决定（钉死用例加 `assert skips == 0`，删调用用例断言 `len(report.unconsumed)`）。
+- 支持「跨 kind 重排 / 合法删调用」；**不支持凭空新增调用**——同签名现场多发而录制没有剩余响应时照样 `NoMatchInWindow`。
 
 ### 6.4 路径归一化
 
@@ -571,6 +578,13 @@ class ReplayTransport:
 - `positional` 模式：按位消费 `llm_request` 序列对应的响应，跳过请求指纹比对；报告首行输出「按位回放（跳过请求指纹比对，仅保证响应序列）」。
 - `positional` 模式的失败判据取 `cassette_meta.expected_assertion`：在该次回放的 assert 级事件序列中查找该 id，找到即算复现。
 
+**多轮回放**（`run_replay(..., all_turns=False, reseed=False)`，API 默认关、CLI `trace replay` 默认开）：
+
+- `Cassette.turns()` 按 `turn_start` 把事件流切成用户轮，每轮带 `{index, start, end, request_indices, question, assertion_ids}`；载荷被 L3 删光、只剩控制流标记的空轮（无 `llm_request`）直接跳过——否则收缩器删掉某轮载荷后会多出一个「有 `turn_start` 没请求」的幻影轮。
+- `all_turns=True` 时逐轮调用 `chat_fn(question, _conv=conv)`，会话自然累积；任一轮解析不出用户问题就抛 `ReplayError` fail-closed，绝不静默少跑一轮。`reseed=True` 时每轮从该轮首个请求的 `pre_request` 快照重建 `conv`，用于隔离轮间状态。报告 `report.turns` 列出实际回放的轮。
+- 回放期间抑制长期记忆注入：录下的 user 文本已含注入内容，重注会改请求指纹、对不上。
+- L3 的 `replay_once` 固定传 `all_turns=True`，于是「删除一个轮单元」在谓词里就是真的少一次 `chat()`。
+
 ---
 
 ## 7. 阶段 3.5 / 5：L3 最小化
@@ -616,7 +630,7 @@ c2    = ddmin(c1,       units=history_groups, test=FAIL_same_assertion,
 - 单元固定项：首轮、含失败断言的轮、全部 assert 级控制流事件。实现上靠**结构**保证：删除单元只覆盖可删载荷事件（`llm_request` / `llm_chunk` / `llm_end` / `token_usage` / `tool_call` / `tool_result`），控制流事件不进任何单元，于是「永不删」不需要额外判据。
 - 分层删：轮单元之下再切出响应包（一次请求的 `llm_request` 到 `llm_end`）与工具包（`tool_call` 与配对的 `tool_result`），先删大块再细分。
 - 依赖保持：`tool_result` 不能在没有对应 `tool_call` 时存活、反之亦然。回放前先做投影校验，不合法的候选直接判 `PASS` 且**不花回放预算**——否则回放器会以 `ReplayToolMissing` / 漂移拒掉，等于白烧一次预算。
-- **本轮只实现阶段 1（轮级 ddmin）**。阶段 2 的单元从「对话态」派生，而把事件流重建成对话态的 converter 不存在；硬凑一份等于自己发明历史语义，缩出来的 cassette 就没法和真实回放对上。接口留在 `tools/shrink.py` 的 `history_group_units()`，接上去之前先写 converter，再用 `spine_guard()` 做守卫。
+- 阶段 2 的单元从「对话态」派生：`tools/shrink.py` 的 `history_group_units()` 取失败轮最后一个 `llm_request` 的 `messages` 与 `q_idx`，调用 `context._find_groups()` 切组，再把每个组映射回产生它的事件（助手消息 → 该次请求的响应包络，工具消息 → 配对的 `tool_call` / `tool_result`）。映射不出来源的消息（用户提问、注入的 nudge）所在的组一律 pin 住、不参与删除。注意 `_find_groups()` 只看当前提问**之前**的消息，因此失败轮为首轮时历史组为空——这是如实结论，不是接口没接上；报告 `guard.why` 会写明这一情况。候选守卫由 `spine_guard()` 承担。
 - 阶段 2 守卫：候选的响应序列相对 `spine` 只允许减少或保持，出现新增或重排即判该候选无效；响应数减少时记入报告。
 - 收缩后 checkpoint 的 B 组状态按新序列重算并覆盖源快照值。
 
@@ -685,10 +699,12 @@ c2    = ddmin(c1,       units=history_groups, test=FAIL_same_assertion,
 
 **L1（写入时，始终开启）**：抹掉 harness 会在回放时重新提供的值——env 密钥（`DS_KEY` / `VISION_API_KEY` / `TAVILY_KEY` / QQ secret / `sk-*` 模式）、`Authorization` header、cookie、clipboard 内容。替换为 `{"$redacted": "env:DS_KEY", "len": 35}`。所有省略采用可逆或可重取形式。这一层**不该被当成选项**：它有名字、有固定形状，规则定得准，成本几乎为零。
 
-**L2（导出时，`--shareable`）**：
+**L2（导出时，计划中的 `--shareable`）**：
+
+> 尚未实现：`cmd_export` 上那个未接线的 `--shareable` 参数已删除（§10 #6），不要照下面这行敲。这段留作 L2 的设计口径。
 
 ```
-python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>
+python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>   # 计划中，未实现
 ```
 
 额外抹用户正文、文件内容、路径、URL query。这一层存在，是因为**这些没有可靠的识别规则**：脚本判断不了「这段文本里有没有客户数据」——一段普通需求描述和一段必须保密的合同条款长得一模一样。所以分工是 L1 处理**能确定**的，L2 处理**不确定的一律抹掉**。
@@ -764,9 +780,9 @@ python -m tools.trace export --shareable tmp/traces/<sid> --out <dir>
 | 3 | overlay 建立方式与根位置 | 目录副本（`shutil.copy2`），根留 `tmp/overlay/<sid>/`；递归扫描类工具重写到 overlay 根（§8.1、§8.2） |
 | 4 | 存储格式 | 自研 JSONL；OTEL 作为派生视图 `python -m tools.trace export --format otel`，不进 L0 存储层（§4.1） |
 | 5 | L3 导出粒度 | 一个 fixture 一个失败轮次、一个 `expected_assertion`（§7.4） |
-| 6 | 脱敏口径 | L1 抹密钥类，写入时始终开启（不是选项）；入库判据是「bug 与正文无关」（换掉输入仍复现），靠**录制源头用合成输入**保证，不靠事后抹正文——事后抹会改掉请求指纹，回放找不到那个请求；必须原样重放的现场不入库（§8.4） |
-| 7 | L3 谓词与报告口径 | 三态 `FAIL` / `PASS` / `UNRESOLVED`：判等照抄回放器的 `exp in assertion_ids`；「换了个失败」判 `PASS` 并记 `substituted_assertion`；`UNRESOLVED` 只有超时与确定性护栏两个来源、按 delta debugging 原义当 `PASS`，超时是独立状态；不引入概率判据。报告另加 `unconsumed` / `critical_elements` / `substituted_assertion` 三栏。本轮只实现阶段 1（轮级），阶段 2 留 `history_group_units()` 接口（§7.1、§7.2、§7.3） |
+| 6 | 脱敏口径 | L1 抹密钥类，写入时始终开启（不是选项）；入库判据是「bug 与正文无关」（换掉输入仍复现），靠**录制源头用合成输入**保证，不靠事后抹正文——事后抹会改掉请求指纹，回放找不到那个请求；必须原样重放的现场不入库（§8.4）。`cmd_export` 上未接线的 `--shareable` 参数已删除（对外分享脱敏属 L2，不在 trace 导出层） |
+| 7 | L3 谓词与报告口径 | 三态 `FAIL` / `PASS` / `UNRESOLVED`：判等照抄回放器的 `exp in assertion_ids`；「换了个失败」判 `PASS` 并记 `substituted_assertion`；`UNRESOLVED` 只有超时与确定性护栏两个来源、按 delta debugging 原义当 `PASS`，超时是独立状态；不引入概率判据。报告另加 `unconsumed` / `critical_elements` / `substituted_assertion` 三栏。阶段 1 轮级 ddmin 与阶段 2 历史组 ddmin 均已实现：阶段 2 由 `history_group_units()` 从对话态派生单元，`spine_guard()` 保证响应序列只减不增不重排，失败轮为首轮时历史组为空并在 `guard.why` 写明（§7.1、§7.2、§7.3） |
 | 8 | 生产开录的开关、边界与保留策略 | 开关是单一判据 `TRACE_ENABLED`（`1` / `true` / `yes` / `on` / `strict`），只在会话起点求值一次，中途不改主意；档位仍归 `TRACE_LEVEL`；一次会话 = 一次进程级入口运行（TUI 取 `AgentTUI.run()`、CLI 取 `__main__` 输入循环），不取 `chat()`——`request_index` 要跨轮只增；收尾走 `try/finally` 且不外抛；失败现场（`tool_error:*` / `exception:*` / `turn_end:reason=<非 answer/interrupted>`）记 `retention=failure` 默认保留，正常会话记 `normal` 由 `python -m tools.trace clean --older-than 30d` 清，清失败现场要显式 `--include-failures`（§4.10、§4.9） |
 | 9 | thinking-only 重试的口径 | 预算 3 次、**先判后加**：饱和后不再发第 4 次请求，在两处循环顶（主循环与收尾段）提前返回，守卫位于 `_prep_context` / `_checkpoint` **之前**（那两处会为一次并不存在的请求推进 `request_index`）；每轮注入 nudge 前先把该轮思考存成一条 assistant 消息（`reasoning:: …`），nudge 独立成条、**不改写用户原话**（§3.x 落点为 `runner.py` 的 `_append_thinking_turn` / `_nudge_is_last`） |
 | 10 | `request_index` 的单调性 | 轮号与请求号是两件事：`set_tool_round()` **不清零** `request_index`，否则轮级事件（`notice` / `turn_end` / `checkpoint`）退回 `0`，`validate_events()` 会报 `request_index 回退`，回放侧也找不到归属。请求号只由 `writer.begin_request` 分配，跨轮只增（§4.5） |
-| 11 | L3 的轮级删除空间 | 轮级 ddmin 的空间由**源现场的请求条数**决定：`positional_stuck` 只有 3 条响应，且 3 条都是「预算耗尽的证据」——只留 2 条时 `_empty_retries` 到不了预算，`reason=stuck` 那条饱和分支根本不会触发（§7.1 的 `FAIL` 判据是成员判定，见 §7.4）。要拿到「真删成功」的证据需要一份**多用户轮**的真现场 |
+| 11 | L3 的轮级删除空间 | 轮级 ddmin 的空间由**源现场的请求条数**决定：`positional_stuck` 只有 3 条响应，且 3 条都是「预算耗尽的证据」——只留 2 条时 `_empty_retries` 到不了预算，`reason=stuck` 那条饱和分支根本不会触发（§7.1 的 `FAIL` 判据是成员判定，见 §7.4）。要拿到「真删成功」的证据需要一份**多用户轮**的真现场。已补：入库 `tests/fixtures/replay/multiturn_stuck`（3 个用户轮真现场）+ `test_shrink_multiturn_real_turn_deletion`（真删 `turn=2#1 / turn=3#2`，响应 5→3、`repatch_b_group` 重算）+ `test_shrink_multiturn_budget_stops_at_baseline`（预算耗尽停在基线）；回放侧的多轮真跑见 `test_replay_all_turns_reproduces_every_user_turn`（§6.6） |

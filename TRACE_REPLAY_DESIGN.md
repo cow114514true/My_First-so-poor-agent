@@ -424,16 +424,36 @@ strict_hash = sha256(raw(kind, model, params, messages))     # 仅作快速预�
 
 **跨会话说明**：压缩摘要内容参与 `loose`，因为它是模型生成的实义内容。这意味着 cassette **不支持跨会话复用**（同一份 cassette 只对产出它的那次会话有效）。这是有意的取舍：跨会话复用需要把摘要也归一化，那会把「压缩结果变了」这类真问题一起掩盖掉。
 
-### 6.3 游标走位
+### 6.3 签名分桶的 FIFO 游标
 
-- 在 `[cursor, cursor+W]` 内找匹配，`W` 默认 8，可配
-- 命中 `cursor+k`：`cursor..cursor+k-1` 记为 **skipped**，前进，写 `replay_skip` 事件（含被跳过项的 loose / strict 差异摘要）
-- 窗口内无命中：失败 + diff
-- `strict` 模式 `W=0`（锁步）**且**要求 §6.6 的判据全部成立；它只适用于 volatile 槽位全部为 `reinject`（或 `tolerate` 的差异已被显式接受）的 cassette
+游标不止一条：**按请求签名分桶，每个桶一条独立的 FIFO 游标**。签名只取 `kind`
+（`replay.request_signature()`），不含 model / params / messages——这些由 §6.1 的 `loose`
+负责判定，桶只决定「从哪条流里按顺序取」。
+
+```python
+buckets = { signature: [录制位置, ...] }   # 升序
+at      = { signature: 已消费到的下标 }
+W       = 8                                # strict 模式 W = 0（锁步按桶成立）
+```
+
+- 现场请求按自己的 `signature` 只进**本桶**，在 `[at[sig], at[sig]+W]` 内搜 `loose` 命中。
+- 命中本桶下标 `k`：`at[sig]..k-1` 记为 **skipped**，前移，写 `replay_skip` 事件
+  （含被跳过那几条的 loose / strict 差异摘要），`at[sig] = k+1`。
+- 本桶窗口内无命中：抛 `NoMatchInWindow`（点名签名桶与已消费数），输出两侧 diff。
+- 跑完后**本桶里没人取的录制请求要进报告**（`report.unconsumed`）：分桶让「代码合法地
+  删掉一个调用」不再让后续整体错位，代价就是那条录制的响应没人取——不显式报出来，
+  「录制 5 条、现场只用了 3 条」会被绿色通过掩盖。
+
+**为什么必须分桶**：混 kind 的会话（chat 与摘要器 summary 交错）里，全局单游标会把
+「一次 kind 交错」算成整体错位——现场先发 summary、录制里 summary 在第 2 位，窗口 0 的
+全局游标第一步就 `NoMatchInWindow`，可两条响应其实都在。分桶后各 kind 各走各的 FIFO，
+「跨 kind 重排调用」与「合法删掉某 kind 的调用」都自然成立；只有「凭空新增调用」
+（现场比录制多要一个同签名响应）仍必须失败——cassette 里没有多余响应可给。
 
 **skip 必须计入报告**，否则「跳了 30 条也算过」就是假绿。断言钩子：
 - 钉死用例：`assert skips == 0`
 - 漂移观测：`assert skips <= N`
+- 删调用观测：`assert len(report.unconsumed) == N`
 
 副产品（当一等功能做）：**skip 的位置就是 prompt 漂移的位置**，把「代码改动导致发给模型的东西变了」从隐性变成显性 diff。默认只报告、不失败——否则每调一次提示词都要重录，两周后没人维护。
 
@@ -595,7 +615,7 @@ python -m tools.trace_migrate conversations/*.json --out tmp/traces/
 > **反例警示**：`_store_tool_args` 的「省略」**不是** redaction，是**数据丢失**——它让 Bug 21/22（覆盖无备份、diff 自检失效）的现场永久不可回放。规矩：不可逆的省略不许做；要么可逆，要么回放时能重取。（这也是原则 ① 的另一种说法：落盘的是数据，不是「为了省地方而做的加工产物」。）
 
 **L2 — 导出时，显式 opt-in**
-`trace export --shareable`：额外抹用户正文、文件内容、路径、URL query。用途是把用例提交进仓库。
+`trace export --shareable`（计划中，尚未实现；`cmd_export` 上未接线的参数已删）：额外抹用户正文、文件内容、路径、URL query。用途是把用例提交进仓库。
 
 - **硬规矩：L2 产物必须通过回放自检才允许导出。** 红了说明 redaction 破坏了保真，或测试本来就在偷看明文。
 - 只有 L2 导出物进 `tests/fixtures/replay/`。
