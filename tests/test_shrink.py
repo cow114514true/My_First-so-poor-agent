@@ -4,12 +4,13 @@
 `except Exception`——被测代码用 `SystemExit` 表达"输入不对"，那是一条用例的失败，
 不该掀翻整个套件。
 
-真跑输入只有一份：`tests/fixtures/replay/positional_stuck/`。它是三个入库 fixture 里
-唯一"失败可复现"的现场（`turn_end:reason=stuck`，按位回放）。**入库 fixture 不许改**，
-收缩产物一律写到 `tmp/` 下。合成输入只用来打边界：失败换了另一个失败、超时、预算耗尽。
+真跑输入来自入库 fixture：`positional_stuck/`（单轮；三条响应都是必需的，ddmin 删不动）
+与 `multiturn_stuck/`（多用户轮；真会整轮删掉）。**入库 fixture 不许改**，收缩产物一律
+写到 `tmp/` 下。合成输入只用来打边界：失败换了另一个失败、超时、预算耗尽。
 """
 import json
 import os
+import re
 import shutil
 import sys
 
@@ -208,12 +209,16 @@ def test_shrink_guard():
     cas = _stuck_cassette()
     spine = shrink_mod.positional_spine(list(cas.events))
     assert len(spine) == 3, spine
-    # 收缩报告里带着守卫这一栏（本轮未启用，说明为什么）
+    # 收缩报告里带着守卫这一栏（阶段 2 已启用，无历史组时也要说明为什么）
     out = os.path.join(_SELFTEST, "guard", "cass")
     report = shrink_mod.shrink_cassette(_fixture("positional_stuck"), out,
                                         max_replays=40, runs=1, timeout=600, force=True)
     guard = report["guard"]
-    assert guard["enabled"] is False and guard["stage2_hook"] == "history_group_units()"
+    assert guard["enabled"] is True and guard["stage2_hook"] == "history_group_units()"
+    # 失败轮是首轮（q_idx=1），_find_groups 扫 messages[1:1]，拿不到历史组。
+    assert guard["groups"] == 0 and guard["groups_live"] == 0, guard
+    assert guard["groups_deleted"] == [], guard
+    assert "无可用历史组" in guard["why"], guard["why"]
     assert guard["response_count_before"] == 3, guard
     # 守卫报告必须与这次收缩**如实对应**：它记的减少量 = 真实减少量，
     # 且减少的条数要和 `deleted_units` 里的响应单元数对得上。
@@ -224,7 +229,72 @@ def test_shrink_guard():
     # 三次 thinking-only 重试的响应内容指纹完全相同（实测全是 2313f7b88d64d166），
     # 所以差值必须按位置+内容一起对齐算；用集合差会得出"删了一个还剩两个，什么都没少"。
     assert len(set(spine)) == 1, spine
-    assert shrink_mod.history_group_units(cas) == []
+    assert shrink_mod.history_group_units(list(cas.events),
+                                          expected_assertion=STUCK) == []
+
+
+# ── §7.2 阶段 2：历史组 converter ──────────────────────────────────
+def _prior_turn_events():
+    """两轮：turn0 正常答完，turn1 卡住；turn1 的首个请求带着 turn0 的对话态。"""
+    return [
+        {"type": "turn_start", "turn": 0, "seq": 0},
+        {"type": "llm_request", "request_index": 1, "seq": 1, "messages": [
+            {"role": "system", "content": "s"}, {"role": "user", "content": "q1"}]},
+        {"type": "llm_chunk", "request_index": 1, "seq": 2, "content": "a1"},
+        {"type": "llm_end", "request_index": 1, "seq": 3, "finish_reason": "stop"},
+        {"type": "turn_end", "reason": "answer", "seq": 4},
+        {"type": "turn_start", "turn": 0, "seq": 5},
+        {"type": "llm_request", "request_index": 2, "seq": 6, "messages": [
+            {"role": "system", "content": "s"}, {"role": "user", "content": "q1"},
+            {"role": "assistant", "content": "a1"}, {"role": "user", "content": "q2"}]},
+        {"type": "llm_chunk", "request_index": 2, "seq": 7, "content": "boom"},
+        {"type": "llm_end", "request_index": 2, "seq": 8, "finish_reason": "stop"},
+        {"type": "notice", "level": "warn", "code": "stuck", "seq": 9},
+        {"type": "turn_end", "reason": "stuck", "seq": 10},
+    ]
+
+
+def test_history_groups_empty_when_failing_turn_is_first():
+    """首轮失败没有"之前的历史"：三个入库 fixture 的历史组都为空。"""
+    for name in ("positional_stuck", "multiturn_stuck", "l2_file_ops"):
+        cas = cassette_mod.Cassette(_fixture(name), check_env=False)
+        groups = shrink_mod.history_group_units(list(cas.events),
+                                                 expected_assertion=STUCK)
+        assert groups == [], (name, [(g.name, g.indices) for g in groups])
+
+
+def test_history_groups_map_prior_turn_to_events():
+    """turn1 失败时，turn0 的对话态被切成历史组，且指回产生它的事件。
+
+    助手消息组能定位到 ri=1 的响应包络（llm_request/chunk/end → 索引 1,2,3）；
+    用户提问这类非事件产生的消息组必须 pin 住，绝不参与删除。
+    """
+    groups = shrink_mod.history_group_units(_prior_turn_events(),
+                                            expected_assertion=STUCK)
+    got = {g.name: (g.pinned, g.indices) for g in groups}
+    assert got == {"history[1:2]": (True, ()),
+                   "history[2:3]": (False, (1, 2, 3))}, got
+    for g in groups:
+        if g.pinned:
+            assert "非事件产生" in g.why, g.why
+
+
+def test_history_group_deletion_rejected_by_spine_guard():
+    """阶段 2 守卫：删历史组若动了 response 脊（这里把 ri=1 整条删掉），候选作废。"""
+    events = _prior_turn_events()
+    groups = shrink_mod.history_group_units(events, expected_assertion=STUCK)
+    group = [g for g in groups if not g.pinned][0]
+    # 阶段 1 收敛后的脊 = 剩下的响应序列；删掉 ri=1 后候选脊变短，仍在子序列内
+    spine = shrink_mod.positional_spine([events[i] for i in (6, 7, 8, 9, 10)])
+    kept = [events[i] for i in range(len(events)) if i not in set(group.indices)]
+    ok, note = shrink_mod.spine_guard(shrink_mod.positional_spine(kept), spine)
+    assert ok is True, note
+    # 反过来：往候选里塞进一个源序列没有的响应 → 不是子序列，守卫必须拒绝。
+    # （只加 llm_chunk 不够：没有配对的 llm_request，positional_spine 根本不认它。）
+    bogus = kept + [{"type": "llm_request", "request_index": 9, "seq": 99},
+                    {"type": "llm_chunk", "request_index": 9, "seq": 100, "content": "x"}]
+    ok2, note2 = shrink_mod.spine_guard(shrink_mod.positional_spine(bogus), spine)
+    assert ok2 is False, note2
 
 
 # ── §9 #37：一份 fixture 只带一个断言 ───────────────────────────────
@@ -324,6 +394,76 @@ def test_shrink_positional_stuck_end_to_end():
         r=report["replays"], b=report["response_count_before"],
         a=report["response_count_after"], d=report["deleted_events"],
         c=report["converged"]))
+
+
+# ── L3「真删成功」：多用户轮现场 ─────────────────────────────────────
+def test_shrink_multiturn_real_turn_deletion():
+    """真删：多用户轮现场被整轮删除，checkpoint B 组重算，报告与 meta 口径一致。"""
+    cas = cassette_mod.Cassette(_fixture("multiturn_stuck"), check_env=False)
+    units, _ = shrink_mod.build_units(list(cas.events), STUCK)
+    turns = [u for u in units if u.kind == "turn"]
+    assert len(turns) == 3, [u.name for u in turns]
+    pinned = [u for u in turns if u.pinned]
+    assert len(pinned) == 1 and "失败" in pinned[0].why, [u.why for u in turns]
+
+    out = os.path.join(_SELFTEST, "multiturn", "cass")
+    report = shrink_mod.shrink_cassette(_fixture("multiturn_stuck"), out,
+                                        max_replays=200, runs=1, timeout=600, force=True)
+    assert report["converged"] is True, report
+    assert report["verify"]["status"] == shrink_mod.FAIL, report["verify"]
+    assert report["response_count_after"] < report["response_count_before"], report
+    deleted_turns = [u for u in report["deleted_units"] if u.startswith("turn=")]
+    assert deleted_turns, report["deleted_units"]
+    # 删的必须是不含失败断言的那两轮，绝不能是首轮
+    assert pinned[0].name not in deleted_turns, deleted_turns
+    # 删掉整轮后 checkpoint 的 B 组必须按活值重算，否则下一轮请求的快照是旧世界的
+    assert report["checkpoint_b_patched"] > 0, report["checkpoint_b_patched"]
+
+    meta = json.load(open(os.path.join(out, cassette_mod.CASSETTE_META), encoding="utf-8"))
+    assert meta["expected_assertion"] == STUCK
+    assert meta["playback_mode"] == cassette_mod.PLAYBACK_POSITIONAL
+    assert STUCK in (meta.get("assertion_ids") or [])
+    # 欠账 #6：meta 里真有 request_count，且与导出后的请求条数一致
+    assert meta.get("request_count") == report["response_count_after"], (
+        meta.get("request_count"), report["response_count_after"])
+    # 欠账 #5：derived_from 记的回放次数必须等于报告里的 replays（含导出后复核那次）
+    m = re.search(r"replays=(\d+)", meta.get("derived_from") or "")
+    assert m, meta.get("derived_from")
+    assert int(m.group(1)) == report["replays"], (meta["derived_from"], report["replays"])
+    print("      ↳ 多轮现场：响应 {b}→{a}，删掉 {t}，B 组重算 {p} 份".format(
+        b=report["response_count_before"], a=report["response_count_after"],
+        t=deleted_turns, p=report["checkpoint_b_patched"]))
+
+
+def test_shrink_multiturn_budget_stops_at_baseline():
+    """预算只够基线那一次探测：一轮都不删，但仍必须给出可核对、能复现的报告。
+
+    全轮回放（all_turns）下，结果里保留下来的每个请求都会被重放消费，所以这里
+    `unconsumed` 应当为空——"非空 unconsumed" 是回放层的删除可见性属性，由
+    test_replay.py::test_signature_bucket_deletion_shows_unconsumed 覆盖。"""
+    out = os.path.join(_SELFTEST, "multiturn-budget", "cass")
+    report = shrink_mod.shrink_cassette(_fixture("multiturn_stuck"), out,
+                                        max_replays=1, runs=1, timeout=600, force=True)
+    assert report["converged"] is False, report
+    assert report["deleted_units"] == [], report["deleted_units"]
+    assert report["response_count_after"] == report["response_count_before"], report
+    # 就算没来得及最小化，导出后复核也必须仍能复现失败，否则这份报告没有意义
+    assert report["verify"]["status"] == shrink_mod.FAIL, report["verify"]
+    assert report["unconsumed"] == [], report["unconsumed"]
+
+
+# ── 欠账 #3：CLI 接在入库真 fixture 上 ───────────────────────────────
+def test_shrink_cli_on_real_fixture():
+    """CLI 入口（`python -m tools.shrink run`）直接吃入库真 cassette，不是合成品。"""
+    out = os.path.join(_SELFTEST, "cli", "cass")
+    rc = shrink_mod.main(["run", "--cassette", _fixture("positional_stuck"),
+                          "--out", out, "--max-replays", "120",
+                          "--runs", "1", "--timeout", "600", "--force"])
+    assert rc == 0, rc
+    meta = json.load(open(os.path.join(out, cassette_mod.CASSETTE_META), encoding="utf-8"))
+    assert meta["expected_assertion"] == STUCK, meta["expected_assertion"]
+    assert meta["playback_mode"] == cassette_mod.PLAYBACK_POSITIONAL
+    assert "shrink" in (meta.get("derived_from") or ""), meta.get("derived_from")
 
 
 def _run_all():

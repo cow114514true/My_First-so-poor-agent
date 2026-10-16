@@ -39,6 +39,7 @@ if _ROOT not in sys.path:
 
 from loop_agent_core import cassette as cassette_mod  # noqa: E402
 from loop_agent_core import checkpoint as checkpoint_mod  # noqa: E402
+from loop_agent_core import context as context_mod  # noqa: E402
 from loop_agent_core import replay as replay_mod  # noqa: E402
 from loop_agent_core import trace as trace_mod  # noqa: E402
 
@@ -144,17 +145,23 @@ def _bundles(events: list, lo: int, hi: int) -> list:
 def build_units(events: list, expected_assertion: str) -> tuple:
     """构造两阶段 ddmin 的单元树（§16.3）。
 
-    阶段 1 单元 = 用户轮（这里就是顶层单元）；阶段 2 单元 = 历史组，本轮**不实现**
-    （见 ``history_group_units``）。返回 ``(units, notes)``。
+    阶段 1 单元 = 用户轮（这里就是顶层单元）；阶段 2 单元 = 历史组，由
+    history_group_units 从对话态派生。返回 (units, notes)。
     """
     notes = []
     blocks = _turn_blocks(events)
-    failing_turn = None
-    for e in events:
+    # 失败轮按**事件下标**定位，不按 ``turn`` 字段：录制侧 ``begin_turn`` 传入的
+    # 是本进程 trace 上下文的 turn，而那个值从没被推进过，实测多用户轮的每条
+    # ``turn_start`` / ``turn_end`` 都挂着 `turn=0`。按字段匹配会让"含失败断言的轮"
+    # 命中所有轮 → 每轮都被钉成固定项，轮级 ddmin 一个整轮也删不掉（这正是
+    # L3「真删成功」一直拿不到证据的根因）。改用下标区间，轮身份只由它在事件流里的
+    # 位置决定，与 `turn` 字段是否可靠无关。
+    failing_index = None
+    for i, e in enumerate(events):
         if trace_mod.assertion_id(e) == expected_assertion:
-            failing_turn = e.get("turn")
+            failing_index = i
             break
-    if failing_turn is None:
+    if failing_index is None:
         # 源现场本身没有这个断言：调用方应当先确认它能复现。
         notes.append(f"源事件里找不到断言 {expected_assertion}（按 id 派生口径）")
     units = []
@@ -171,7 +178,7 @@ def build_units(events: list, expected_assertion: str) -> tuple:
         why = ""
         if is_first:
             why = "首轮（问题本身）"
-        if failing_turn is not None and events[lo].get("turn") == failing_turn:
+        if failing_index is not None and lo <= failing_index < hi:
             why = (why + " + 含失败断言的轮").strip(" +")
         # 轮单元只覆盖**可删载荷**；控制流事件（turn_start/turn_end/...）不在任何
         # 单元里，于是"全部控制流事件永不删"是结构上成立的，不靠自觉。
@@ -236,7 +243,7 @@ def check_projection(events: list) -> list:
     return problems
 
 
-# ── 阶段 2 的守卫（留接口，本轮不启用） ─────────────────────────────────
+# ── 阶段 2 的守卫 ─────────────────────────────────────────────────────
 def positional_spine(events: list) -> tuple:
     """响应序列的"脊"：每条响应的内容指纹，按发生顺序（§16.3）。
 
@@ -321,15 +328,144 @@ def spine_report(spine_before, spine_after) -> dict:
             "reduced": reduced}
 
 
-def history_group_units(cassette) -> list:
-    """阶段 2 的删除单元 = 历史组（``context._find_groups``）。
+# ── 阶段 2：事件流 → 对话态的 converter + 历史组单元 ────────────────────
+def _msg_key(msg: dict) -> str:
+    "消息身份：按内容做稳定摘要，用来对齐相邻两次请求的 messages 公共前缀。"
+    return trace_mod.digest({k: msg.get(k) for k in
+                             ("role", "content", "tool_calls", "tool_call_id", "name")},
+                            n=16)
 
-    **本轮不实现**：历史组是从"对话态"（``conv["messages"]``）派生的，而把事件流
-    重建成对话态的 converter 不存在——按位回放的现场并不携带 conv 快照，硬凑一份
-    等于自己发明一套历史语义，收缩结果就没法和真实回放对上。接口留在这里，
-    接上去时要做的第一件事是写 converter + 用 ``spine_guard`` 做守卫。
+
+def _response_span(events: list, ri) -> tuple:
+    "request_index=ri 的响应包覆盖的事件下标：llm_request → llm_end（含 token_usage）。"
+    a = None
+    for i, e in enumerate(events):
+        if e.get("type") == "llm_request" and e.get("request_index") == ri:
+            a = i
+            break
+    if a is None:
+        return ()
+    j = a + 1
+    while j < len(events) and events[j].get("type") not in ("llm_request", "llm_end"):
+        j += 1
+    if j < len(events) and events[j].get("type") == "llm_end":
+        j += 1
+    while j < len(events) and events[j].get("type") == "token_usage":
+        j += 1
+    return tuple(range(a, j))
+
+
+def _tool_span(events: list, call_id) -> tuple:
+    "call_id 对应的 tool_call / tool_result 事件下标（缺一个就返回空，宁可不删）。"
+    return tuple(i for i, e in enumerate(events)
+                 if e.get("type") in ("tool_call", "tool_result")
+                 and (e.get("call_id") or e.get("id")) == call_id)
+
+
+def _producers_before(events: list, target_pos: int) -> tuple:
+    """把事件流重建成 target_pos（一个 llm_request 事件下标）处的对话态。
+
+    返回 (messages, producers)：messages 是那条请求实际发出去的会话
+    （llm_request.messages——录制时真正的对话态），producers[k] 是产生
+    messages[k] 的事件下标元组，None 表示这条消息不是本 trace 里的事件产生的
+    （会话起点带着的历史、控制流注入的 nudge），因此不可删。
+
+    对齐方式：按请求顺序取相邻两次 messages 的公共前缀，尾部新增消息由前一条
+    请求的响应包（assistant）或紧随其后的工具包（tool）产生。公共前缀被压缩
+    改写而变短时，改写段无法归因，一律记 None——保守地当不可删，绝不替录制侧
+    发明历史。
     """
-    return []
+    positions = [i for i, e in enumerate(events) if e.get("type") == "llm_request"]
+    if target_pos not in positions:
+        return [], []
+    previous = list(events[positions[0]].get("messages") or [])
+    messages = previous
+    producers = [None] * len(messages)
+    target_i = positions.index(target_pos)
+    for p_i in range(1, target_i + 1):
+        pos = positions[p_i]
+        cur = list(events[pos].get("messages") or [])
+        common = 0
+        while (common < len(previous) and common < len(cur)
+               and _msg_key(previous[common]) == _msg_key(cur[common])):
+            common += 1
+        producers = producers[:common]
+        prev_ri = events[positions[p_i - 1]].get("request_index")
+        for k in range(common, len(cur)):
+            msg = cur[k] or {}
+            role = msg.get("role")
+            if role == "assistant":
+                producers.append(_response_span(events, prev_ri) or None)
+            elif role == "tool":
+                cid = msg.get("tool_call_id") or msg.get("call_id") or msg.get("id")
+                producers.append(_tool_span(events, cid) or None)
+            else:
+                producers.append(None)
+        previous = cur
+        messages = cur
+    return messages, producers
+
+
+def history_group_units(events: list, expected_assertion=None) -> list:
+    """阶段 2 的删除单元 = 失败轮之前的历史组（context._find_groups）。
+
+    converter 不发明语义：对话态直接取 llm_request.messages（录制时真正发出的
+    会话），提问下标 q_idx 取该轮首条请求的最后一条 message——runner.py 在轮首设
+    q_idx = len(messages) - 1，轮内工具轮不再前移。于是：
+
+    - 首轮失败（q_idx == 1）→ _find_groups 扫 messages[1:1] → 无历史组；
+    - 后续轮失败 → 组覆盖之前各轮的消息，按“助手消息→那条请求的响应包、工具消息→
+      对应 tool_call/tool_result”映射成事件下标。
+
+    组里只要有一条消息没有产出事件（用户提问本身、注入的 nudge），整组不可删、
+    标成固定项。返回 Unit 列表；expected_assertion 不给时取最后一条请求所在轮。
+    """
+    blocks = _turn_blocks(events)
+    failing_index = None
+    if expected_assertion:
+        for i, e in enumerate(events):
+            if trace_mod.assertion_id(e) == expected_assertion:
+                failing_index = i
+                break
+    block = None
+    if blocks:
+        for lo, hi in blocks:
+            if failing_index is not None and lo <= failing_index < hi:
+                block = (lo, hi)
+                break
+        if block is None:
+            block = blocks[-1] if failing_index is None else None
+    if block is None:
+        lo, hi = 0, len(events)
+    else:
+        lo, hi = block
+    reqs = [i for i in range(lo, hi) if events[i].get("type") == "llm_request"]
+    if not reqs:
+        return []
+    first_msgs = list(events[reqs[0]].get("messages") or [])
+    q_idx = len(first_msgs) - 1
+    if q_idx <= 0:
+        return []
+    messages, producers = _producers_before(events, reqs[-1])
+    if not messages:
+        return []
+    q_idx = min(q_idx, len(messages))
+    units = []
+    for start, end, _size, _prio in context_mod._find_groups(q_idx, {"messages": messages}):
+        indices, blocked = set(), ""
+        for k in range(start, end):
+            prod = producers[k] if k < len(producers) else None
+            if not prod:
+                blocked = "组内含非事件产生的消息（用户提问/注入的 nudge）"
+                break
+            indices.update(prod)
+        if blocked:
+            units.append(Unit(name=f"history[{start}:{end}]", kind="history",
+                              indices=(), pinned=True, why=blocked))
+        else:
+            units.append(Unit(name=f"history[{start}:{end}]", kind="history",
+                              indices=tuple(sorted(indices))))
+    return units
 
 
 # ── 真回放探针 ────────────────────────────────────────────────────────
@@ -376,7 +512,10 @@ def replay_once(cassette_dir: str, run_dir: str) -> dict:
     os.makedirs(run_dir, exist_ok=True)
     ids, consumed, err, live_calls = [], [], None, []
     try:
-        rep = replay_mod.run_replay(cassette_dir, run_dir=run_dir, check_env=False)
+        # all_turns=True：L3 的删除空间包含用户轮，回放必须**真的跑完剩下的轮**——
+        # 只跑第一轮时"删掉后面某轮仍复现"是假的（那些轮根本没被读过）。
+        rep = replay_mod.run_replay(cassette_dir, run_dir=run_dir, check_env=False,
+                                    all_turns=True)
         ids = list(rep.assertion_ids or [])
         consumed = [m.get("position") for m in (rep.matches or [])]
     except BaseException as exc:  # noqa: BLE001 —— 回放炸了 = 没复现，不是崩溃
@@ -497,6 +636,7 @@ class CandidateTester:
         self.cand_dir = os.path.join(work_dir, "cand")
         self.notes = []
         self.first = True
+        self.spine = None
 
     def remaining(self) -> int:
         return max(0, self.max_replays - self.replays)
@@ -512,6 +652,13 @@ class CandidateTester:
                 res = (PASS, {"kind": "projection", "detail": "; ".join(problems[:3])})
                 self.cache[key] = res
                 self.notes.append({"unit": None, "why": "依赖投影不成立：" + problems[0]})
+                return res
+        if not self.first and self.spine is not None:
+            ok, note = spine_guard(positional_spine(kept), self.spine)
+            if not ok:
+                res = (PASS, {"kind": "spine", "detail": note})
+                self.cache[key] = res
+                self.notes.append({"unit": None, "why": "阶段 2 守卫拒绝：" + note})
                 return res
         if not self.first and self.replays + self.runs > self.max_replays:
             self.notes.append({"unit": None, "why": "回放预算耗尽"})
@@ -569,6 +716,8 @@ class Reducer:
         self.critical = []
         self.solo_tested = set()
         self.deleted = []
+        self.groups_total = 0
+        self.groups_live = 0
 
     def test(self, cand) -> tuple:
         status, info = self.tester.run(cand)
@@ -621,9 +770,11 @@ class Reducer:
             n = min(len(live), n * 2)
         return live
 
-    def run(self, units) -> None:
-        """两阶段骨架：先删整轮，再进轮内细分（§16.3）。"""
+    def run(self, units, groups=None) -> None:
+        """两阶段骨架：先删整轮，再进轮内细分，最后按历史组做阶段 2（§16.3 / §7.2）。"""
         top = [u for u in units if not u.pinned and set(u.indices) <= self.best]
+        self.groups_total = len(groups or ())
+        self.groups_live = 0
         try:
             self.ddmin(top)
             for u in units:
@@ -632,6 +783,15 @@ class Reducer:
                 kids = [c for c in u.children if set(c.indices) <= self.best]
                 if kids:
                     self.ddmin(kids)
+            # 阶段 2：单元是失败轮之前的历史组，守卫是响应序列只减不增不重排。
+            # spine 取阶段 1 收敛后的 c1（§7.2 的 spine = positional_spine(c1)）。
+            live = [u for u in (groups or ()) if not u.pinned
+                    and set(u.indices) <= self.best]
+            self.groups_live = len(live)
+            if live:
+                c1 = [self.events[i] for i in sorted(self.best)]
+                self.tester.spine = positional_spine(c1)
+                self.ddmin(live)
         except BudgetExhausted:
             self.converged = False
 
@@ -807,8 +967,9 @@ def shrink_cassette(cassette_dir: str, out_dir: str, *, expected_assertion=None,
     os.makedirs(work_dir, exist_ok=True)
     root, cas = prepare_root(cassette_dir, work_dir)
     units, notes = build_units(events, expected)
-    say(f"收缩 {cassette_dir} → 断言 {expected}；单元 {len(units)} 个，"
-        f"事件 {len(events)} 条，预算 {max_replays} 次回放")
+    groups = history_group_units(events, expected_assertion=expected)
+    say(f"收缩 {cassette_dir} → 断言 {expected}；轮单元 {len(units)} 个、"
+        f"历史组 {len(groups)} 个，事件 {len(events)} 条，预算 {max_replays} 次回放")
     tester = CandidateTester(events, source, root=root, expected=expected,
                              work_dir=work_dir, max_replays=max_replays,
                              timeout=timeout, runs=runs,
@@ -820,7 +981,7 @@ def shrink_cassette(cassette_dir: str, out_dir: str, *, expected_assertion=None,
         raise ShrinkError(f"源 cassette 不能复现断言 {expected}"
                           f"（判定 {status}：{(base_info or {}).get('detail') or ''}）；"
                           "收缩的前提是现场真的失败，先修输入或换断言。")
-    reducer.run(units)
+    reducer.run(units, groups)
     best = reducer.best
     kept_events = [events[i] for i in sorted(best)]
     # 最终候选的活值（B 组 / 消费位置 / 断言序列）从缓存里取，不额外回放
@@ -828,8 +989,11 @@ def shrink_cassette(cassette_dir: str, out_dir: str, *, expected_assertion=None,
     probe = (best_info or {}).get("probe") or {}
     patched = repatch_b_group(root, kept_events, probe.get("live_b") or [])
     _write_trace(root, kept_events)
+    # 导出后还要复核一次（下面的 `verify`），那次回放也是本次导出的成本：
+    # 报告里的 `replays` 把它算进去了，`derived_from` 不能少记一次——两处口径必须一致。
+    export_replays = tester.replays + 1
     derived = (f"{source.source_id} + shrink(units=turns, deleted="
-               f"{len(events) - len(kept_events)} events, replays={tester.replays}, "
+               f"{len(events) - len(kept_events)} events, replays={export_replays}, "
                f"runs={runs}, expected_assertion={expected})")
     meta = cassette_mod.slice_cassette(
         root, out_dir, playback_mode=cassette_mod.PLAYBACK_POSITIONAL,
@@ -847,9 +1011,9 @@ def shrink_cassette(cassette_dir: str, out_dir: str, *, expected_assertion=None,
         "cassette": out_dir,
         "source": cassette_dir,
         "source_id": source.source_id,
-        "units": len(_flatten(units)),
-        "units_top": len(units),
-        "unit_kinds": sorted({u.kind for u in units}),
+        "units": len(_flatten(units)) + len(groups),
+        "units_top": len(units) + len(groups),
+        "unit_kinds": sorted({u.kind for u in units} | {u.kind for u in groups}),
         "replays": tester.replays,
         "max_replays": max_replays,
         "converged": bool(reducer.converged),
@@ -859,17 +1023,22 @@ def shrink_cassette(cassette_dir: str, out_dir: str, *, expected_assertion=None,
         "response_count_after": len(after_requests),
         "calls_before": len(before_requests),
         "calls_after": len(after_requests),
-        "skipped_units": skipped_units(units, reducer, tester),
+        "skipped_units": skipped_units(list(units) + groups, reducer, tester),
         "unconsumed": unconsumed_events(kept_events, probe),
-        "critical_elements": critical_elements(reducer, units),
+        "critical_elements": critical_elements(reducer, list(units) + groups),
         "substituted_assertion": (best_info or {}).get("substituted"),
         "deleted_units": list(reducer.deleted),
         "deleted_events": len(events) - len(kept_events),
         "guard": dict(spine_report(spine_before, spine_after), **{
-            "enabled": False,
-            "why": "阶段 2（历史组 ddmin）本轮未实现：组从对话态派生，"
-                   "事件流 → 对话态的 converter 不存在",
+            "enabled": True,
             "stage2_hook": "history_group_units()",
+            "groups": reducer.groups_total,
+            "groups_live": reducer.groups_live,
+            "groups_deleted": [d for d in reducer.deleted
+                               if d.startswith("history[")],
+            "why": "" if reducer.groups_live else (
+                "阶段 2 无可用历史组：失败轮为首轮（q_idx=1，_find_groups 扫 "
+                "messages[1:1] 为空），或组内只有用户提问/nudge 这类非事件产生的消息"),
         }),
         "checkpoint_b_patched": patched,
         "verify": {"status": vstatus, "detail": (vinfo or {}).get("kind")},
