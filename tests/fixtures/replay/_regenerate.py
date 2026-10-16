@@ -40,6 +40,12 @@
   机制事实（重写发生过、真实 WORK_DIR 一字未动、跨类重读命中、overlay 树结构）
   由 `tests/test_replay.py` 里那条用例逐条断言——那里的断言比一个字符串更具体，
   而且它读的是 trace 里的 `tool_call.overlay` 字段与 `ReplayReport`，不是靠猜。
+
+- `multiturn_stuck/`：按位模式，**多用户轮**。首轮 thinking-only 被空 nudge 反复重试后
+  stuck，后两轮正常收尾。它是给 L3 准备的"真删得动"的现场：单轮的 `positional_stuck`
+  三条响应都是必需的，ddmin 一个也删不掉；多用户轮才会整轮被删，进而真的触发
+  checkpoint B 组重算（`repatch_b_group`）。两条一起构成 L3 的回归面：
+  一条证明"不乱删"，一条证明"真删成功"。
 """
 import json
 import os
@@ -156,6 +162,12 @@ TOOL_BATCH = [[_Chunk(_Delta(tool_calls=[_ToolCall(0, "c1", "get_date", "{}")]))
 THINKING_BATCH = [[_Chunk(_Delta(reasoning="我再想想")),
                    _Chunk(_Delta(), finish_reason="stop"),
                    _Chunk(usage=True, no_choices=True)]]
+# 多用户轮：前三次请求吃掉 THINKING_BATCH（首轮的 3 次空 nudge 重试 → stuck），
+# 之后两次落到这里正常收尾。`_FakeTransport` 对超出的调用复用最后一组。
+NORMAL_ANSWER_BATCH = [[_Chunk(_Delta(content="好的，记下了"), finish_reason="stop"),
+                        _Chunk(usage=True, no_choices=True)]]
+MULTITURN_BATCH = [THINKING_BATCH[0], THINKING_BATCH[0], THINKING_BATCH[0],
+                   NORMAL_ANSWER_BATCH[0]]
 
 
 # ── L2 剧本：三类重写各一次 ──────────────────────────────────────
@@ -235,7 +247,10 @@ def _record(batches, question, name, seed=None):
                           manifest={"session_id": sid, "backend": "fake",
                                     "model": "deepseek-v4-flash"})
     try:
-        out = la.chat(question, _conv=conv)
+        # 单条问题保持原样；传 list/tuple 表示多用户轮（同一 conv 顺序问下去）。
+        questions = question if isinstance(question, (list, tuple)) else [question]
+        for q in questions:
+            out = la.chat(q, _conv=conv)
     finally:
         if prev_tool is not None:
             la.TOOL_CALL_MAP["get_date"] = prev_tool
@@ -291,15 +306,20 @@ SPECS = [
      "mode": "positional", "expected": "turn_end:reason=stuck"},
     {"name": "l2_file_ops", "batches": _l2_tool_batch(), "question": "改一下那个文件",
      "mode": "fingerprint", "expected": "turn_end:reason=answer", "seed": _seed_l2_work},
+    {"name": "multiturn_stuck", "batches": MULTITURN_BATCH,
+     "question": ["想个办法", "再想一个", "还有别的吗"],
+     "mode": "positional", "expected": "turn_end:reason=stuck"},
 ]
 
 # 天然每次不同的字段：只比"契约"部分，不比这些。
 #
-# `duration_ms` 是一台机器上这次跑多久的**测量值**，不是契约：同一个工具同样的入参，
-# 一次 0ms 一次 1ms 都可能。它不进这个名单的话，`--check` 会随机红——而一旦它随机红，
-# 这个闸门就没人信了（"又飘了，重录一下"正是它要防的事）。事件里凡是"跑一次的耗时/
-# 时刻"，都属于这一类。
-_VOLATILE_EVENT_KEYS = ("ts", "seq", "run_id", "session", "duration_ms")
+# `duration_ms` / `latency_ms` 是一台机器上这次跑多久的**测量值**，不是契约：同一个
+# 工具同样的入参，一次 0ms 一次 1ms 都可能。它们不进这个名单的话，`--check` 会随机
+# 红——而一旦它随机红，这个闸门就没人信了（"又飘了，重录一下"正是它要防的事）。
+# `latency_ms` 尤其明显：它是上游一次响应的毫秒取整，稳定录成 0/1 全看当次调度，
+# `tests/test_trace.py` 的 `_VOLATILE` 早已把它当易变字段。
+# 事件里凡是"跑一次的耗时/时刻"，都属于这一类。
+_VOLATILE_EVENT_KEYS = ("ts", "seq", "run_id", "session", "duration_ms", "latency_ms")
 _STABLE_META_KEYS = ("cassette_format", "canon_version", "playback_mode", "completeness",
                      "degraded_reasons", "expected_assertion", "assertion_ids",
                      "checkpoint_count", "derived_from")
